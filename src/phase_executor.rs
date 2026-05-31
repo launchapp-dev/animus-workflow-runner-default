@@ -17,7 +17,7 @@ use crate::phase_prompt::{
 };
 use crate::phase_targets::PhaseTargetPlanner;
 use crate::runtime_contract::{
-    apply_phase_capability_launch_flags, inject_agent_tool_policy, inject_default_stdio_mcp,
+    apply_phase_capability_launch_flags, inject_agent_tool_policy, inject_default_stdio_mcp_with_config,
     inject_memory_mcp_for_capable_agent, inject_named_mcp_servers, inject_project_mcp_servers,
     inject_response_schema_into_launch_args, inject_workflow_mcp_servers, phase_output_json_schema_for,
     phase_response_json_schema_for, set_mcp_tool_policy,
@@ -111,6 +111,7 @@ impl orchestrator_core::PhaseExecutor for CliPhaseExecutor {
             schedule_input: None,
             routing: &routing,
             phase_timeout_secs,
+            mcp_config: None,
         })
         .await;
 
@@ -1197,6 +1198,7 @@ struct PhaseAgentParams<'a> {
     routing: &'a protocol::PhaseRoutingConfig,
     resolved_phase_skills: &'a skill_dispatch::ResolvedPhaseSkillSet,
     phase_timeout_secs: Option<u64>,
+    mcp_config: Option<&'a protocol::McpRuntimeConfig>,
 }
 
 struct AgentPhaseRunOutcome {
@@ -1504,7 +1506,18 @@ async fn run_workflow_phase_with_agent(params: PhaseAgentParams<'_>) -> Result<A
                         &ctx.agent_runtime_config,
                     );
                     inject_cli_launch_overrides(&mut runtime_contract, &effective_tool_id, phase_runtime_settings);
-                    inject_default_stdio_mcp(&mut runtime_contract, project_root);
+                    // codex P2 #1: thread host-supplied `mcp_config` through to
+                    // the stdio injection. When no host override is supplied
+                    // (CLI path, tests), fall back to the default config —
+                    // matching pre-fix behavior.
+                    let default_mcp_runtime_config = protocol::McpRuntimeConfig::default();
+                    let effective_mcp_runtime_config =
+                        params.mcp_config.unwrap_or(&default_mcp_runtime_config);
+                    inject_default_stdio_mcp_with_config(
+                        &mut runtime_contract,
+                        project_root,
+                        effective_mcp_runtime_config,
+                    );
                     inject_agent_tool_policy(&mut runtime_contract, ctx, phase_id);
                     inject_project_mcp_servers(&mut runtime_contract, project_root, ctx, phase_id);
                     inject_workflow_mcp_servers(&mut runtime_contract, ctx, phase_id);
@@ -1838,6 +1851,11 @@ pub struct PhaseRunParams<'a> {
     pub schedule_input: Option<&'a str>,
     pub routing: &'a protocol::PhaseRoutingConfig,
     pub phase_timeout_secs: Option<u64>,
+    /// Optional host-supplied MCP runtime config. Threaded into
+    /// [`inject_default_stdio_mcp_with_config`] so the daemon can override
+    /// the stdio command / endpoint / transport per call. When `None`,
+    /// callers fall back to `McpRuntimeConfig::default()`.
+    pub mcp_config: Option<&'a protocol::McpRuntimeConfig>,
 }
 
 pub async fn run_workflow_phase(params: &PhaseRunParams<'_>) -> Result<PhaseRunResult> {
@@ -1970,6 +1988,7 @@ async fn run_workflow_phase_inner(params: &PhaseRunParams<'_>) -> Result<PhaseRu
                 routing: params.routing,
                 resolved_phase_skills: &resolved_phase_skills,
                 phase_timeout_secs: params.phase_timeout_secs,
+                mcp_config: params.mcp_config,
             })
             .await?;
             metadata.selected_tool = agent_result.selected_tool.clone();

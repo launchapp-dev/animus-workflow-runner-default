@@ -1059,4 +1059,75 @@ mod tests {
         validate_basic_json_schema(&decision_without_evidence, &schema)
             .expect("phase decision without evidence field should validate when no required evidence types");
     }
+
+    /// Codex P2 #1 (mcp_config wire-through): when the host supplies a
+    /// non-default `McpRuntimeConfig` with an explicit `stdio_command`, the
+    /// stdio injection must honor it instead of falling back to a sibling
+    /// `animus` binary search. Asserts the runtime config visible at the
+    /// phase execution layer reflects the host-supplied override.
+    #[test]
+    fn inject_default_stdio_mcp_with_config_honors_host_supplied_stdio_command() {
+        let mut runtime_contract = serde_json::json!({
+            "cli": { "capabilities": { "supports_mcp": true } },
+            "mcp": {}
+        });
+        let mcp_config = protocol::McpRuntimeConfig {
+            stdio_command: Some("/opt/host/bin/host-mcp".to_string()),
+            stdio_args_json: Some(serde_json::to_string(&vec!["--from-host", "--json"]).unwrap()),
+            ..Default::default()
+        };
+        inject_default_stdio_mcp_with_config(&mut runtime_contract, "/tmp/project", &mcp_config);
+
+        assert_eq!(
+            runtime_contract.pointer("/mcp/stdio/command").and_then(Value::as_str),
+            Some("/opt/host/bin/host-mcp"),
+            "host-supplied stdio_command must be threaded into /mcp/stdio/command"
+        );
+        let args = runtime_contract.pointer("/mcp/stdio/args").and_then(Value::as_array).expect("stdio args");
+        let arg_strings: Vec<&str> = args.iter().filter_map(|value| value.as_str()).collect();
+        assert_eq!(
+            arg_strings,
+            vec!["--from-host", "--json"],
+            "host-supplied stdio_args_json must override the project-root fallback"
+        );
+    }
+
+    /// Codex P2 #1: the v0.5 wire contract parses `mcp_config` on
+    /// `WorkflowExecuteRequest` into `WorkflowExecuteInternalParams.mcp_config`.
+    /// This test pins that mapping so a future regression cannot silently
+    /// drop the field again on the way to the runtime contract.
+    #[test]
+    fn workflow_execute_request_parses_mcp_config_into_internal_params() {
+        use animus_workflow_runner_protocol::WorkflowExecuteRequest;
+
+        let request = WorkflowExecuteRequest {
+            workflow_id: Some("wf-1".to_string()),
+            task_id: Some("TASK-1".to_string()),
+            requirement_id: None,
+            title: None,
+            description: None,
+            subject_dispatch: None,
+            subject_ref: None,
+            workflow_ref: None,
+            input: None,
+            vars: Default::default(),
+            model: None,
+            tool: None,
+            phase_timeout_secs: None,
+            phase_filter: None,
+            phase_routing: None,
+            mcp_config: Some(serde_json::json!({
+                "stdio_command": "/opt/host/bin/host-mcp",
+                "stdio_args_json": "[\"--host\"]",
+                "agent_id": "host-agent"
+            })),
+        };
+
+        let parsed_mcp_config: Option<protocol::McpRuntimeConfig> =
+            request.mcp_config.clone().and_then(|value| serde_json::from_value(value).ok());
+        let parsed = parsed_mcp_config.expect("WorkflowExecuteRequest.mcp_config must parse into McpRuntimeConfig");
+        assert_eq!(parsed.stdio_command.as_deref(), Some("/opt/host/bin/host-mcp"));
+        assert_eq!(parsed.stdio_args_json.as_deref(), Some("[\"--host\"]"));
+        assert_eq!(parsed.agent_id.as_deref(), Some("host-agent"));
+    }
 }

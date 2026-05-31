@@ -233,12 +233,11 @@ pub async fn handle_workflow_execute(request: WorkflowExecuteRequest) -> Result<
         phase_timeout_secs: request.phase_timeout_secs,
         phase_filter: request.phase_filter.clone(),
         phase_routing: request.phase_routing.clone().and_then(|value| serde_json::from_value(value).ok()),
-        // TODO(codex-p2): `mcp_config` is parsed into `WorkflowExecuteInternalParams`
-        // but the lifted `execute_workflow_with_hub` does not yet thread it down
-        // into `run_workflow_phase` — phase execution still uses
-        // `McpRuntimeConfig::default()`. Host-provided MCP endpoints are
-        // currently ignored. Wire it through `routing` once the upstream
-        // workflow runner accepts a per-call MCP override.
+        // Wire the host-supplied per-call MCP runtime config through
+        // `WorkflowExecuteInternalParams` -> `execute_workflow_with_hub` ->
+        // `PhaseRunParams` -> `inject_default_stdio_mcp_with_config`.
+        // When absent (CLI path), the phase falls back to
+        // `McpRuntimeConfig::default()`.
         mcp_config: request.mcp_config.clone().and_then(|value| serde_json::from_value(value).ok()),
     };
 
@@ -415,6 +414,12 @@ pub async fn handle_workflow_run_phase(request: WorkflowPhaseRunRequest) -> Resu
         schedule_input: request.schedule_input.as_deref(),
         routing: &routing,
         phase_timeout_secs: request.phase_timeout_secs,
+        // workflow/run_phase does not yet accept a per-call mcp_config on the
+        // wire; the single-phase scheduler calls this entry point and lacks a
+        // place for it in the protocol surface. Leave None and let the runtime
+        // contract fall back to the default. The bulk surface (workflow/execute)
+        // does thread mcp_config (codex P2 #1).
+        mcp_config: None,
     })
     .await;
     let elapsed: Duration = started.elapsed();

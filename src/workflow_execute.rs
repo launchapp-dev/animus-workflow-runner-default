@@ -197,6 +197,10 @@ pub async fn execute_workflow_with_hub(
 ) -> Result<WorkflowExecuteInternalResult> {
     let routing = params.phase_routing.take().unwrap_or_default();
     let phase_timeout_secs = params.phase_timeout_secs;
+    // codex P2 #1: lift the per-call MCP runtime config out of `params` so it
+    // can be borrowed by both the phase-filter and full-pipeline `PhaseRunParams`
+    // construction sites below.
+    let mcp_config = params.mcp_config.take();
 
     let mut workflow = match params.workflow_id.as_deref() {
         Some(workflow_id) => load_existing_workflow(hub.clone(), workflow_id, &params).await?,
@@ -336,6 +340,7 @@ pub async fn execute_workflow_with_hub(
             routing: &routing,
 
             phase_timeout_secs,
+            mcp_config: mcp_config.as_ref(),
         })
         .await;
 
@@ -538,6 +543,7 @@ pub async fn execute_workflow_with_hub(
             routing: &routing,
 
             phase_timeout_secs,
+            mcp_config: mcp_config.as_ref(),
         })
         .await;
 
