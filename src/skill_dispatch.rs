@@ -136,16 +136,44 @@ pub fn apply_skill_capability_overrides(
     caps
 }
 
+/// Returns the index where skill-supplied `extra_args` should be inserted in
+/// `/cli/launch/args` so they land before the prompt and never split a
+/// flag/value pair that wraps the prompt.
+///
+/// Heuristics:
+///   - When the trailing two args are `-p <prompt>` (Gemini's prompt-flag
+///     pair), insert before `-p` so the prompt stays attached to its flag.
+///   - Otherwise insert at `len - 1`, matching `inject_cli_extra_args`'s
+///     `launch_prompt_insert_index` heuristic.
+///   - When args is empty, return 0 (callers won't read past that).
+fn skill_extra_args_insert_index(args: &[Value]) -> usize {
+    let len = args.len();
+    if len >= 2 {
+        let prompt_flag = args[len - 2].as_str();
+        if prompt_flag == Some("-p") || prompt_flag == Some("--prompt") {
+            return len - 2;
+        }
+    }
+    len.saturating_sub(1)
+}
+
 pub fn inject_skill_overrides(runtime_contract: &mut Value, tool_id: &str, skill_result: &SkillApplicationResult) {
     // Codex P2 #3: for Claude/Codex/Gemini launch contracts the prompt is the
     // trailing positional argument. `inject_cli_extra_args` already uses the
     // pre-prompt insertion index for its sibling overrides; do the same here
     // so skill-supplied flags are seen as flags by the CLI, not as part of
-    // the prompt text. When the launch args vector is empty (no prompt
-    // positional yet), insert at the end so the order is still deterministic.
+    // the prompt text.
+    //
+    // Tool-specific edge cases:
+    //   - Gemini emits the prompt as `-p <prompt>` (the prompt is the value
+    //     of the `-p` flag, not a bare trailing positional). Inserting at
+    //     `len-1` would land between `-p` and its value. Detect the `-p`
+    //     pair at the tail and insert one slot earlier.
+    //   - When the launch args vector is empty (no prompt positional yet),
+    //     insert at the end so the order is still deterministic.
     if !skill_result.extra_args.is_empty() {
         if let Some(args) = runtime_contract.pointer_mut("/cli/launch/args").and_then(Value::as_array_mut) {
-            let mut insert_at = args.len().saturating_sub(1).min(args.len());
+            let mut insert_at = skill_extra_args_insert_index(args);
             for arg in &skill_result.extra_args {
                 if !args.iter().any(|a| a.as_str() == Some(arg)) {
                     args.insert(insert_at, Value::String(arg.clone()));
@@ -396,6 +424,32 @@ mod tests {
             arg_strings,
             vec!["exec", "--skill-flag-1", "--skill-flag-2", "the-prompt-text"],
             "skill extra_args must be inserted before the trailing prompt positional"
+        );
+    }
+
+    /// Gemini-shaped launch contracts end with `-p <prompt>` (the prompt is
+    /// the value of the `-p` flag, not a bare positional). Skill flags must
+    /// land before `-p` so the flag/value pair stays intact.
+    #[test]
+    fn inject_skill_overrides_handles_gemini_prompt_flag_pair() {
+        let mut runtime_contract = json!({
+            "cli": {
+                "launch": {
+                    "args": ["--model", "gemini-2.5-pro", "-p", "the-prompt-text"]
+                }
+            }
+        });
+        let skill_result =
+            SkillApplicationResult { extra_args: vec!["--skill-flag".to_string()], ..Default::default() };
+
+        inject_skill_overrides(&mut runtime_contract, "gemini", &skill_result);
+
+        let args = runtime_contract.pointer("/cli/launch/args").and_then(Value::as_array).expect("launch args");
+        let arg_strings: Vec<&str> = args.iter().filter_map(|value| value.as_str()).collect();
+        assert_eq!(
+            arg_strings,
+            vec!["--model", "gemini-2.5-pro", "--skill-flag", "-p", "the-prompt-text"],
+            "skill extra_args must land before the Gemini `-p <prompt>` pair so the prompt stays attached to its flag"
         );
     }
 
