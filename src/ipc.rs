@@ -226,7 +226,27 @@ pub fn build_runtime_contract_with_resume(
     prompt: &str,
     resume_plan: Option<&orchestrator_core::runtime_contract::CliSessionResumePlan>,
 ) -> Option<Value> {
-    let mcp_config = protocol::McpRuntimeConfig::default();
+    build_runtime_contract_with_resume_and_mcp_config(
+        tool,
+        model,
+        prompt,
+        resume_plan,
+        &protocol::McpRuntimeConfig::default(),
+    )
+}
+
+/// Variant of [`build_runtime_contract_with_resume`] that threads
+/// host-supplied `mcp_config.endpoint` and `mcp_config.agent_id` into the
+/// runtime contract. Used by the phase execution path so a per-call
+/// `WorkflowExecuteRequest.mcp_config` can reach the spawned agent.
+/// (Codex P2 #1 follow-up — covers non-stdio fields too.)
+pub fn build_runtime_contract_with_resume_and_mcp_config(
+    tool: &str,
+    model: &str,
+    prompt: &str,
+    resume_plan: Option<&orchestrator_core::runtime_contract::CliSessionResumePlan>,
+    mcp_config: &protocol::McpRuntimeConfig,
+) -> Option<Value> {
     let mcp_endpoint = mcp_config.endpoint.clone();
     let mcp_agent_id = mcp_config.agent_id.clone();
 

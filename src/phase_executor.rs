@@ -1,6 +1,6 @@
 use crate::config_context::RuntimeConfigContext;
 use crate::ipc::{
-    build_runtime_contract_with_resume, collect_json_payload_lines, connect_runner, event_matches_run,
+    build_runtime_contract_with_resume_and_mcp_config, collect_json_payload_lines, connect_runner, event_matches_run,
     run_dir as ipc_run_dir, runner_config_dir, write_json_line,
 };
 use crate::payload_traversal::{parse_commit_message_from_text, parse_phase_decision_from_text};
@@ -1473,11 +1473,18 @@ async fn run_workflow_phase_with_agent(params: PhaseAgentParams<'_>) -> Result<A
                         .expect("json object")
                         .insert("agent_id".to_string(), serde_json::json!(agent_id));
                 }
-                if let Some(mut runtime_contract) = build_runtime_contract_with_resume(
+                // codex P2 #1 follow-up: resolve the effective MCP runtime
+                // config once at the top of the attempt loop so we can pass
+                // host-supplied `endpoint` / `agent_id` into the runtime
+                // contract construction (not just the later stdio injection).
+                let default_mcp_runtime_config = protocol::McpRuntimeConfig::default();
+                let effective_mcp_runtime_config = params.mcp_config.unwrap_or(&default_mcp_runtime_config);
+                if let Some(mut runtime_contract) = build_runtime_contract_with_resume_and_mcp_config(
                     context.get("tool").and_then(Value::as_str).unwrap_or("codex"),
                     &effective_model_id,
                     &effective_prompt,
                     Some(&resume_plan),
+                    effective_mcp_runtime_config,
                 ) {
                     if let Some(contract) = phase_contract.as_ref() {
                         let mut policy = serde_json::json!({
@@ -1507,11 +1514,10 @@ async fn run_workflow_phase_with_agent(params: PhaseAgentParams<'_>) -> Result<A
                     );
                     inject_cli_launch_overrides(&mut runtime_contract, &effective_tool_id, phase_runtime_settings);
                     // codex P2 #1: thread host-supplied `mcp_config` through to
-                    // the stdio injection. When no host override is supplied
-                    // (CLI path, tests), fall back to the default config —
-                    // matching pre-fix behavior.
-                    let default_mcp_runtime_config = protocol::McpRuntimeConfig::default();
-                    let effective_mcp_runtime_config = params.mcp_config.unwrap_or(&default_mcp_runtime_config);
+                    // the stdio injection (in addition to the
+                    // endpoint/agent_id threaded above). When no host override
+                    // is supplied (CLI path, tests), fall back to the default
+                    // config — matching pre-fix behavior.
                     inject_default_stdio_mcp_with_config(
                         &mut runtime_contract,
                         project_root,

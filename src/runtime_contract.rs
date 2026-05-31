@@ -1072,17 +1072,17 @@ mod tests {
     /// Codex P2 #4: when the daemon supplies `init_extensions.memory_mcp_stdio_command`,
     /// the plugin uses that explicit binary path instead of probing for a
     /// sibling `animus`. Exercises the override path via `install_plugin_state`.
+    ///
+    /// IMPORTANT: this test does NOT delete the sibling `animus` stub created
+    /// by `inject_memory_mcp_added_when_capability_enabled` — both tests run
+    /// in parallel under default `cargo test` and racing on the shared
+    /// `target/debug/deps/animus` path causes a flake. The init-extension
+    /// override path takes precedence over sibling discovery, so the test
+    /// can assert override behaviour without touching the sibling at all.
     #[test]
     fn inject_memory_mcp_uses_init_extension_stdio_command_override() {
         use crate::plugin::{install_plugin_state, PluginState};
         use std::sync::Arc;
-
-        // Drop any sibling `animus` so the test can prove the override is the
-        // sole reason the injection succeeds.
-        let exe = std::env::current_exe().expect("test binary path");
-        let exe_dir = exe.parent().expect("test binary parent dir");
-        let sibling = exe_dir.join("animus");
-        let _ = std::fs::remove_file(&sibling);
 
         let stub_command = "/opt/host/bin/host-supplied-memory-mcp";
         // Install plugin state with the override but the test uses a tempdir
@@ -1126,6 +1126,38 @@ mod tests {
             hub: hub2,
             memory_mcp_stdio_command: None,
         });
+    }
+
+    /// Codex P2 #1 follow-up: host-supplied `endpoint` and `agent_id` must
+    /// reach the runtime contract via `build_runtime_contract_with_resume_and_mcp_config`,
+    /// not just the stdio injection path. Pre-fix the wire-through only
+    /// covered stdio_command; HTTP endpoints stayed at the default.
+    #[test]
+    fn build_runtime_contract_with_resume_and_mcp_config_honors_endpoint_and_agent_id() {
+        let mcp_config = protocol::McpRuntimeConfig {
+            endpoint: Some("https://host.example.com/mcp".to_string()),
+            agent_id: Some("custom-agent".to_string()),
+            ..Default::default()
+        };
+        let runtime_contract = crate::ipc::build_runtime_contract_with_resume_and_mcp_config(
+            "codex",
+            "claude-sonnet-4-6",
+            "the prompt",
+            None,
+            &mcp_config,
+        )
+        .expect("runtime contract should build");
+
+        assert_eq!(
+            runtime_contract.pointer("/mcp/endpoint").and_then(Value::as_str),
+            Some("https://host.example.com/mcp"),
+            "host-supplied mcp_config.endpoint must reach /mcp/endpoint"
+        );
+        assert_eq!(
+            runtime_contract.pointer("/mcp/agent_id").and_then(Value::as_str),
+            Some("custom-agent"),
+            "host-supplied mcp_config.agent_id must reach /mcp/agent_id"
+        );
     }
 
     /// Codex P2 #1 (mcp_config wire-through): when the host supplies a
