@@ -287,6 +287,19 @@ pub fn inject_default_stdio_mcp_with_config(
         return;
     }
 
+    // Codex P2 follow-up: when the host supplies a non-empty `endpoint` (even
+    // without an explicit `transport: "http"`), prefer it. The agent runner
+    // resolves stdio before endpoint, so injecting a stdio command alongside
+    // a host-supplied endpoint silently shadows the endpoint. The stdio
+    // command must only be injected when the host has NOT requested an
+    // endpoint AND has not explicitly supplied its own stdio command.
+    let host_supplied_endpoint = mcp_config.endpoint.as_deref().map(str::trim).is_some_and(|value| !value.is_empty());
+    let host_supplied_stdio_command =
+        mcp_config.stdio_command.as_deref().map(str::trim).is_some_and(|value| !value.is_empty());
+    if host_supplied_endpoint && !host_supplied_stdio_command {
+        return;
+    }
+
     let supports_mcp =
         runtime_contract.pointer("/cli/capabilities/supports_mcp").and_then(Value::as_bool).unwrap_or(false);
     if !supports_mcp {
@@ -1157,6 +1170,34 @@ mod tests {
             runtime_contract.pointer("/mcp/agent_id").and_then(Value::as_str),
             Some("custom-agent"),
             "host-supplied mcp_config.agent_id must reach /mcp/agent_id"
+        );
+    }
+
+    /// Codex P2 round 4: when the host sends `mcp_config.endpoint` without
+    /// `transport: "http"`, stdio injection must NOT silently shadow the
+    /// host-supplied endpoint. Pre-fix, the runtime contract ended up with
+    /// both `/mcp/endpoint` and `/mcp/stdio` set; the agent runner resolves
+    /// stdio first, so the endpoint was effectively ignored in co-located
+    /// deployments with a sibling `animus` binary.
+    #[test]
+    fn host_supplied_endpoint_suppresses_default_stdio_injection() {
+        let mut runtime_contract = serde_json::json!({
+            "cli": { "capabilities": { "supports_mcp": true } },
+            "mcp": { "endpoint": "https://host.example.com/mcp" }
+        });
+        let mcp_config = protocol::McpRuntimeConfig {
+            endpoint: Some("https://host.example.com/mcp".to_string()),
+            ..Default::default()
+        };
+        inject_default_stdio_mcp_with_config(&mut runtime_contract, "/tmp/project", &mcp_config);
+        assert!(
+            runtime_contract.pointer("/mcp/stdio").is_none(),
+            "stdio injection must be skipped when the host supplied an endpoint, so the endpoint is not shadowed"
+        );
+        assert_eq!(
+            runtime_contract.pointer("/mcp/endpoint").and_then(Value::as_str),
+            Some("https://host.example.com/mcp"),
+            "host-supplied endpoint must remain on the contract"
         );
     }
 
