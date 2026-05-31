@@ -137,16 +137,19 @@ pub fn apply_skill_capability_overrides(
 }
 
 pub fn inject_skill_overrides(runtime_contract: &mut Value, tool_id: &str, skill_result: &SkillApplicationResult) {
-    // TODO(codex-p2): for Claude/Codex/Gemini launch contracts, the prompt is
-    // the trailing positional argument; appending `extra_args` after the
-    // prompt makes the CLI treat them as prompt text instead of flags. Pre-fix
-    // (lifted) behavior; matches what `inject_cli_extra_args` does for
-    // sibling overrides. Should insert before the prompt index instead.
+    // Codex P2 #3: for Claude/Codex/Gemini launch contracts the prompt is the
+    // trailing positional argument. `inject_cli_extra_args` already uses the
+    // pre-prompt insertion index for its sibling overrides; do the same here
+    // so skill-supplied flags are seen as flags by the CLI, not as part of
+    // the prompt text. When the launch args vector is empty (no prompt
+    // positional yet), insert at the end so the order is still deterministic.
     if !skill_result.extra_args.is_empty() {
         if let Some(args) = runtime_contract.pointer_mut("/cli/launch/args").and_then(Value::as_array_mut) {
+            let mut insert_at = args.len().saturating_sub(1).min(args.len());
             for arg in &skill_result.extra_args {
                 if !args.iter().any(|a| a.as_str() == Some(arg)) {
-                    args.push(Value::String(arg.clone()));
+                    args.insert(insert_at, Value::String(arg.clone()));
+                    insert_at += 1;
                 }
             }
         }
@@ -365,6 +368,50 @@ mod tests {
         let error =
             resolve_phase_skills(&ctx, temp.path(), "implementation").expect_err("missing skill should fail loudly");
         assert!(error.to_string().contains("missing-runtime-skill"), "error should name missing skill: {error}");
+    }
+
+    /// Codex P2 #3: skill-supplied `extra_args` must land before the trailing
+    /// prompt positional so the CLI parses them as flags. Pre-fix, `extra_args`
+    /// were `args.push`-ed after the prompt and the CLI treated them as
+    /// additional prompt text.
+    #[test]
+    fn inject_skill_overrides_inserts_extra_args_before_prompt() {
+        let mut runtime_contract = json!({
+            "cli": {
+                "launch": {
+                    "args": ["exec", "the-prompt-text"]
+                }
+            }
+        });
+        let mut skill_result = SkillApplicationResult::default();
+        skill_result.extra_args = vec!["--skill-flag-1".to_string(), "--skill-flag-2".to_string()];
+
+        inject_skill_overrides(&mut runtime_contract, "codex", &skill_result);
+
+        let args = runtime_contract.pointer("/cli/launch/args").and_then(Value::as_array).expect("launch args");
+        let arg_strings: Vec<&str> = args.iter().filter_map(|value| value.as_str()).collect();
+        assert_eq!(
+            arg_strings,
+            vec!["exec", "--skill-flag-1", "--skill-flag-2", "the-prompt-text"],
+            "skill extra_args must be inserted before the trailing prompt positional"
+        );
+    }
+
+    /// When the launch args contain only the prompt positional, the skill
+    /// flags land at position 0 (before the prompt).
+    #[test]
+    fn inject_skill_overrides_with_single_prompt_inserts_before_it() {
+        let mut runtime_contract = json!({
+            "cli": { "launch": { "args": ["the-prompt-text"] } }
+        });
+        let mut skill_result = SkillApplicationResult::default();
+        skill_result.extra_args = vec!["--flag".to_string()];
+
+        inject_skill_overrides(&mut runtime_contract, "codex", &skill_result);
+
+        let args = runtime_contract.pointer("/cli/launch/args").and_then(Value::as_array).expect("launch args");
+        let arg_strings: Vec<&str> = args.iter().filter_map(|value| value.as_str()).collect();
+        assert_eq!(arg_strings, vec!["--flag", "the-prompt-text"]);
     }
 
     #[test]
