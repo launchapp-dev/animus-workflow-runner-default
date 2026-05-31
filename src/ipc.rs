@@ -255,8 +255,10 @@ pub fn build_runtime_contract_with_resume_and_mcp_config(
         mcp_config.endpoint.as_deref().map(str::trim).filter(|value| !value.is_empty()).map(ToOwned::to_owned);
     let mcp_agent_id =
         mcp_config.agent_id.as_deref().map(str::trim).filter(|value| !value.is_empty()).map(ToOwned::to_owned);
+    let mcp_stdio_command =
+        mcp_config.stdio_command.as_deref().map(str::trim).filter(|value| !value.is_empty()).map(ToOwned::to_owned);
 
-    let runtime_contract = runtime_contract::build_runtime_contract(
+    let mut runtime_contract = runtime_contract::build_runtime_contract(
         tool,
         model,
         prompt,
@@ -265,6 +267,25 @@ pub fn build_runtime_contract_with_resume_and_mcp_config(
         mcp_endpoint.as_deref(),
         mcp_agent_id.as_deref(),
     )?;
+
+    // Codex P2 round 7: `build_runtime_contract` only enables
+    // `mcp.enforce_only` when an `endpoint` is set, but a host-supplied
+    // `stdio_command` is also a fully-formed MCP transport — without
+    // enforce_only the agent runner skips native MCP setup and the stdio
+    // config is ignored. Flip the flag (and seed the allowed-tool prefixes)
+    // when the host supplied a usable stdio command but no endpoint.
+    if mcp_endpoint.is_none() && mcp_stdio_command.is_some() {
+        let cli_supports_mcp =
+            runtime_contract.pointer("/cli/capabilities/supports_mcp").and_then(Value::as_bool).unwrap_or(false);
+        if cli_supports_mcp {
+            if let Some(mcp) = runtime_contract.get_mut("mcp").and_then(Value::as_object_mut) {
+                mcp.insert("enforce_only".to_string(), Value::Bool(true));
+                let agent_id_for_prefixes = mcp_agent_id.as_deref().unwrap_or("animus");
+                let prefixes = protocol::default_allowed_tool_prefixes(agent_id_for_prefixes);
+                mcp.insert("allowed_tool_prefixes".to_string(), serde_json::json!(prefixes));
+            }
+        }
+    }
     Some(runtime_contract)
 }
 

@@ -1173,6 +1173,37 @@ mod tests {
         );
     }
 
+    /// Codex P2 round 7: when the host supplies only `mcp_config.stdio_command`
+    /// (no endpoint), `build_runtime_contract` would leave `mcp.enforce_only`
+    /// at `false` because that helper keys enforcement on the endpoint. The
+    /// agent runner then skips native MCP setup and the stdio config is
+    /// ignored. Asserts the new ipc wrapper flips `enforce_only` to true and
+    /// seeds the allowed-tool prefixes when a stdio command is supplied.
+    #[test]
+    fn host_supplied_stdio_command_enables_mcp_enforcement() {
+        let mcp_config = protocol::McpRuntimeConfig {
+            stdio_command: Some("/opt/host/bin/host-mcp".to_string()),
+            ..Default::default()
+        };
+        let runtime_contract = crate::ipc::build_runtime_contract_with_resume_and_mcp_config(
+            "codex",
+            "claude-sonnet-4-6",
+            "the prompt",
+            None,
+            &mcp_config,
+        )
+        .expect("runtime contract should build");
+
+        assert_eq!(
+            runtime_contract.pointer("/mcp/enforce_only").and_then(Value::as_bool),
+            Some(true),
+            "host-supplied stdio_command must enable mcp.enforce_only so the agent runner performs native MCP setup"
+        );
+        let prefixes =
+            runtime_contract.pointer("/mcp/allowed_tool_prefixes").and_then(Value::as_array).expect("prefixes");
+        assert!(!prefixes.is_empty(), "allowed_tool_prefixes must be seeded when enforce_only is true");
+    }
+
     /// Codex P2 round 4: when the host sends `mcp_config.endpoint` without
     /// `transport: "http"`, stdio injection must NOT silently shadow the
     /// host-supplied endpoint. Pre-fix, the runtime contract ended up with
