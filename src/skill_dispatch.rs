@@ -383,8 +383,10 @@ mod tests {
                 }
             }
         });
-        let mut skill_result = SkillApplicationResult::default();
-        skill_result.extra_args = vec!["--skill-flag-1".to_string(), "--skill-flag-2".to_string()];
+        let skill_result = SkillApplicationResult {
+            extra_args: vec!["--skill-flag-1".to_string(), "--skill-flag-2".to_string()],
+            ..Default::default()
+        };
 
         inject_skill_overrides(&mut runtime_contract, "codex", &skill_result);
 
@@ -404,8 +406,7 @@ mod tests {
         let mut runtime_contract = json!({
             "cli": { "launch": { "args": ["the-prompt-text"] } }
         });
-        let mut skill_result = SkillApplicationResult::default();
-        skill_result.extra_args = vec!["--flag".to_string()];
+        let skill_result = SkillApplicationResult { extra_args: vec!["--flag".to_string()], ..Default::default() };
 
         inject_skill_overrides(&mut runtime_contract, "codex", &skill_result);
 

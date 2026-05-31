@@ -1511,8 +1511,7 @@ async fn run_workflow_phase_with_agent(params: PhaseAgentParams<'_>) -> Result<A
                     // (CLI path, tests), fall back to the default config —
                     // matching pre-fix behavior.
                     let default_mcp_runtime_config = protocol::McpRuntimeConfig::default();
-                    let effective_mcp_runtime_config =
-                        params.mcp_config.unwrap_or(&default_mcp_runtime_config);
+                    let effective_mcp_runtime_config = params.mcp_config.unwrap_or(&default_mcp_runtime_config);
                     inject_default_stdio_mcp_with_config(
                         &mut runtime_contract,
                         project_root,

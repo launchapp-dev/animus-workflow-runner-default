@@ -194,12 +194,7 @@ pub fn plugin_initialize_result(params: &InitializeParams) -> Result<InitializeR
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
-    install_plugin_state(PluginState {
-        project_root: project_root_path,
-        repo_scope,
-        hub,
-        memory_mcp_stdio_command,
-    });
+    install_plugin_state(PluginState { project_root: project_root_path, repo_scope, hub, memory_mcp_stdio_command });
 
     let mut kind_capabilities = HashMap::new();
     kind_capabilities.insert(

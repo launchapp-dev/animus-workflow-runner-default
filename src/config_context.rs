@@ -9,8 +9,8 @@
 use std::path::Path;
 
 use orchestrator_config::agent_runtime_config::{
-    AgentRuntimeOverrides, PhaseCommandDefinition, PhaseDecisionContract, PhaseExecutionDefinition,
-    PhaseExecutionMode, PhaseOutputContract,
+    AgentRuntimeOverrides, PhaseCommandDefinition, PhaseDecisionContract, PhaseExecutionDefinition, PhaseExecutionMode,
+    PhaseOutputContract,
 };
 use orchestrator_core::AgentRuntimeConfig;
 use protocol::PhaseCapabilities;
@@ -93,12 +93,8 @@ impl RuntimeConfigContext {
     }
 
     pub fn phase_capabilities(&self, phase_id: &str) -> PhaseCapabilities {
-        if let Some(caps) = self
-            .workflow_config
-            .config
-            .phase_definitions
-            .get(phase_id)
-            .and_then(|def| def.capabilities.clone())
+        if let Some(caps) =
+            self.workflow_config.config.phase_definitions.get(phase_id).and_then(|def| def.capabilities.clone())
         {
             return caps.merge_with_defaults(phase_id);
         }
@@ -218,11 +214,7 @@ mod tests {
         };
         RuntimeConfigContext {
             agent_runtime_config: builtin_agent_runtime_config(),
-            workflow_config: LoadedWorkflowConfig {
-                metadata,
-                config: workflow,
-                path: PathBuf::from("builtin"),
-            },
+            workflow_config: LoadedWorkflowConfig { metadata, config: workflow, path: PathBuf::from("builtin") },
         }
     }
 
