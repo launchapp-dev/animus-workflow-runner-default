@@ -1958,14 +1958,21 @@ async fn run_workflow_phase_inner(params: &PhaseRunParams<'_>) -> Result<PhaseRu
             let cli_tool_override = overrides.and_then(|o| o.tool.as_deref());
             let cli_model_override = overrides.and_then(|o| o.model.as_deref());
 
+            // codex P2 #2 follow-up: read tool / model / fallbacks through
+            // `RuntimeConfigContext` so workflow YAML `runtime.*` overrides
+            // win over the agent_runtime_config fallback. Pre-fix these
+            // accessors went straight to `merged_runtime`, silently dropping
+            // YAML overrides even though `phase_execution()` reported them.
+            let ctx_tool_override = ctx.phase_tool_override(phase_id);
+            let ctx_model_override = ctx.phase_model_override(phase_id);
+            let ctx_fallback_models = ctx.phase_fallback_models(phase_id);
+            let ctx_fallback_tools = ctx.phase_fallback_tools(phase_id);
             let runtime_settings = Some(WorkflowPhaseRuntimeSettings {
-                tool: cli_tool_override.or_else(|| merged_runtime.phase_tool_override(phase_id)).map(ToOwned::to_owned),
+                tool: cli_tool_override.map(ToOwned::to_owned).or(ctx_tool_override),
                 tool_profile: merged_runtime.phase_tool_profile(phase_id).map(ToOwned::to_owned),
-                model: cli_model_override
-                    .or_else(|| merged_runtime.phase_model_override(phase_id))
-                    .map(ToOwned::to_owned),
-                fallback_models: merged_runtime.phase_fallback_models(phase_id),
-                fallback_tools: merged_runtime.phase_fallback_tools(phase_id),
+                model: cli_model_override.map(ToOwned::to_owned).or(ctx_model_override),
+                fallback_models: ctx_fallback_models,
+                fallback_tools: ctx_fallback_tools,
                 reasoning_effort: merged_runtime.phase_reasoning_effort(phase_id).map(ToOwned::to_owned),
                 web_search: merged_runtime.phase_web_search(phase_id),
                 network_access: merged_runtime.phase_network_access(phase_id),
