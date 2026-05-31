@@ -1,0 +1,82 @@
+[package]
+name = "animus-workflow-runner-default"
+version = "0.1.0"
+edition = "2021"
+description = "Reference workflow_runner plugin for Animus v0.5 (lift-and-shift of in-tree workflow-runner-v2)"
+license = "Elastic-2.0"
+repository = "https://github.com/launchapp-dev/animus-workflow-runner-default"
+
+[lib]
+name = "animus_workflow_runner_default"
+path = "src/lib.rs"
+
+[[bin]]
+name = "animus-workflow-runner-default"
+path = "src/main.rs"
+
+[dependencies]
+# --- v0.5 protocol crates (tagged at animus-protocol v0.5.0) ----------------
+animus-plugin-protocol      = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.5.0" }
+animus-subject-protocol     = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.5.0" }
+animus-workflow-runner-protocol = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.5.0" }
+# animus-plugin-runtime is currently provider-specific (run_provider/ProviderBackend);
+# this plugin implements its own JSON-RPC stdio loop using the protocol types above.
+# Re-pin once the runtime exposes a generic register_method! shell.
+animus-plugin-runtime       = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.5.0" }
+
+# --- ao-cli helper crates (pinned to main; switch to branch = "v0.5" after Wave 3) -
+# TODO(v0.5-wave3): repin all of these to `branch = "v0.5"` once that branch
+# exists on origin. Today there is no v0.5 branch on launchapp-dev/animus-cli.
+agent-runner               = { git = "https://github.com/launchapp-dev/animus-cli", rev = "e02ae75b79558029cf1dfb92b787d8fd8d54c641" }
+protocol                   = { git = "https://github.com/launchapp-dev/animus-cli", rev = "e02ae75b79558029cf1dfb92b787d8fd8d54c641", package = "protocol" }
+orchestrator-core          = { git = "https://github.com/launchapp-dev/animus-cli", rev = "e02ae75b79558029cf1dfb92b787d8fd8d54c641" }
+orchestrator-config        = { git = "https://github.com/launchapp-dev/animus-cli", rev = "e02ae75b79558029cf1dfb92b787d8fd8d54c641" }
+orchestrator-store         = { git = "https://github.com/launchapp-dev/animus-cli", rev = "e02ae75b79558029cf1dfb92b787d8fd8d54c641" }
+orchestrator-providers     = { git = "https://github.com/launchapp-dev/animus-cli", rev = "e02ae75b79558029cf1dfb92b787d8fd8d54c641" }
+orchestrator-git-ops       = { git = "https://github.com/launchapp-dev/animus-cli", rev = "e02ae75b79558029cf1dfb92b787d8fd8d54c641" }
+orchestrator-notifications = { git = "https://github.com/launchapp-dev/animus-cli", rev = "e02ae75b79558029cf1dfb92b787d8fd8d54c641" }
+orchestrator-logging       = { git = "https://github.com/launchapp-dev/animus-cli", rev = "e02ae75b79558029cf1dfb92b787d8fd8d54c641" }
+
+# --- stdlib-ish deps (move with the crate) ----------------------------------
+anyhow = "1.0"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive"] }
+dirs = "5"
+jsonschema = "0.45"
+regex = "1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "process", "time", "net", "sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+assert_cmd = "2.0"
+tempfile = "3.10"
+
+# v0.5 lift: mirror the relevant relaxations from ao-cli's workspace lints
+# so the (byte-identical) lifted modules clear `clippy -- -D warnings`. As
+# the standalone package matures these allowances can be tightened
+# function-by-function.
+[lints.rust]
+unsafe_code = "deny"
+unused_must_use = "warn"
+
+[lints.clippy]
+too_many_arguments = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+doc_markdown = "allow"
+struct_excessive_bools = "allow"
+too_many_lines = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+cast_lossless = "allow"
+similar_names = "allow"
+wildcard_imports = "allow"
