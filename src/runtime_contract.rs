@@ -634,6 +634,15 @@ pub fn inject_memory_mcp_for_capable_agent(
 }
 
 fn current_ao_command() -> Option<String> {
+    // Codex P2 #4: prefer the host-supplied
+    // `init_extensions.memory_mcp_stdio_command` override before falling
+    // back to sibling-binary discovery. Standalone plugin deployments
+    // (no co-located `animus` CLI) can now inject memory MCP by setting
+    // the init extension on `InitializeParams`.
+    if let Some(command) = crate::plugin::memory_mcp_stdio_command_override() {
+        return Some(command);
+    }
+
     let exe = std::env::current_exe().ok()?;
     let exe_dir = exe.parent()?;
     let ao_binary = exe_dir.join("animus");
@@ -645,7 +654,7 @@ fn current_ao_command() -> Option<String> {
         // memory MCP CLI. Return None so the caller can omit the memory
         // MCP injection instead of starting a recursive workflow-runner
         // process. The daemon SHOULD supply an explicit `stdio_command`
-        // when memory MCP is required; tracked as v0.6.
+        // when memory MCP is required.
         None
     }
 }
@@ -1058,6 +1067,65 @@ mod tests {
 
         validate_basic_json_schema(&decision_without_evidence, &schema)
             .expect("phase decision without evidence field should validate when no required evidence types");
+    }
+
+    /// Codex P2 #4: when the daemon supplies `init_extensions.memory_mcp_stdio_command`,
+    /// the plugin uses that explicit binary path instead of probing for a
+    /// sibling `animus`. Exercises the override path via `install_plugin_state`.
+    #[test]
+    fn inject_memory_mcp_uses_init_extension_stdio_command_override() {
+        use crate::plugin::{install_plugin_state, PluginState};
+        use std::sync::Arc;
+
+        // Drop any sibling `animus` so the test can prove the override is the
+        // sole reason the injection succeeds.
+        let exe = std::env::current_exe().expect("test binary path");
+        let exe_dir = exe.parent().expect("test binary parent dir");
+        let sibling = exe_dir.join("animus");
+        let _ = std::fs::remove_file(&sibling);
+
+        let stub_command = "/opt/host/bin/host-supplied-memory-mcp";
+        // Install plugin state with the override but the test uses a tempdir
+        // FileServiceHub to satisfy the constructor.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let hub: Arc<dyn orchestrator_core::services::ServiceHub> =
+            Arc::new(orchestrator_core::FileServiceHub::new(temp.path()).expect("filehub"));
+        install_plugin_state(PluginState {
+            project_root: temp.path().to_path_buf(),
+            repo_scope: None,
+            hub,
+            memory_mcp_stdio_command: Some(stub_command.to_string()),
+        });
+
+        let workflow_config = workflow_config_with_phase_agent("research", "default");
+        let agent_runtime_config = agent_runtime_config_with_memory("default", true);
+        let ctx = RuntimeConfigContext { agent_runtime_config, workflow_config };
+
+        let mut runtime_contract = serde_json::json!({
+            "cli": { "capabilities": { "supports_mcp": true } },
+            "mcp": { "agent_id": "animus" }
+        });
+        inject_memory_mcp_for_capable_agent(&mut runtime_contract, "/tmp/project", &ctx, "research");
+
+        let entry = runtime_contract
+            .pointer("/mcp/additional_servers/animus.memory")
+            .expect("animus.memory server entry should be injected when init-extension override is set");
+        assert_eq!(
+            entry.pointer("/command").and_then(Value::as_str),
+            Some(stub_command),
+            "init-extension stdio command override must be used"
+        );
+
+        // Reset the global override so other tests in the same process do
+        // not inherit it. (PluginState is process-global via OnceLock + Mutex.)
+        let hub2: Arc<dyn orchestrator_core::services::ServiceHub> =
+            Arc::new(orchestrator_core::FileServiceHub::new(temp.path()).expect("filehub reset"));
+        install_plugin_state(PluginState {
+            project_root: temp.path().to_path_buf(),
+            repo_scope: None,
+            hub: hub2,
+            memory_mcp_stdio_command: None,
+        });
     }
 
     /// Codex P2 #1 (mcp_config wire-through): when the host supplies a

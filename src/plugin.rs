@@ -42,12 +42,20 @@ pub const PLUGIN_DESCRIPTION: &str =
     "Reference workflow_runner plugin for Animus v0.5 (lift-and-shift of in-tree workflow-runner-v2)";
 /// Init-extension key for the v0.5 project binding map.
 pub const PROJECT_BINDING_EXTENSION: &str = "project_binding";
+/// Init-extension key for an explicit memory MCP stdio command path supplied
+/// by the host daemon (codex P2 #4). When set, the plugin uses this command
+/// instead of probing for a sibling `animus` binary. Documented in README.
+pub const MEMORY_MCP_STDIO_COMMAND_EXTENSION: &str = "memory_mcp_stdio_command";
 
 /// Per-process plugin state established at `initialize` time.
 pub struct PluginState {
     pub project_root: PathBuf,
     pub repo_scope: Option<String>,
     pub hub: Arc<dyn ServiceHub>,
+    /// Optional host-supplied memory MCP stdio command path. When `Some`,
+    /// `inject_memory_mcp_for_capable_agent` prefers it over the
+    /// sibling-binary discovery fallback. See README "init_extensions".
+    pub memory_mcp_stdio_command: Option<String>,
 }
 
 static PLUGIN_STATE: OnceLock<Mutex<Option<Arc<PluginState>>>> = OnceLock::new();
@@ -61,6 +69,14 @@ fn state_slot() -> &'static Mutex<Option<Arc<PluginState>>> {
 pub fn install_plugin_state(state: PluginState) {
     let mut guard = state_slot().lock().unwrap();
     *guard = Some(Arc::new(state));
+}
+
+/// Best-effort read of the optional `memory_mcp_stdio_command` override
+/// supplied via init_extensions. Returns `None` when the plugin is not
+/// initialized or no override was supplied; callers MUST fall back to
+/// sibling-binary discovery (and finally refusal) in that case.
+pub fn memory_mcp_stdio_command_override() -> Option<String> {
+    state_slot().lock().ok().and_then(|guard| guard.as_ref().and_then(|state| state.memory_mcp_stdio_command.clone()))
 }
 
 /// Read the current plugin state. Returns an error if `initialize` has not
@@ -161,7 +177,29 @@ pub fn plugin_initialize_result(params: &InitializeParams) -> Result<InitializeR
             .map_err(|error| anyhow!("failed to open FileServiceHub for {project_root}: {error}"))?,
     );
 
-    install_plugin_state(PluginState { project_root: project_root_path, repo_scope, hub });
+    // Codex P2 #4: optional `memory_mcp_stdio_command` init-extension lets the
+    // daemon supply an explicit memory MCP binary path so the plugin does not
+    // need to discover a sibling `animus` binary. Accepts either a bare
+    // string or an object with `command` / `path`.
+    let memory_mcp_stdio_command = params
+        .init_extensions
+        .get(MEMORY_MCP_STDIO_COMMAND_EXTENSION)
+        .and_then(|value| {
+            value
+                .as_str()
+                .map(ToOwned::to_owned)
+                .or_else(|| value.get("command").and_then(Value::as_str).map(ToOwned::to_owned))
+                .or_else(|| value.get("path").and_then(Value::as_str).map(ToOwned::to_owned))
+        })
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    install_plugin_state(PluginState {
+        project_root: project_root_path,
+        repo_scope,
+        hub,
+        memory_mcp_stdio_command,
+    });
 
     let mut kind_capabilities = HashMap::new();
     kind_capabilities.insert(
