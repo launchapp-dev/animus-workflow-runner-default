@@ -173,17 +173,29 @@ impl RuntimeConfigContext {
     }
 
     pub fn phase_fallback_tools(&self, phase_id: &str) -> Vec<String> {
-        if let Some(values) = self.yaml_phase_runtime(phase_id).map(|r| {
-            r.fallback_tools
+        if let Some(yaml_runtime) = self.yaml_phase_runtime(phase_id) {
+            let yaml_tools: Vec<String> = yaml_runtime
+                .fallback_tools
                 .iter()
                 .map(String::as_str)
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(ToOwned::to_owned)
-                .collect::<Vec<_>>()
-        }) {
-            if !values.is_empty() {
-                return values;
+                .collect();
+            if !yaml_tools.is_empty() {
+                return yaml_tools;
+            }
+            // Codex P2 round 6: when YAML defines `fallback_models` but omits
+            // `fallback_tools`, do NOT fall back to the agent_runtime_config
+            // tools — those are paired by index with the runtime config's
+            // models and would mismatch the YAML-supplied models (e.g.
+            // YAML `fallback_models: [gemini-2.5-pro]` paired with inherited
+            // `fallback_tools: [codex]`). Return an empty vec so the phase
+            // target planner auto-derives the tool from the model.
+            let yaml_supplied_fallback_models =
+                yaml_runtime.fallback_models.iter().any(|value| !value.trim().is_empty());
+            if yaml_supplied_fallback_models {
+                return Vec::new();
             }
         }
         self.agent_runtime_config.phase_fallback_tools(phase_id)
@@ -258,6 +270,44 @@ mod tests {
         assert_eq!(ctx.phase_directive("implementation"), "yaml-directive");
         assert_eq!(ctx.phase_fallback_models("implementation"), vec!["yaml-fallback-model".to_string()]);
         assert_eq!(ctx.phase_fallback_tools("implementation"), vec!["yaml-fallback-tool".to_string()]);
+    }
+
+    /// Codex P2 round 6: when workflow YAML supplies `fallback_models` but
+    /// omits `fallback_tools`, the accessor must NOT pair the YAML models
+    /// with inherited agent_runtime_config tools (which are paired by index
+    /// with the agent_runtime_config models, not the YAML models). Returning
+    /// an empty fallback_tools vec lets the phase target planner auto-derive
+    /// the correct tool from each YAML model.
+    #[test]
+    fn yaml_fallback_models_without_yaml_fallback_tools_returns_empty_tools() {
+        let override_def = PhaseExecutionDefinition {
+            mode: PhaseExecutionMode::Agent,
+            agent_id: None,
+            directive: None,
+            system_prompt: None,
+            runtime: Some(AgentRuntimeOverrides {
+                fallback_models: vec!["gemini-2.5-pro".to_string()],
+                // fallback_tools intentionally omitted
+                ..Default::default()
+            }),
+            capabilities: None,
+            output_contract: None,
+            output_json_schema: None,
+            decision_contract: None,
+            retry: None,
+            skills: Vec::new(),
+            command: None,
+            manual: None,
+            default_tool: None,
+            idempotency: Default::default(),
+        };
+        let ctx = make_ctx_with_yaml_override("implementation", override_def);
+
+        assert_eq!(ctx.phase_fallback_models("implementation"), vec!["gemini-2.5-pro".to_string()]);
+        assert!(
+            ctx.phase_fallback_tools("implementation").is_empty(),
+            "YAML fallback_models without YAML fallback_tools must NOT inherit unrelated agent_runtime_config tools — they would mismatch by index"
+        );
     }
 
     /// When the YAML phase definition omits a field, the accessor must fall
