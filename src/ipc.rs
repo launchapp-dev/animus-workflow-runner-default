@@ -247,8 +247,14 @@ pub fn build_runtime_contract_with_resume_and_mcp_config(
     resume_plan: Option<&orchestrator_core::runtime_contract::CliSessionResumePlan>,
     mcp_config: &protocol::McpRuntimeConfig,
 ) -> Option<Value> {
-    let mcp_endpoint = mcp_config.endpoint.clone();
-    let mcp_agent_id = mcp_config.agent_id.clone();
+    // Codex P3 follow-up: trim blank endpoints / agent ids to `None` so they
+    // don't enable `mcp.enforce_only` without a usable transport, which
+    // would break phase execution in standalone deployments without a
+    // stdio command or sibling binary.
+    let mcp_endpoint =
+        mcp_config.endpoint.as_deref().map(str::trim).filter(|value| !value.is_empty()).map(ToOwned::to_owned);
+    let mcp_agent_id =
+        mcp_config.agent_id.as_deref().map(str::trim).filter(|value| !value.is_empty()).map(ToOwned::to_owned);
 
     let runtime_contract = runtime_contract::build_runtime_contract(
         tool,
