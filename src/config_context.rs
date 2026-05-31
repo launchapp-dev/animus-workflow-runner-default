@@ -1,15 +1,16 @@
-// TODO(codex-p2): workflow YAML phase definitions are read by
-// `workflow_config::phase_execution()` (which gives workflow-local
-// definitions precedence over agent_runtime_config), but the accessors
-// below currently consult only `agent_runtime_config`. This was the
-// upstream behavior of `workflow-runner-v2` at lift time — fixing it
-// requires also threading `workflow_config` into every accessor, which
-// is more invasive than a 10-LOC inline fix. Track in v0.6.
+// Phase accessors give workflow YAML phase definitions precedence over the
+// agent_runtime_config fallback. Pre-lift behaviour of `workflow-runner-v2`
+// silently dropped workflow YAML overrides for many accessors below; this
+// module now consults `workflow_config.phase_definitions` first (via the
+// shared `phase_execution()` helper) and falls back to the agent runtime
+// config only when the YAML definition does not supply the field. (Codex
+// P2 #2.)
 
 use std::path::Path;
 
 use orchestrator_config::agent_runtime_config::{
-    PhaseCommandDefinition, PhaseDecisionContract, PhaseExecutionDefinition, PhaseExecutionMode, PhaseOutputContract,
+    AgentRuntimeOverrides, PhaseCommandDefinition, PhaseDecisionContract, PhaseExecutionDefinition,
+    PhaseExecutionMode, PhaseOutputContract,
 };
 use orchestrator_core::AgentRuntimeConfig;
 use protocol::PhaseCapabilities;
@@ -27,12 +28,22 @@ impl RuntimeConfigContext {
         Self { agent_runtime_config, workflow_config }
     }
 
+    /// Returns the workflow YAML phase definition when present, falling
+    /// back to `agent_runtime_config` so call sites can read a single
+    /// merged view.
     pub fn phase_execution(&self, phase_id: &str) -> Option<&PhaseExecutionDefinition> {
         self.workflow_config
             .config
             .phase_definitions
             .get(phase_id)
             .or_else(|| self.agent_runtime_config.phase_execution(phase_id))
+    }
+
+    /// Returns the workflow YAML `runtime` override block when present.
+    /// Helper used by the phase accessors below to express the
+    /// "YAML wins over agent_runtime_config" precedence.
+    fn yaml_phase_runtime(&self, phase_id: &str) -> Option<&AgentRuntimeOverrides> {
+        self.workflow_config.config.phase_definitions.get(phase_id).and_then(|def| def.runtime.as_ref())
     }
 
     pub fn phase_mode(&self, phase_id: &str) -> PhaseExecutionMode {
@@ -49,10 +60,32 @@ impl RuntimeConfigContext {
     }
 
     pub fn phase_system_prompt(&self, phase_id: &str) -> Option<String> {
+        if let Some(prompt) = self
+            .workflow_config
+            .config
+            .phase_definitions
+            .get(phase_id)
+            .and_then(|def| def.system_prompt.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Some(prompt.to_string());
+        }
         self.agent_runtime_config.phase_system_prompt(phase_id).map(ToOwned::to_owned)
     }
 
     pub fn phase_directive(&self, phase_id: &str) -> String {
+        if let Some(directive) = self
+            .workflow_config
+            .config
+            .phase_definitions
+            .get(phase_id)
+            .and_then(|def| def.directive.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return directive.to_string();
+        }
         self.agent_runtime_config
             .phase_directive(phase_id)
             .map(ToOwned::to_owned)
@@ -60,11 +93,25 @@ impl RuntimeConfigContext {
     }
 
     pub fn phase_capabilities(&self, phase_id: &str) -> PhaseCapabilities {
+        if let Some(caps) = self
+            .workflow_config
+            .config
+            .phase_definitions
+            .get(phase_id)
+            .and_then(|def| def.capabilities.clone())
+        {
+            return caps.merge_with_defaults(phase_id);
+        }
         self.agent_runtime_config.phase_capabilities(phase_id)
     }
 
     pub fn phase_output_contract(&self, phase_id: &str) -> Option<&PhaseOutputContract> {
-        self.agent_runtime_config.phase_output_contract(phase_id)
+        self.workflow_config
+            .config
+            .phase_definitions
+            .get(phase_id)
+            .and_then(|def| def.output_contract.as_ref())
+            .or_else(|| self.agent_runtime_config.phase_output_contract(phase_id))
     }
 
     pub fn phase_mcp_servers(&self, phase_id: &str) -> Vec<String> {
@@ -77,30 +124,178 @@ impl RuntimeConfigContext {
     }
 
     pub fn phase_output_json_schema(&self, phase_id: &str) -> Option<&Value> {
-        self.agent_runtime_config.phase_output_json_schema(phase_id)
+        self.workflow_config
+            .config
+            .phase_definitions
+            .get(phase_id)
+            .and_then(|def| def.output_json_schema.as_ref())
+            .or_else(|| self.agent_runtime_config.phase_output_json_schema(phase_id))
     }
 
     pub fn phase_decision_contract(&self, phase_id: &str) -> Option<&PhaseDecisionContract> {
-        self.agent_runtime_config.phase_decision_contract(phase_id)
+        self.workflow_config
+            .config
+            .phase_definitions
+            .get(phase_id)
+            .and_then(|def| def.decision_contract.as_ref())
+            .or_else(|| self.agent_runtime_config.phase_decision_contract(phase_id))
     }
 
     pub fn phase_tool_override(&self, phase_id: &str) -> Option<String> {
+        if let Some(value) =
+            self.yaml_phase_runtime(phase_id).and_then(|r| r.tool.as_deref()).map(str::trim).filter(|s| !s.is_empty())
+        {
+            return Some(value.to_string());
+        }
         self.agent_runtime_config.phase_tool_override(phase_id).map(ToOwned::to_owned)
     }
 
     pub fn phase_model_override(&self, phase_id: &str) -> Option<String> {
+        if let Some(value) =
+            self.yaml_phase_runtime(phase_id).and_then(|r| r.model.as_deref()).map(str::trim).filter(|s| !s.is_empty())
+        {
+            return Some(value.to_string());
+        }
         self.agent_runtime_config.phase_model_override(phase_id).map(ToOwned::to_owned)
     }
 
     pub fn phase_fallback_models(&self, phase_id: &str) -> Vec<String> {
+        if let Some(values) = self.yaml_phase_runtime(phase_id).map(|r| {
+            r.fallback_models
+                .iter()
+                .map(String::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        }) {
+            if !values.is_empty() {
+                return values;
+            }
+        }
         self.agent_runtime_config.phase_fallback_models(phase_id)
     }
 
     pub fn phase_fallback_tools(&self, phase_id: &str) -> Vec<String> {
+        if let Some(values) = self.yaml_phase_runtime(phase_id).map(|r| {
+            r.fallback_tools
+                .iter()
+                .map(String::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        }) {
+            if !values.is_empty() {
+                return values;
+            }
+        }
         self.agent_runtime_config.phase_fallback_tools(phase_id)
     }
 
     pub fn phase_command(&self, phase_id: &str) -> Option<&PhaseCommandDefinition> {
         self.phase_execution(phase_id).and_then(|def| def.command.as_ref())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use orchestrator_core::{
+        builtin_agent_runtime_config, builtin_workflow_config, workflow_config_hash, LoadedWorkflowConfig,
+        WorkflowConfigMetadata, WorkflowConfigSource,
+    };
+    use std::path::PathBuf;
+
+    fn make_ctx_with_yaml_override(phase_id: &str, def: PhaseExecutionDefinition) -> RuntimeConfigContext {
+        let mut workflow = builtin_workflow_config();
+        workflow.phase_definitions.insert(phase_id.to_string(), def);
+        let metadata = WorkflowConfigMetadata {
+            schema: workflow.schema.clone(),
+            version: workflow.version,
+            hash: workflow_config_hash(&workflow),
+            source: WorkflowConfigSource::Builtin,
+        };
+        RuntimeConfigContext {
+            agent_runtime_config: builtin_agent_runtime_config(),
+            workflow_config: LoadedWorkflowConfig {
+                metadata,
+                config: workflow,
+                path: PathBuf::from("builtin"),
+            },
+        }
+    }
+
+    /// Codex P2 #2: workflow YAML phase definitions must override
+    /// `agent_runtime_config` for `phase_tool_override`, `phase_model_override`,
+    /// `phase_system_prompt`, `phase_directive`, `phase_fallback_models`,
+    /// `phase_fallback_tools`, `phase_output_contract`, and
+    /// `phase_decision_contract`. Pre-fix these accessors silently dropped the
+    /// YAML override.
+    #[test]
+    fn yaml_phase_definition_overrides_agent_runtime_config() {
+        let override_def = PhaseExecutionDefinition {
+            mode: PhaseExecutionMode::Agent,
+            agent_id: Some("yaml-agent".to_string()),
+            directive: Some("yaml-directive".to_string()),
+            system_prompt: Some("yaml-system-prompt".to_string()),
+            runtime: Some(AgentRuntimeOverrides {
+                tool: Some("yaml-tool".to_string()),
+                model: Some("yaml-model".to_string()),
+                fallback_models: vec!["yaml-fallback-model".to_string()],
+                fallback_tools: vec!["yaml-fallback-tool".to_string()],
+                ..Default::default()
+            }),
+            capabilities: None,
+            output_contract: None,
+            output_json_schema: None,
+            decision_contract: None,
+            retry: None,
+            skills: Vec::new(),
+            command: None,
+            manual: None,
+            default_tool: None,
+            idempotency: Default::default(),
+        };
+        let ctx = make_ctx_with_yaml_override("implementation", override_def);
+
+        assert_eq!(ctx.phase_agent_id("implementation").as_deref(), Some("yaml-agent"));
+        assert_eq!(ctx.phase_tool_override("implementation").as_deref(), Some("yaml-tool"));
+        assert_eq!(ctx.phase_model_override("implementation").as_deref(), Some("yaml-model"));
+        assert_eq!(ctx.phase_system_prompt("implementation").as_deref(), Some("yaml-system-prompt"));
+        assert_eq!(ctx.phase_directive("implementation"), "yaml-directive");
+        assert_eq!(ctx.phase_fallback_models("implementation"), vec!["yaml-fallback-model".to_string()]);
+        assert_eq!(ctx.phase_fallback_tools("implementation"), vec!["yaml-fallback-tool".to_string()]);
+    }
+
+    /// When the YAML phase definition omits a field, the accessor must fall
+    /// back to `agent_runtime_config` (preserving pre-fix behavior for the
+    /// unspecified subset of fields).
+    #[test]
+    fn yaml_phase_definition_falls_back_to_agent_runtime_for_missing_fields() {
+        // YAML definition with only `agent_id` set — everything else should
+        // resolve from the agent_runtime_config side.
+        let sparse = PhaseExecutionDefinition {
+            mode: PhaseExecutionMode::Agent,
+            agent_id: Some("default".to_string()),
+            directive: None,
+            system_prompt: None,
+            runtime: None,
+            capabilities: None,
+            output_contract: None,
+            output_json_schema: None,
+            decision_contract: None,
+            retry: None,
+            skills: Vec::new(),
+            command: None,
+            manual: None,
+            default_tool: None,
+            idempotency: Default::default(),
+        };
+        let ctx = make_ctx_with_yaml_override("implementation", sparse);
+
+        // No YAML directive — fall through to agent_runtime_config or default
+        // string; either way it must not panic and must be non-empty.
+        assert!(!ctx.phase_directive("implementation").is_empty());
     }
 }
