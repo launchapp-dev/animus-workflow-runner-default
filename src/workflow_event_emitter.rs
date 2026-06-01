@@ -1,19 +1,24 @@
 //! Generic sink for workflow lifecycle events surfaced by
-//! [`crate::workflow_execute::execute_workflow`].
+//! [`crate::workflow_execute::execute_workflow_with_hub`].
 //!
-//! v0.5 lift-and-shift change: the legacy `SubprocessPipeEmitter` /
-//! `ANIMUS_WORKFLOW_EVENT_PIPE` back-channel was removed. The plugin process
-//! lives behind a JSON-RPC stdio boundary and returns its phase events as a
-//! `Vec<PhaseEvent>` field on the `workflow/execute` response (see
-//! [`crate::phase_event_recorder`]). The `WorkflowEventEmitter` trait survives
-//! because internal callers (workflow_execute, integration tests) still emit
-//! events through it; the daemon collects them by inspecting the response
-//! payload, not by listening on a side pipe.
+//! Two delivery paths coexist:
+//!
+//! 1. **JSON-RPC return value.** When the plugin runs via stdio JSON-RPC the
+//!    daemon collects `phase_events` directly from the `workflow/execute`
+//!    response (see [`crate::phase_event_recorder`]). No side channel.
+//! 2. **Subprocess back-channels.** When the plugin binary runs in
+//!    direct-execute mode (`animus-workflow-runner-default execute ...`,
+//!    spawned by the daemon scheduler), it streams events as they happen
+//!    via [`SubprocessPipeEmitter`] (legacy daemon-binds path) and
+//!    [`ReattachListenerEmitter`] (runner-binds reattach path). The runner
+//!    uses [`FanoutEmitter`] to drive both from one emit call.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
+#[cfg(unix)]
+use std::sync::Mutex;
 
 /// Kind discriminator for a [`RuntimeWorkflowEvent`].
 ///
@@ -49,9 +54,10 @@ pub struct RuntimeWorkflowEvent {
     pub occurred_at: DateTime<Utc>,
 }
 
-/// Wire form retained for back-compat with any tooling that previously
-/// consumed JSONL lines emitted by the deprecated subprocess pipe. The
-/// in-tree daemon should consume events from the JSON-RPC response now.
+/// Wire form sent across the subprocess back-channel pipe and the reattach
+/// listener. The runtime [`RuntimeWorkflowEventKind`] enum is serialized as
+/// its protocol wire string so the daemon-side reader can deserialize
+/// without a shared Rust dependency on the enum.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WireWorkflowEvent {
     pub workflow_id: String,
@@ -77,11 +83,119 @@ pub trait WorkflowEventEmitter: Send + Sync {
 
 pub type SharedWorkflowEventEmitter = Arc<dyn WorkflowEventEmitter>;
 
+/// Env var the daemon sets on workflow-runner spawn pointing at a
+/// pre-bound Unix-domain socket. When present the runner constructs a
+/// [`SubprocessPipeEmitter`] that streams [`WireWorkflowEvent`] lines back
+/// to the daemon.
+pub const ANIMUS_WORKFLOW_EVENT_PIPE_ENV: &str = "ANIMUS_WORKFLOW_EVENT_PIPE";
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoopWorkflowEventEmitter;
 
 impl WorkflowEventEmitter for NoopWorkflowEventEmitter {
     fn emit(&self, _event: RuntimeWorkflowEvent) {}
+}
+
+/// Subprocess-side emitter that serializes each event as a single JSON line
+/// to a Unix domain socket the daemon prebinds. Used by the workflow
+/// runner binary when [`ANIMUS_WORKFLOW_EVENT_PIPE_ENV`] is set.
+///
+/// The connection is established lazily on the first `emit` call and held
+/// open for the lifetime of the emitter. If the daemon closes its end mid
+/// stream we silently swallow subsequent write errors — losing a phase
+/// boundary event is strictly preferable to crashing the runner.
+///
+/// Windows: not implemented; [`SubprocessPipeEmitter::new`] returns `None`
+/// and callers fall back to [`NoopWorkflowEventEmitter`].
+pub struct SubprocessPipeEmitter {
+    #[cfg(unix)]
+    inner: Mutex<Option<std::os::unix::net::UnixStream>>,
+    #[cfg(unix)]
+    socket_path: std::path::PathBuf,
+}
+
+impl SubprocessPipeEmitter {
+    /// Construct from an explicit socket path. Returns `None` on platforms
+    /// where the back-channel is not implemented (currently: non-Unix).
+    #[cfg(unix)]
+    pub fn new(socket_path: impl Into<std::path::PathBuf>) -> Option<Arc<Self>> {
+        Some(Arc::new(Self { inner: Mutex::new(None), socket_path: socket_path.into() }))
+    }
+
+    #[cfg(not(unix))]
+    pub fn new(_socket_path: impl Into<std::path::PathBuf>) -> Option<Arc<Self>> {
+        None
+    }
+
+    /// Construct from the [`ANIMUS_WORKFLOW_EVENT_PIPE_ENV`] env var. Returns
+    /// `None` if the env var is unset, empty, or the platform does not
+    /// support the back-channel.
+    pub fn from_env() -> Option<Arc<Self>> {
+        let path = std::env::var(ANIMUS_WORKFLOW_EVENT_PIPE_ENV).ok()?;
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        Self::new(trimmed)
+    }
+}
+
+#[cfg(unix)]
+impl WorkflowEventEmitter for SubprocessPipeEmitter {
+    fn emit(&self, event: RuntimeWorkflowEvent) {
+        use std::io::Write;
+        let wire = WireWorkflowEvent::from(&event);
+        let mut line = match serde_json::to_string(&wire) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        line.push('\n');
+
+        let mut guard = match self.inner.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        if guard.is_none() {
+            match std::os::unix::net::UnixStream::connect(&self.socket_path) {
+                Ok(stream) => {
+                    *guard = Some(stream);
+                }
+                Err(_) => return,
+            }
+        }
+        if let Some(stream) = guard.as_mut() {
+            if stream.write_all(line.as_bytes()).is_err() {
+                *guard = None;
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+impl WorkflowEventEmitter for SubprocessPipeEmitter {
+    fn emit(&self, _event: RuntimeWorkflowEvent) {}
+}
+
+/// Fan-out emitter that forwards every event to multiple underlying
+/// emitters. Used by the workflow runner binary to drive both the legacy
+/// daemon-bound [`SubprocessPipeEmitter`] and the v0.5.1 reattach listener
+/// from a single phase-execution emit call.
+pub struct FanoutEmitter {
+    sinks: Vec<SharedWorkflowEventEmitter>,
+}
+
+impl FanoutEmitter {
+    pub fn new(sinks: Vec<SharedWorkflowEventEmitter>) -> Arc<Self> {
+        Arc::new(Self { sinks })
+    }
+}
+
+impl WorkflowEventEmitter for FanoutEmitter {
+    fn emit(&self, event: RuntimeWorkflowEvent) {
+        for sink in &self.sinks {
+            sink.emit(event.clone());
+        }
+    }
 }
 
 #[cfg(test)]

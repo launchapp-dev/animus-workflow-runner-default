@@ -1,13 +1,19 @@
 //! `animus-workflow-runner-default` binary entrypoint.
 //!
-//! Implements the v0.5 plugin contract: newline-delimited JSON-RPC 2.0 over
-//! stdio. The host (the daemon's plugin manager) speaks
-//! `animus-plugin-protocol@1.1.0`; this binary handles `initialize`,
-//! `$/ping`, `health/check`, `shutdown`, `exit`, plus the two
-//! `workflow_runner` methods (`workflow/execute`, `workflow/run_phase`).
+//! Implements TWO modes:
 //!
-//! Supports `--manifest` for install-time discovery (matches the convention
-//! used by `animus-plugin-runtime`'s providers).
+//! 1. **JSON-RPC stdio plugin** (default). Listens for newline-delimited
+//!    JSON-RPC 2.0 frames on stdin and replies on stdout per the
+//!    `animus-plugin-protocol@1.1.0` contract. Handles `initialize`,
+//!    `$/ping`, `health/check`, `shutdown`, `exit`, plus the two
+//!    `workflow_runner` methods (`workflow/execute`, `workflow/run_phase`).
+//!
+//! 2. **Direct-execute CLI** (`execute` subcommand). Invoked by the daemon
+//!    scheduler as a subprocess to run a single workflow end-to-end. This
+//!    matches the legacy `animus-workflow-runner` CLI surface so the
+//!    daemon's `build_runner_command` path keeps working unchanged.
+//!
+//! Also supports `--manifest` for install-time discovery.
 
 use std::io::{self, IsTerminal, Write};
 use std::sync::Arc;
@@ -24,9 +30,21 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
+mod direct_execute;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    handle_cli_args();
+    if let Some(action) = parse_cli_action() {
+        match action {
+            CliAction::Manifest => print_manifest_and_exit(),
+            CliAction::Help => print_help_and_exit(),
+            CliAction::Execute(args) => {
+                init_tracing();
+                let code = direct_execute::run_execute(*args).await;
+                std::process::exit(code as i32);
+            }
+        }
+    }
 
     if io::stdin().is_terminal() {
         eprintln!("animus-workflow-runner-default is a STDIO plugin; pipe JSON-RPC on stdin or pass --manifest");
@@ -34,7 +52,59 @@ async fn main() -> anyhow::Result<()> {
     }
 
     init_tracing();
+    run_stdio_plugin_loop().await
+}
 
+enum CliAction {
+    Manifest,
+    Help,
+    Execute(Box<direct_execute::ExecuteArgs>),
+}
+
+fn parse_cli_action() -> Option<CliAction> {
+    let mut args = std::env::args().skip(1).peekable();
+    let first = args.peek()?.clone();
+    match first.as_str() {
+        "--manifest" | "-m" => Some(CliAction::Manifest),
+        "--help" | "-h" => Some(CliAction::Help),
+        "execute" => {
+            args.next();
+            match direct_execute::ExecuteArgs::parse(args) {
+                Ok(parsed) => Some(CliAction::Execute(Box::new(parsed))),
+                Err(error) => {
+                    eprintln!("animus-workflow-runner-default execute: {error}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        _ => None,
+    }
+}
+
+fn init_tracing() {
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_env("RUST_LOG").unwrap_or_else(|_| "info".into()))
+        .try_init();
+}
+
+fn print_manifest_and_exit() -> ! {
+    let mut stdout = io::stdout().lock();
+    let _ = writeln!(stdout, "{}", serde_json::to_string(&plugin_manifest()).expect("serialize manifest"));
+    let _ = stdout.flush();
+    std::process::exit(0);
+}
+
+fn print_help_and_exit() -> ! {
+    eprintln!("animus-workflow-runner-default — Animus v0.5 workflow_runner plugin + direct-execute runner");
+    eprintln!("Usage:");
+    eprintln!("  animus-workflow-runner-default --manifest    Print plugin manifest as JSON and exit");
+    eprintln!("  animus-workflow-runner-default               Run JSON-RPC loop on stdin/stdout");
+    eprintln!("  animus-workflow-runner-default execute ...   Run a workflow end-to-end (CLI mode)");
+    std::process::exit(0);
+}
+
+async fn run_stdio_plugin_loop() -> anyhow::Result<()> {
     let stdout = Arc::new(Mutex::new(tokio::io::stdout()));
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin).lines();
@@ -59,36 +129,6 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
-}
-
-fn init_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_env("RUST_LOG").unwrap_or_else(|_| "info".into()))
-        .try_init();
-}
-
-fn handle_cli_args() {
-    for arg in std::env::args().skip(1) {
-        match arg.as_str() {
-            "--manifest" | "-m" => print_manifest_and_exit(),
-            "--help" | "-h" => {
-                eprintln!("animus-workflow-runner-default — STDIO workflow_runner plugin for Animus v0.5");
-                eprintln!("Usage:");
-                eprintln!("  animus-workflow-runner-default --manifest    Print plugin manifest as JSON and exit");
-                eprintln!("  animus-workflow-runner-default               Run JSON-RPC loop on stdin/stdout");
-                std::process::exit(0);
-            }
-            _ => {}
-        }
-    }
-}
-
-fn print_manifest_and_exit() -> ! {
-    let mut stdout = io::stdout().lock();
-    let _ = writeln!(stdout, "{}", serde_json::to_string(&plugin_manifest()).expect("serialize manifest"));
-    let _ = stdout.flush();
-    std::process::exit(0);
 }
 
 async fn handle_request(request: RpcRequest, stdout: Arc<Mutex<tokio::io::Stdout>>) {

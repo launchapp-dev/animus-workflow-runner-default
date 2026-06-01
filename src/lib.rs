@@ -30,6 +30,7 @@ pub mod phase_prompt;
 pub mod phase_session;
 pub mod phase_targets;
 pub mod plugin;
+pub mod reattach;
 pub mod runtime_contract;
 pub mod runtime_support;
 pub mod skill_dispatch;
@@ -69,14 +70,11 @@ pub use plugin::{
 };
 pub use runtime_support::*;
 pub use workflow_event_emitter::{
-    NoopWorkflowEventEmitter, RuntimeWorkflowEvent, RuntimeWorkflowEventKind, SharedWorkflowEventEmitter,
-    WireWorkflowEvent, WorkflowEventEmitter,
+    FanoutEmitter, NoopWorkflowEventEmitter, RuntimeWorkflowEvent, RuntimeWorkflowEventKind,
+    SharedWorkflowEventEmitter, SubprocessPipeEmitter, WireWorkflowEvent, WorkflowEventEmitter,
+    ANIMUS_WORKFLOW_EVENT_PIPE_ENV,
 };
-// `WorkflowExecuteParams` is an internal type (kept `pub(crate)` in
-// `workflow_execute.rs`); the publicly callable surface is
-// `handle_workflow_execute` (wire) and `execute_workflow_with_hub` (in-process
-// integration tests).
-pub use workflow_execute::execute_workflow_with_hub;
+pub use workflow_execute::{execute_workflow_with_hub, WorkflowExecuteInternalParams};
 pub use workflow_helpers::{
     task_requires_research, workflow_has_active_research, workflow_has_completed_research, PhaseExecutionEvent,
 };

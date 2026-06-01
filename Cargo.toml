@@ -1,8 +1,8 @@
 [package]
 name = "animus-workflow-runner-default"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
-description = "Reference workflow_runner plugin for Animus v0.5 (lift-and-shift of in-tree workflow-runner-v2)"
+description = "Reference workflow_runner plugin for Animus v0.5 (stdio JSON-RPC + direct-execute CLI; replaces in-tree workflow-runner-v2)"
 license = "Elastic-2.0"
 repository = "https://github.com/launchapp-dev/animus-workflow-runner-default"
 
