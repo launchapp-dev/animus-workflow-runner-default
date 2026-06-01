@@ -1,6 +1,6 @@
 [package]
 name = "animus-workflow-runner-default"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Reference workflow_runner plugin for Animus v0.5 (lift-and-shift of in-tree workflow-runner-v2)"
 license = "Elastic-2.0"
@@ -16,13 +16,13 @@ path = "src/main.rs"
 
 [dependencies]
 # --- v0.5 protocol crates (tagged at animus-protocol v0.5.0) ----------------
-animus-plugin-protocol      = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.5.0" }
-animus-subject-protocol     = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.5.0" }
-animus-workflow-runner-protocol = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.5.0" }
+animus-plugin-protocol      = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.5.1" }
+animus-subject-protocol     = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.5.1" }
+animus-workflow-runner-protocol = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.5.1" }
 # animus-plugin-runtime is currently provider-specific (run_provider/ProviderBackend);
 # this plugin implements its own JSON-RPC stdio loop using the protocol types above.
 # Re-pin once the runtime exposes a generic register_method! shell.
-animus-plugin-runtime       = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.5.0" }
+animus-plugin-runtime       = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.5.1" }
 
 # --- ao-cli helper crates (pinned to main; switch to branch = "v0.5" after Wave 3) -
 # TODO(v0.5-wave3): repin all of these to `branch = "v0.5"` once that branch

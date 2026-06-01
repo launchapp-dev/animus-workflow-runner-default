@@ -36,7 +36,7 @@ use crate::workflow_execute::{execute_workflow_with_hub, WorkflowExecuteInternal
 /// Plugin and binary name.
 pub const PLUGIN_NAME: &str = "animus-workflow-runner-default";
 /// Plugin semver (matches `Cargo.toml`).
-pub const PLUGIN_VERSION: &str = "0.1.0";
+pub const PLUGIN_VERSION: &str = "0.2.0";
 /// Plugin description.
 pub const PLUGIN_DESCRIPTION: &str =
     "Reference workflow_runner plugin for Animus v0.5 (lift-and-shift of in-tree workflow-runner-v2)";
@@ -393,11 +393,11 @@ fn workflow_status_to_wire(status: WorkflowStatus) -> &'static str {
     match status {
         WorkflowStatus::Completed => workflow_status::COMPLETED,
         WorkflowStatus::Running => workflow_status::RUNNING,
-        WorkflowStatus::Pending => workflow_status::RUNNING,
+        WorkflowStatus::Pending => workflow_status::PENDING,
         WorkflowStatus::Failed => workflow_status::FAILED,
         WorkflowStatus::Escalated => workflow_status::ESCALATED,
         WorkflowStatus::Cancelled => workflow_status::CANCELLED,
-        WorkflowStatus::Paused => workflow_status::RUNNING,
+        WorkflowStatus::Paused => workflow_status::PAUSED,
     }
 }
 
@@ -429,6 +429,15 @@ pub async fn handle_workflow_run_phase(request: WorkflowPhaseRunRequest) -> Resu
 
     let task_complexity = request.task_complexity.as_deref().and_then(parse_task_complexity);
 
+    // Per-call MCP runtime config (v0.2.0 protocol). Precedence:
+    //   1. request.mcp_config (per-call override)
+    //   2. None — runtime contract falls back to McpRuntimeConfig::default().
+    // The plugin does not persist a workflow-level mcp_config (workflow/execute
+    // carries it through `WorkflowExecuteInternalParams` only for the duration
+    // of that call), so per-phase replays MUST resupply it on the wire.
+    let mcp_config: Option<protocol::McpRuntimeConfig> =
+        request.mcp_config.clone().and_then(|value| serde_json::from_value(value).ok());
+
     let started = std::time::Instant::now();
     let run_result = crate::phase_executor::run_workflow_phase(&crate::phase_executor::PhaseRunParams {
         project_root: &project_root,
@@ -447,12 +456,7 @@ pub async fn handle_workflow_run_phase(request: WorkflowPhaseRunRequest) -> Resu
         schedule_input: request.schedule_input.as_deref(),
         routing: &routing,
         phase_timeout_secs: request.phase_timeout_secs,
-        // workflow/run_phase does not yet accept a per-call mcp_config on the
-        // wire; the single-phase scheduler calls this entry point and lacks a
-        // place for it in the protocol surface. Leave None and let the runtime
-        // contract fall back to the default. The bulk surface (workflow/execute)
-        // does thread mcp_config (codex P2 #1).
-        mcp_config: None,
+        mcp_config: mcp_config.as_ref(),
     })
     .await;
     let elapsed: Duration = started.elapsed();
@@ -562,5 +566,84 @@ mod tests {
         let err = anyhow!("PROJECT_BINDING_MISMATCH: bound to /a but request implied /b");
         let (code, _msg) = classify_error(&err);
         assert_eq!(code, error_codes::PROJECT_BINDING_MISMATCH);
+    }
+
+    #[test]
+    fn workflow_status_to_wire_emits_paused_vocabulary() {
+        assert_eq!(workflow_status_to_wire(WorkflowStatus::Paused), workflow_status::PAUSED);
+        assert_eq!(workflow_status_to_wire(WorkflowStatus::Paused), "paused");
+    }
+
+    #[test]
+    fn workflow_status_to_wire_emits_pending_vocabulary() {
+        assert_eq!(workflow_status_to_wire(WorkflowStatus::Pending), workflow_status::PENDING);
+        assert_eq!(workflow_status_to_wire(WorkflowStatus::Pending), "pending");
+    }
+
+    #[test]
+    fn workflow_status_to_wire_preserves_existing_states() {
+        assert_eq!(workflow_status_to_wire(WorkflowStatus::Completed), workflow_status::COMPLETED);
+        assert_eq!(workflow_status_to_wire(WorkflowStatus::Running), workflow_status::RUNNING);
+        assert_eq!(workflow_status_to_wire(WorkflowStatus::Failed), workflow_status::FAILED);
+        assert_eq!(workflow_status_to_wire(WorkflowStatus::Escalated), workflow_status::ESCALATED);
+        assert_eq!(workflow_status_to_wire(WorkflowStatus::Cancelled), workflow_status::CANCELLED);
+    }
+
+    fn make_phase_run_request(mcp_config: Option<Value>) -> WorkflowPhaseRunRequest {
+        WorkflowPhaseRunRequest {
+            execution_cwd: "/tmp/proj".to_string(),
+            workflow_id: "wf-1".to_string(),
+            workflow_ref: "default".to_string(),
+            subject_id: "task:TASK-1".to_string(),
+            subject_title: "title".to_string(),
+            subject_description: "desc".to_string(),
+            phase_id: "implementation".to_string(),
+            phase_attempt: 0,
+            phase_timeout_secs: None,
+            model_override: None,
+            tool_override: None,
+            task_complexity: None,
+            rework_context: None,
+            pipeline_vars: HashMap::new(),
+            dispatch_input: None,
+            schedule_input: None,
+            phase_routing: None,
+            mcp_config,
+        }
+    }
+
+    #[test]
+    fn workflow_run_phase_request_parses_mcp_config_when_present() {
+        let request = make_phase_run_request(Some(json!({
+            "stdio_command": "/opt/host/bin/host-mcp",
+            "stdio_args_json": "[\"--host\"]",
+            "agent_id": "host-agent"
+        })));
+        let parsed: Option<protocol::McpRuntimeConfig> =
+            request.mcp_config.clone().and_then(|value| serde_json::from_value(value).ok());
+        let parsed = parsed.expect("WorkflowPhaseRunRequest.mcp_config must parse into McpRuntimeConfig");
+        assert_eq!(parsed.stdio_command.as_deref(), Some("/opt/host/bin/host-mcp"));
+        assert_eq!(parsed.stdio_args_json.as_deref(), Some("[\"--host\"]"));
+        assert_eq!(parsed.agent_id.as_deref(), Some("host-agent"));
+    }
+
+    #[test]
+    fn workflow_run_phase_request_without_mcp_config_falls_back_to_none() {
+        let request = make_phase_run_request(None);
+        let parsed: Option<protocol::McpRuntimeConfig> =
+            request.mcp_config.clone().and_then(|value| serde_json::from_value(value).ok());
+        assert!(parsed.is_none(), "absent mcp_config must surface as None so the runtime contract uses defaults");
+    }
+
+    #[test]
+    fn workflow_run_phase_request_round_trips_mcp_config_through_serde() {
+        let original = make_phase_run_request(Some(json!({
+            "stdio_command": "/usr/bin/mcp",
+            "agent_id": "agent-x"
+        })));
+        let serialized = serde_json::to_value(&original).expect("serialize");
+        assert!(serialized.get("mcp_config").is_some(), "mcp_config must round-trip on the wire");
+        let back: WorkflowPhaseRunRequest = serde_json::from_value(serialized).expect("deserialize");
+        assert_eq!(back.mcp_config, original.mcp_config);
     }
 }
