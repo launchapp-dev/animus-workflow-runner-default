@@ -1,6 +1,6 @@
 [package]
 name = "animus-workflow-runner-default"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 description = "Reference workflow_runner plugin for Animus v0.5 (stdio JSON-RPC + direct-execute CLI; thin wrapper over animus-runtime-shared)"
 license = "Elastic-2.0"
@@ -32,18 +32,10 @@ orchestrator-git-ops       = { git = "https://github.com/launchapp-dev/animus-cl
 orchestrator-notifications = { git = "https://github.com/launchapp-dev/animus-cli", rev = "e02ae75b79558029cf1dfb92b787d8fd8d54c641" }
 orchestrator-logging       = { git = "https://github.com/launchapp-dev/animus-cli", rev = "e02ae75b79558029cf1dfb92b787d8fd8d54c641" }
 
-# v0.4.0: shared runtime modules moved out-of-tree to
+# v0.4.1: shared runtime modules consumed from out-of-tree
 # `launchapp-dev/animus-runtime-shared`. The plugin re-exports the shared
 # surface via `lib.rs` so existing downstream consumers stay source-compat.
-#
-# RELEASE BLOCKER for tag v0.4.0: this currently points at a sibling path
-# checkout. The runtime-shared crate must be published as
-# `launchapp-dev/animus-runtime-shared` v0.1.0 BEFORE the v0.4.0 tag of
-# this plugin can be consumed standalone. After publication, swap the
-# `path = "../animus-runtime-shared"` line for
-# `git = "https://github.com/launchapp-dev/animus-runtime-shared", tag = "v0.1.0"`
-# and re-cut the plugin tag as v0.4.1.
-animus-runtime-shared      = { path = "../animus-runtime-shared" }
+animus-runtime-shared      = { git = "https://github.com/launchapp-dev/animus-runtime-shared", tag = "v0.1.1" }
 
 # --- stdlib-ish deps (still needed by plugin-only modules) ------------------
 anyhow = "1.0"
@@ -64,7 +56,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 [dev-dependencies]
 assert_cmd = "2.0"
 tempfile = "3.10"
-animus-runtime-shared      = { path = "../animus-runtime-shared", features = ["test-fault"] }
+animus-runtime-shared      = { git = "https://github.com/launchapp-dev/animus-runtime-shared", tag = "v0.1.1", features = ["test-fault"] }
 
 # v0.5 lift: mirror the relevant relaxations from ao-cli's workspace lints
 # so the (byte-identical) lifted modules clear `clippy -- -D warnings`. As
