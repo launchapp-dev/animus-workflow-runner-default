@@ -8,7 +8,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command as TokioCommand;
 use tokio::time::timeout;
 
-use crate::payload_traversal::parse_phase_decision_from_text;
+use animus_runtime_shared::payload_traversal::parse_phase_decision_from_text;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CommandExecutionContext<'a> {
@@ -486,7 +486,7 @@ fn parse_command_json_output(stdout: &str) -> Result<Value> {
     if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
         return Ok(value);
     }
-    let payloads = crate::ipc::collect_json_payload_lines(stdout);
+    let payloads = animus_runtime_shared::ipc::collect_json_payload_lines(stdout);
     payloads
         .last()
         .map(|(_, payload)| payload.clone())

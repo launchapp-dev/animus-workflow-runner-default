@@ -1,93 +1,69 @@
 //! `animus-workflow-runner-default` — reference `workflow_runner` plugin for
-//! Animus v0.5. Lift-and-shift of the in-tree `workflow-runner-v2` crate
-//! wrapped with the JSON-RPC stdio plugin contract from
-//! `animus-workflow-runner-protocol`.
-//!
-//! See `docs/architecture/v0.5-protocol-specs.md` §1 in the kernel repo for
-//! the canonical wire contract.
+//! Animus v0.5. Plugin-private modules (`phase_executor`, `workflow_execute`,
+//! `phase_targets`, `phase_failover`, `phase_command`, `skill_dispatch`,
+//! `direct_exec`, `direct_execute`, `phase_event_recorder`, `plugin`) live
+//! here; the shared runtime modules (`agent_state`, `config_context`, `ipc`,
+//! `phase_session`, `phase_output`, `phase_prompt`, `phase_git`, `reattach`,
+//! `runtime_contract`, `runtime_support`, `workflow_event_emitter`,
+//! `workflow_helpers`, `workflow_merge_recovery`, `metrics_hook`,
+//! `notification_log`, `payload_traversal`, `ensure_execution_cwd`,
+//! `phase_metadata`) live in `animus-runtime-shared` and are re-exported
+//! below.
 
-pub mod agent_state;
-pub mod config_context;
 pub mod direct_exec;
-pub mod ensure_execution_cwd;
-// `ipc` here is the agent-runner Unix-socket bridge used by `phase_executor`
-// to dispatch agent processes — it is NOT the plugin-host JSON-RPC stdio
-// boundary. The kernel-extraction-v0.5.md brief's "delete ipc.rs" guidance
-// targeted a hypothetical workflow-runner subprocess pipe; the actual file
-// is load-bearing for in-process phase execution and is retained without
-// `pub use ipc::*` (only used internally by `phase_executor`).
-pub(crate) mod ipc;
-pub mod metrics_hook;
-pub mod notification_log;
-pub mod payload_traversal;
 pub mod phase_command;
 pub mod phase_event_recorder;
 pub mod phase_executor;
 pub mod phase_failover;
-pub mod phase_git;
-pub mod phase_output;
-pub mod phase_prompt;
-pub mod phase_session;
 pub mod phase_targets;
 pub mod plugin;
-pub mod reattach;
-pub mod runtime_contract;
-pub mod runtime_support;
 pub mod skill_dispatch;
-pub mod workflow_event_emitter;
 pub mod workflow_execute;
-pub mod workflow_helpers;
-pub mod workflow_merge_recovery;
 
-pub use agent_state::{
-    append_agent_memory, clear_agent_memory, delete_agent_memory_entry, list_agent_messages, load_agent_memory,
-    send_agent_message, AgentMemoryDocument, AgentMemoryEntry, AgentMessage,
+// Re-export every module from animus-runtime-shared so existing
+// `animus_workflow_runner_default::<module>::*` imports keep working.
+pub use animus_runtime_shared::{
+    agent_state, config_context, ensure_execution_cwd, ipc, metrics_hook, notification_log, payload_traversal,
+    phase_git, phase_metadata, phase_output, phase_prompt, phase_session, reattach, runtime_contract, runtime_support,
+    workflow_event_emitter, workflow_helpers, workflow_merge_recovery,
 };
-pub use ensure_execution_cwd::ensure_execution_cwd;
-pub use payload_traversal::{
-    fallback_implementation_commit_message, parse_commit_message_from_text, parse_phase_decision_from_text,
+
+pub use animus_runtime_shared::{
+    append_agent_memory, block_reason_sideeffecting, block_reason_unknown, build_phase_prompt, classify_phase_recovery,
+    clear_agent_memory, commit_implementation_changes, delete_agent_memory_entry,
+    ensure_execution_cwd as _ensure_execution_cwd, ensure_git_identity, fallback_implementation_commit_message,
+    git_has_pending_changes, install_memory_mcp_stdio_command_override, is_git_repo, is_phase_completed,
+    list_agent_messages, load_agent_memory, parse_commit_message_from_text, parse_phase_decision_from_text,
+    persist_phase_output, persist_resumed_phase_completion, phase_completion_marker_path, phase_idempotency_for,
+    phase_output_dir, phase_requires_commit_message, phase_requires_commit_message_with_config,
+    phase_requires_commit_message_with_ctx, phase_result_kind_for_ctx, read_persisted_decision, render_phase_prompt,
+    render_phase_prompt_with_ctx, render_phase_prompt_with_ctx_overrides, send_agent_message, task_requires_research,
+    validate_basic_json_schema, workflow_has_active_research, workflow_has_completed_research,
+    write_phase_completion_marker, AgentMemoryDocument, AgentMemoryEntry, AgentMessage, FanoutEmitter,
+    MergeConflictContext, NoopWorkflowEventEmitter, PersistedDecisionReadError, PersistedPhaseOutput,
+    PhaseCompletionMarker, PhaseExecutionEvent, PhaseExecutionMetadata, PhaseExecutionOutcome, PhaseExecutionSignal,
+    PhasePromptInputs, PhasePromptParams, PhaseRecoveryAction, PhaseRenderParams, RenderedPhasePrompt,
+    RuntimeWorkflowEvent, RuntimeWorkflowEventKind, SharedWorkflowEventEmitter, SubprocessPipeEmitter,
+    WireWorkflowEvent, WorkflowEventEmitter, ANIMUS_WORKFLOW_EVENT_PIPE_ENV,
 };
+
 pub use phase_event_recorder::{workflow_events_path, PhaseEventRecorder};
 pub use phase_executor::{
-    load_agent_runtime_config, run_workflow_phase, CliPhaseExecutor, PhaseExecuteOverrides, PhaseExecutionMetadata,
-    PhaseExecutionOutcome, PhaseExecutionSignal, PhaseRunParams, PhaseRunResult,
+    load_agent_runtime_config, run_workflow_phase, CliPhaseExecutor, PhaseExecuteOverrides, PhaseRunParams,
+    PhaseRunResult,
 };
 pub use phase_failover::{classify_phase_failure, PhaseFailureClassifier, PhaseFailureKind};
-pub use phase_git::{commit_implementation_changes, ensure_git_identity, git_has_pending_changes, is_git_repo};
-pub use phase_output::{
-    is_phase_completed, persist_phase_output, persist_resumed_phase_completion, phase_completion_marker_path,
-    phase_output_dir, read_persisted_decision, write_phase_completion_marker, PersistedDecisionReadError,
-    PersistedPhaseOutput, PhaseCompletionMarker,
-};
-pub use phase_prompt::{
-    build_phase_prompt, phase_requires_commit_message, phase_requires_commit_message_with_config, render_phase_prompt,
-    PhasePromptInputs, PhasePromptParams, PhaseRenderParams, RenderedPhasePrompt,
-};
 pub use phase_targets::PhaseTargetPlanner;
 pub use plugin::{
     handle_workflow_execute, handle_workflow_run_phase, plugin_initialize_result, plugin_manifest, PluginState,
     PROJECT_BINDING_EXTENSION,
 };
-pub use runtime_support::*;
-pub use workflow_event_emitter::{
-    FanoutEmitter, NoopWorkflowEventEmitter, RuntimeWorkflowEvent, RuntimeWorkflowEventKind,
-    SharedWorkflowEventEmitter, SubprocessPipeEmitter, WireWorkflowEvent, WorkflowEventEmitter,
-    ANIMUS_WORKFLOW_EVENT_PIPE_ENV,
-};
 pub use workflow_execute::{execute_workflow_with_hub, WorkflowExecuteInternalParams};
-pub use workflow_helpers::{
-    task_requires_research, workflow_has_active_research, workflow_has_completed_research, PhaseExecutionEvent,
-};
-pub use workflow_merge_recovery::{
-    block_reason_sideeffecting, block_reason_unknown, classify_phase_recovery, phase_idempotency_for,
-    MergeConflictContext, PhaseRecoveryAction,
-};
 
 #[cfg(test)]
 pub(crate) mod test_env {
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
-    /// Returns the per-process test home directory and pins HOME to it on first call.
     pub fn stable_test_home() -> &'static std::path::Path {
         static HOME: OnceLock<std::path::PathBuf> = OnceLock::new();
         HOME.get_or_init(|| {
@@ -100,11 +76,6 @@ pub(crate) mod test_env {
         })
     }
 
-    /// Process-wide lock for tests that depend on `protocol::scoped_state_root`. Hold the guard
-    /// for the entirety of the test body. Diagnosed cause: under parallel cargo-test execution,
-    /// scope-dir state in `~/.animus/.../` accumulates from many concurrent tempdirs and triggers
-    /// `find_existing_scope_by_origin` collisions / partial state visibility that flips
-    /// scoped_state_root's resolved path between writes and reads. Serializing avoids the race.
     pub fn scoped_state_serializer() -> MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         stable_test_home();

@@ -22,7 +22,9 @@ use std::sync::Mutex;
 use animus_workflow_runner_protocol::PhaseEvent;
 use chrono::Utc;
 
-use crate::workflow_event_emitter::{RuntimeWorkflowEvent, RuntimeWorkflowEventKind, WorkflowEventEmitter};
+use animus_runtime_shared::workflow_event_emitter::{
+    RuntimeWorkflowEvent, RuntimeWorkflowEventKind, WorkflowEventEmitter,
+};
 
 /// Accumulates protocol-shaped `PhaseEvent`s (returned to the daemon) and
 /// mirrors a `WorkflowEventEmitter` for the lifted internal call sites.

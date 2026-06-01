@@ -36,7 +36,7 @@ use crate::workflow_execute::{execute_workflow_with_hub, WorkflowExecuteInternal
 /// Plugin and binary name.
 pub const PLUGIN_NAME: &str = "animus-workflow-runner-default";
 /// Plugin semver (matches `Cargo.toml`).
-pub const PLUGIN_VERSION: &str = "0.3.0";
+pub const PLUGIN_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Plugin description.
 pub const PLUGIN_DESCRIPTION: &str =
     "Reference workflow_runner plugin for Animus v0.5 (stdio JSON-RPC + direct-execute CLI; replaces in-tree workflow-runner-v2)";
@@ -69,6 +69,11 @@ fn state_slot() -> &'static Mutex<Option<Arc<PluginState>>> {
 pub fn install_plugin_state(state: PluginState) {
     let mut guard = state_slot().lock().unwrap();
     *guard = Some(Arc::new(state));
+    drop(guard);
+    // Register the memory_mcp_stdio_command resolver with the shared
+    // runtime crate so `runtime_contract::current_ao_command` can read the
+    // host-supplied override without taking a crate dep on `crate::plugin`.
+    animus_runtime_shared::install_memory_mcp_stdio_command_override(Some(Box::new(memory_mcp_stdio_command_override)));
 }
 
 /// Best-effort read of the optional `memory_mcp_stdio_command` override
@@ -274,7 +279,7 @@ pub async fn handle_workflow_execute(request: WorkflowExecuteRequest) -> Result<
         mcp_config: request.mcp_config.clone().and_then(|value| serde_json::from_value(value).ok()),
     };
 
-    let recorder_dyn: crate::workflow_event_emitter::SharedWorkflowEventEmitter = recorder.clone();
+    let recorder_dyn: animus_runtime_shared::workflow_event_emitter::SharedWorkflowEventEmitter = recorder.clone();
     let internal = execute_workflow_with_hub(params, state.hub.clone(), Some(recorder_dyn)).await?;
 
     let phase_results = internal.phase_results.into_iter().map(snapshot_from_value).collect();

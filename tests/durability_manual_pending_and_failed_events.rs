@@ -86,18 +86,20 @@ fn replay_handles_missing_marker_for_manual_pending_phase_correctly() {
     // the workflow itself will re-pause), NOT silently advance.
     assert!(!is_phase_completed(&project_root, workflow_id, phase_id, 1));
 
-    // Sanity: had we written the legacy marker, the replay path would
-    // be tricked into treating the manual gate as completed — which is
-    // precisely the bug this fix avoids. Demonstrate the contrast:
-    let bad_outcome = PhaseExecutionOutcome::ManualPending {
-        instructions: "buggy persist".to_string(),
+    // animus-runtime-shared v0.1.0 fix (codex P2): persist_phase_output now
+    // skips write_phase_completion_marker for ManualPending outcomes, so the
+    // sibling <phase>.json gets written for the operator UI but the
+    // recovery oracle does NOT see the phase as completed.
+    let pending_outcome = PhaseExecutionOutcome::ManualPending {
+        instructions: "operator gate".to_string(),
         approval_note_required: false,
     };
-    persist_phase_output(&project_root, workflow_id, phase_id, 1, &bad_outcome).expect("simulate legacy bug");
+    persist_phase_output(&project_root, workflow_id, phase_id, 1, &pending_outcome).expect("persist");
     assert!(
-        is_phase_completed(&project_root, workflow_id, phase_id, 1),
-        "shows why legacy behavior was unsafe: marker advertises completion for a manual gate"
+        !is_phase_completed(&project_root, workflow_id, phase_id, 1),
+        "ManualPending must NOT write the completion marker — recovery would otherwise treat a manual gate as completed and advance the workflow",
     );
+    let _ = phase_completion_marker_path(&project_root, workflow_id, phase_id, 1);
 }
 
 #[test]

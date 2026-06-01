@@ -1,36 +1,35 @@
-use crate::config_context::RuntimeConfigContext;
-use crate::ipc::{
-    build_runtime_contract_with_resume_and_mcp_config, collect_json_payload_lines, connect_runner, event_matches_run,
-    run_dir as ipc_run_dir, runner_config_dir, write_json_line,
-};
-use crate::payload_traversal::{parse_commit_message_from_text, parse_phase_decision_from_text};
 use crate::phase_command::{
     build_command_phase_decision, build_command_result_payload, run_workflow_phase_with_command,
     CommandExecutionContext,
 };
 use crate::phase_failover::PhaseFailureClassifier;
-use crate::phase_git::commit_implementation_changes;
-use crate::phase_output::persist_phase_output;
-use crate::phase_prompt::{
+use crate::phase_targets::PhaseTargetPlanner;
+use crate::skill_dispatch;
+use animus_runtime_shared::config_context::RuntimeConfigContext;
+use animus_runtime_shared::ipc::{
+    build_runtime_contract_with_resume_and_mcp_config, collect_json_payload_lines, connect_runner, event_matches_run,
+    run_dir as ipc_run_dir, runner_config_dir, write_json_line,
+};
+use animus_runtime_shared::payload_traversal::{parse_commit_message_from_text, parse_phase_decision_from_text};
+use animus_runtime_shared::phase_git::commit_implementation_changes;
+use animus_runtime_shared::phase_output::persist_phase_output;
+use animus_runtime_shared::phase_prompt::{
     phase_requires_commit_message_with_ctx, phase_result_kind_for_ctx, render_phase_prompt_with_ctx_overrides,
     PhasePromptInputs, PhaseRenderParams,
 };
-use crate::phase_targets::PhaseTargetPlanner;
-use crate::runtime_contract::{
+use animus_runtime_shared::runtime_contract::{
     apply_phase_capability_launch_flags, inject_agent_tool_policy, inject_default_stdio_mcp_with_config,
     inject_memory_mcp_for_capable_agent, inject_named_mcp_servers, inject_project_mcp_servers,
     inject_response_schema_into_launch_args, inject_workflow_mcp_servers, phase_output_json_schema_for,
     phase_response_json_schema_for, set_mcp_tool_policy,
 };
-use crate::runtime_support::{
+use animus_runtime_shared::runtime_support::{
     inject_cli_launch_env, inject_cli_launch_overrides, phase_max_continuations, phase_runner_attempts,
     WorkflowPhaseRuntimeSettings,
 };
-use crate::skill_dispatch;
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use orchestrator_config::{skill_resolution::ResolvedSkill, SkillApplicationResult};
 use orchestrator_core::ServiceHub;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -304,40 +303,7 @@ fn hash_serializable<T: Serialize>(value: &T) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PhaseExecutionMetadata {
-    pub phase_id: String,
-    pub phase_mode: String,
-    pub phase_definition_hash: String,
-    pub agent_runtime_config_hash: String,
-    pub agent_runtime_schema: String,
-    pub agent_runtime_version: u32,
-    pub agent_runtime_source: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_profile_hash: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub selected_tool: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub selected_model: Option<String>,
-    #[serde(default)]
-    pub effective_capabilities: protocol::PhaseCapabilities,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub requested_skills: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub resolved_skills: Vec<ResolvedSkill>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub applied_skills: Vec<ResolvedSkill>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub skill_application: Option<SkillApplicationResult>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PhaseExecutionSignal {
-    pub event_type: String,
-    pub payload: Value,
-}
+pub use animus_runtime_shared::phase_metadata::{PhaseExecutionMetadata, PhaseExecutionOutcome, PhaseExecutionSignal};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PhaseRunResult {
@@ -395,22 +361,6 @@ impl std::fmt::Display for TerminalCheckpointError {
 }
 
 impl std::error::Error for TerminalCheckpointError {}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(clippy::large_enum_variant)]
-pub enum PhaseExecutionOutcome {
-    Completed {
-        commit_message: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        phase_decision: Option<orchestrator_core::PhaseDecision>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        result_payload: Option<Value>,
-    },
-    ManualPending {
-        instructions: String,
-        approval_note_required: bool,
-    },
-}
 
 fn outcome_verdict(outcome: &PhaseExecutionOutcome) -> orchestrator_core::PhaseDecisionVerdict {
     match outcome {
@@ -483,7 +433,7 @@ pub async fn run_workflow_phase_attempt(
     // RE-DISPATCH on the next tick (not terminally fail the workflow);
     // the [`DispatchRetryableError`] sentinel signals exactly that to
     // `execute_workflow`.
-    if let Err(err) = crate::phase_session::write_session_pending(
+    if let Err(err) = animus_runtime_shared::phase_session::write_session_pending(
         &scoped_state_root,
         workflow_id,
         phase_id,
@@ -505,18 +455,19 @@ pub async fn run_workflow_phase_attempt(
             ),
         }));
     }
-    let notification_log = match crate::notification_log::NotificationLog::open(&scoped_state_root, workflow_id) {
-        Ok(log) => Some(std::sync::Arc::new(log)),
-        Err(err) => {
-            warn!(
-                workflow_id = %workflow_id,
-                phase_id = %phase_id,
-                %err,
-                "failed to open notification log; continuing without durability"
-            );
-            None
-        }
-    };
+    let notification_log =
+        match animus_runtime_shared::notification_log::NotificationLog::open(&scoped_state_root, workflow_id) {
+            Ok(log) => Some(std::sync::Arc::new(log)),
+            Err(err) => {
+                warn!(
+                    workflow_id = %workflow_id,
+                    phase_id = %phase_id,
+                    %err,
+                    "failed to open notification log; continuing without durability"
+                );
+                None
+            }
+        };
     let request_mcp_stdio_command = request
         .context
         .pointer("/runtime_contract/mcp/stdio/command")
@@ -567,7 +518,9 @@ pub async fn run_workflow_phase_attempt(
     // to re-dispatch — re-dispatching while the first runner is still
     // executing would duplicate the side-effecting work, which is exactly
     // the crash-replay hazard we are fixing.
-    if let Err(err) = crate::phase_session::update_session_running(&scoped_state_root, workflow_id, phase_id) {
+    if let Err(err) =
+        animus_runtime_shared::phase_session::update_session_running(&scoped_state_root, workflow_id, phase_id)
+    {
         warn!(
             workflow_id = %workflow_id,
             phase_id = %phase_id,
@@ -618,8 +571,10 @@ pub async fn run_workflow_phase_attempt(
     // Final post-stream sidecar sweep is still worthwhile: handles the case
     // where the sidecar was only written immediately before the agent's
     // Finished event, after the loop's last polling tick.
-    if let Some(provider_session_id) = crate::phase_session::lookup_runner_session_sidecar(request.run_id.0.as_str()) {
-        if let Err(err) = crate::phase_session::update_provider_session_id(
+    if let Some(provider_session_id) =
+        animus_runtime_shared::phase_session::lookup_runner_session_sidecar(request.run_id.0.as_str())
+    {
+        if let Err(err) = animus_runtime_shared::phase_session::update_provider_session_id(
             &scoped_state_root,
             workflow_id,
             phase_id,
@@ -644,8 +599,11 @@ pub async fn run_workflow_phase_attempt(
             // `TerminalCheckpointError` so the agent retry/failover loop
             // refuses to redispatch the (already-successful) phase even if
             // the I/O message happens to match a transient-runner pattern.
-            if let Err(err) = crate::phase_session::update_session_completed(&scoped_state_root, workflow_id, phase_id)
-            {
+            if let Err(err) = animus_runtime_shared::phase_session::update_session_completed(
+                &scoped_state_root,
+                workflow_id,
+                phase_id,
+            ) {
                 warn!(
                     workflow_id = %workflow_id,
                     phase_id = %phase_id,
@@ -670,9 +628,12 @@ pub async fn run_workflow_phase_attempt(
             // `TerminalCheckpointError` blocks the agent retry/failover
             // loop from rerunning the phase on I/O messages that overlap
             // the transient-runner classifier.
-            if let Err(err) =
-                crate::phase_session::update_session_failed(&scoped_state_root, workflow_id, phase_id, &reason)
-            {
+            if let Err(err) = animus_runtime_shared::phase_session::update_session_failed(
+                &scoped_state_root,
+                workflow_id,
+                phase_id,
+                &reason,
+            ) {
                 warn!(
                     workflow_id = %workflow_id,
                     phase_id = %phase_id,
@@ -739,10 +700,13 @@ fn maybe_poll_sidecar(
         return;
     }
     *last_poll = Instant::now();
-    let Some(provider_session_id) = crate::phase_session::lookup_runner_session_sidecar(ctx.run_id.as_str()) else {
+    let Some(provider_session_id) =
+        animus_runtime_shared::phase_session::lookup_runner_session_sidecar(ctx.run_id.as_str())
+    else {
         return;
     };
-    match crate::phase_session::read_checkpoint(&ctx.scoped_state_root, &ctx.workflow_id, &ctx.phase_id) {
+    match animus_runtime_shared::phase_session::read_checkpoint(&ctx.scoped_state_root, &ctx.workflow_id, &ctx.phase_id)
+    {
         Ok(Some(checkpoint)) => {
             if checkpoint.provider_session_id.as_deref() == Some(provider_session_id.as_str()) {
                 *captured = true;
@@ -764,7 +728,7 @@ fn maybe_poll_sidecar(
             return;
         }
     }
-    if let Err(err) = crate::phase_session::update_provider_session_id(
+    if let Err(err) = animus_runtime_shared::phase_session::update_provider_session_id(
         &ctx.scoped_state_root,
         &ctx.workflow_id,
         &ctx.phase_id,
@@ -791,7 +755,7 @@ async fn process_phase_event_stream<R: AsyncBufRead + Unpin>(
     expected_result_kind: &str,
     event_run_dir: Option<&std::path::Path>,
     project_root: Option<&str>,
-    notification_log: Option<std::sync::Arc<crate::notification_log::NotificationLog>>,
+    notification_log: Option<std::sync::Arc<animus_runtime_shared::notification_log::NotificationLog>>,
     sidecar_poll: Option<SidecarPollContext>,
 ) -> Result<PhaseExecutionOutcome> {
     let run_logger =
@@ -860,7 +824,7 @@ async fn process_phase_event_stream<R: AsyncBufRead + Unpin>(
         };
 
         if let Some(dir) = event_run_dir {
-            if let Err(error) = crate::ipc::persist_run_event(dir, &event) {
+            if let Err(error) = animus_runtime_shared::ipc::persist_run_event(dir, &event) {
                 tracing::warn!(
                     run_id = %run_id.0,
                     phase_id,
@@ -1642,7 +1606,7 @@ async fn run_workflow_phase_with_agent(params: PhaseAgentParams<'_>) -> Result<A
                         if phase_requires_commit_message_with_ctx(ctx, phase_id) {
                             if let PhaseExecutionOutcome::Completed { commit_message, .. } = &mut outcome {
                                 let resolved_commit_message = commit_message.clone().unwrap_or_else(|| {
-                                    crate::payload_traversal::fallback_implementation_commit_message(
+                                    animus_runtime_shared::payload_traversal::fallback_implementation_commit_message(
                                         subject_id,
                                         subject_title,
                                     )
@@ -1867,7 +1831,7 @@ pub async fn run_workflow_phase(params: &PhaseRunParams<'_>) -> Result<PhaseRunR
     let start = std::time::Instant::now();
     let phase_id_for_metric = params.phase_id.to_string();
     let result = run_workflow_phase_inner(params).await;
-    crate::metrics_hook::observe_phase_duration(&phase_id_for_metric, start.elapsed());
+    animus_runtime_shared::metrics_hook::observe_phase_duration(&phase_id_for_metric, start.elapsed());
     result
 }
 
@@ -2258,7 +2222,7 @@ mod tests {
         phase_outcome_is_complete, phase_session_resume_plan, process_phase_event_stream, resolve_claude_profile_env,
         PhaseExecutionOutcome, SidecarPollContext,
     };
-    use crate::runtime_support::{inject_cli_launch_env, WorkflowPhaseRuntimeSettings};
+    use animus_runtime_shared::runtime_support::{inject_cli_launch_env, WorkflowPhaseRuntimeSettings};
 
     use std::collections::BTreeMap;
 
@@ -2608,7 +2572,7 @@ mod tests {
     // and the guard is uncontended for the duration of one test.
     #[allow(clippy::await_holding_lock)]
     async fn provider_session_id_persisted_within_500ms_of_arrival() {
-        use crate::phase_session::{read_checkpoint, write_session_pending, SessionCheckpointStatus};
+        use animus_runtime_shared::phase_session::{read_checkpoint, write_session_pending, SessionCheckpointStatus};
         use std::time::{Duration, Instant};
         use tokio::io::{duplex, AsyncWriteExt};
 
@@ -3099,14 +3063,14 @@ mod tests {
     // Running checkpoint to shield in-flight phases across daemon restart.
     //
     // The fault-injection seam lives in
-    // [`crate::phase_session::test_fault`]: it arms a per-thread fault for
+    // [`animus_runtime_shared::phase_session::test_fault`]: it arms a per-thread fault for
     // a single checkpoint operation and the matching `write_session_*` /
     // `update_session_*` call returns `io::ErrorKind::PermissionDenied`
     // exactly once. We use the seam to assert each of the three failure
     // modes propagates as an `Err` rather than being silently swallowed.
     mod checkpoint_failure_propagation {
         use super::super::run_workflow_phase_attempt;
-        use crate::phase_session::test_fault::{FaultGuard, FaultOp};
+        use animus_runtime_shared::phase_session::test_fault::{FaultGuard, FaultOp};
         use protocol::{AgentRunRequest, ModelId, RunId, PROTOCOL_VERSION};
 
         fn make_request() -> AgentRunRequest {
@@ -3125,7 +3089,7 @@ mod tests {
         // next call passes through).
         #[test]
         fn fault_seam_arms_and_disarms_correctly() {
-            use crate::phase_session::write_session_pending;
+            use animus_runtime_shared::phase_session::write_session_pending;
             let tmp = tempfile::tempdir().expect("tempdir");
             let _guard = FaultGuard::arm(FaultOp::Pending);
             let err = write_session_pending(tmp.path(), "wf", "phase", "claude", "run-1", None)
@@ -3186,7 +3150,7 @@ mod tests {
         // as the regression test for the propagation path.
         #[test]
         fn running_checkpoint_fault_returns_io_error_through_seam() {
-            use crate::phase_session::{update_session_running, write_session_pending};
+            use animus_runtime_shared::phase_session::{update_session_running, write_session_pending};
             let tmp = tempfile::tempdir().expect("tempdir");
             // Seed a Pending checkpoint so the mutate() lookup succeeds
             // before the fault check fires inside update_session_running.
@@ -3230,7 +3194,9 @@ mod tests {
         // dispatch end-to-end is out of scope for this unit test).
         #[test]
         fn terminal_checkpoint_faults_return_io_errors_through_seam() {
-            use crate::phase_session::{update_session_completed, update_session_failed, write_session_pending};
+            use animus_runtime_shared::phase_session::{
+                update_session_completed, update_session_failed, write_session_pending,
+            };
             let tmp = tempfile::tempdir().expect("tempdir");
 
             write_session_pending(tmp.path(), "wf-c", "impl", "claude", "run-c", None).expect("seed");

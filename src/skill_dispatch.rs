@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::warn;
 
-use crate::config_context::RuntimeConfigContext;
+use animus_runtime_shared::config_context::RuntimeConfigContext;
 
 fn collect_phase_skills(ctx: &RuntimeConfigContext, phase_id: &str) -> Vec<String> {
     let wf_phase_skills =
@@ -211,9 +211,11 @@ pub fn inject_skill_overrides(runtime_contract: &mut Value, tool_id: &str, skill
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ipc::build_runtime_contract_with_resume;
-    use crate::phase_prompt::{render_phase_prompt_with_ctx_overrides, PhasePromptInputs, PhaseRenderParams};
-    use crate::runtime_contract::{inject_named_mcp_servers, set_mcp_tool_policy};
+    use animus_runtime_shared::ipc::build_runtime_contract_with_resume;
+    use animus_runtime_shared::phase_prompt::{
+        render_phase_prompt_with_ctx_overrides, PhasePromptInputs, PhaseRenderParams,
+    };
+    use animus_runtime_shared::runtime_contract::{inject_named_mcp_servers, set_mcp_tool_policy};
 
     use orchestrator_config::workflow_config::McpServerDefinition;
     use orchestrator_core::{

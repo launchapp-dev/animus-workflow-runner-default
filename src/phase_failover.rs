@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 
 use serde_json::Value;
 
-use crate::ipc::collect_json_payload_lines;
+use animus_runtime_shared::ipc::collect_json_payload_lines;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PhaseFailureKind {

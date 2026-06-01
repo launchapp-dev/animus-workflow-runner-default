@@ -22,12 +22,14 @@ use orchestrator_core::{
     PhaseDecisionVerdict, SubjectRef, WorkflowEvent, WorkflowRunInput, WorkflowStatus, SUBJECT_KIND_CUSTOM,
 };
 
-use crate::ensure_execution_cwd::ensure_execution_cwd;
 use crate::phase_executor::{run_workflow_phase, PhaseExecuteOverrides, PhaseExecutionOutcome, PhaseRunParams};
-use crate::phase_output::{
+use animus_runtime_shared::ensure_execution_cwd::ensure_execution_cwd;
+use animus_runtime_shared::phase_output::{
     is_phase_completed, persist_phase_output, phase_output_dir, read_persisted_decision, PersistedPhaseOutput,
 };
-use crate::workflow_event_emitter::{RuntimeWorkflowEvent, RuntimeWorkflowEventKind, SharedWorkflowEventEmitter};
+use animus_runtime_shared::workflow_event_emitter::{
+    RuntimeWorkflowEvent, RuntimeWorkflowEventKind, SharedWorkflowEventEmitter,
+};
 
 // v0.5 IPC-safety changes:
 //   * The legacy in-process `PhaseEvent<'a>` enum + `PhaseEventCallback`
@@ -1035,24 +1037,35 @@ fn persist_phase_output_without_marker(
     let dir = phase_output_dir(project_root, workflow_id);
     std::fs::create_dir_all(&dir)?;
 
-    let (verdict, confidence, reason, commit_message, evidence, guardrail_violations, payload) = match outcome {
-        PhaseExecutionOutcome::Completed { commit_message, phase_decision, result_payload } => {
-            let (v, c, r, ev, gv) = match phase_decision {
-                Some(decision) => (
-                    Some(format!("{:?}", decision.verdict).to_ascii_lowercase()),
-                    Some(decision.confidence),
-                    if decision.reason.is_empty() { None } else { Some(decision.reason.clone()) },
-                    decision.evidence.clone(),
-                    decision.guardrail_violations.clone(),
-                ),
-                None => (Some("advance".to_string()), None, None, Vec::new(), Vec::new()),
-            };
-            (v, c, r, commit_message.clone(), ev, gv, result_payload.clone())
-        }
-        PhaseExecutionOutcome::ManualPending { instructions, .. } => {
-            (Some("manual_pending".to_string()), None, Some(instructions.clone()), None, Vec::new(), Vec::new(), None)
-        }
-    };
+    let (verdict, confidence, reason, risk, target_phase, commit_message, evidence, guardrail_violations, payload) =
+        match outcome {
+            PhaseExecutionOutcome::Completed { commit_message, phase_decision, result_payload } => {
+                let (v, c, r, risk, target, ev, gv) = match phase_decision {
+                    Some(decision) => (
+                        Some(format!("{:?}", decision.verdict).to_ascii_lowercase()),
+                        Some(decision.confidence),
+                        if decision.reason.is_empty() { None } else { Some(decision.reason.clone()) },
+                        Some(format!("{:?}", decision.risk).to_ascii_lowercase()),
+                        decision.target_phase.clone(),
+                        decision.evidence.clone(),
+                        decision.guardrail_violations.clone(),
+                    ),
+                    None => (Some("advance".to_string()), None, None, None, None, Vec::new(), Vec::new()),
+                };
+                (v, c, r, risk, target, commit_message.clone(), ev, gv, result_payload.clone())
+            }
+            PhaseExecutionOutcome::ManualPending { instructions, .. } => (
+                Some("manual_pending".to_string()),
+                None,
+                Some(instructions.clone()),
+                None,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                None,
+            ),
+        };
 
     let output = PersistedPhaseOutput {
         phase_id: phase_id.to_string(),
@@ -1060,6 +1073,8 @@ fn persist_phase_output_without_marker(
         verdict,
         confidence,
         reason,
+        risk,
+        target_phase,
         commit_message,
         evidence,
         guardrail_violations,
@@ -2836,7 +2851,7 @@ mod post_success_merge_tests {
 #[cfg(test)]
 mod phase_filter_marker_tests {
     use super::*;
-    use crate::phase_output::{is_phase_completed, persist_phase_output, phase_completion_marker_path};
+    use animus_runtime_shared::phase_output::{is_phase_completed, persist_phase_output, phase_completion_marker_path};
     use orchestrator_core::{PhaseDecision, PhaseDecisionVerdict, WorkflowDecisionRisk};
     use uuid::Uuid;
 
@@ -2976,7 +2991,7 @@ mod phase_filter_marker_tests {
     // assertion and matches the daemon_run.rs precedent the brief cites.
     #[test]
     fn persist_phase_output_fault_seam_returns_error() {
-        use crate::phase_output::test_fault::FaultGuard;
+        use animus_runtime_shared::phase_output::test_fault::FaultGuard;
         use orchestrator_core::{PhaseDecision, PhaseDecisionVerdict, WorkflowDecisionRisk};
 
         let tmp = std::env::temp_dir().join(format!("animus-test-persist-fault-{}", Uuid::new_v4()));
@@ -3020,7 +3035,7 @@ mod phase_filter_marker_tests {
         // after fixing the I/O condition). This test simulates the exact
         // sequence: persist (with fault) → observe Err → fail phase →
         // do NOT advance → verify hub state: failed but at original phase.
-        use crate::phase_output::test_fault::FaultGuard;
+        use animus_runtime_shared::phase_output::test_fault::FaultGuard;
         use orchestrator_core::services::ServiceHub as ServiceHubTrait;
         use orchestrator_core::{
             InMemoryServiceHub, Priority, TaskCreateInput, TaskStatus, TaskType, WorkflowRunInput, WorkflowStatus,

@@ -1,8 +1,8 @@
 [package]
 name = "animus-workflow-runner-default"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
-description = "Reference workflow_runner plugin for Animus v0.5 (stdio JSON-RPC + direct-execute CLI; replaces in-tree workflow-runner-v2)"
+description = "Reference workflow_runner plugin for Animus v0.5 (stdio JSON-RPC + direct-execute CLI; thin wrapper over animus-runtime-shared)"
 license = "Elastic-2.0"
 repository = "https://github.com/launchapp-dev/animus-workflow-runner-default"
 
@@ -15,18 +15,13 @@ name = "animus-workflow-runner-default"
 path = "src/main.rs"
 
 [dependencies]
-# --- v0.5 protocol crates (tagged at animus-protocol v0.5.0) ----------------
+# --- v0.5 protocol crates (tagged at animus-protocol v0.5.1) ----------------
 animus-plugin-protocol      = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.5.1" }
 animus-subject-protocol     = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.5.1" }
 animus-workflow-runner-protocol = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.5.1" }
-# animus-plugin-runtime is currently provider-specific (run_provider/ProviderBackend);
-# this plugin implements its own JSON-RPC stdio loop using the protocol types above.
-# Re-pin once the runtime exposes a generic register_method! shell.
 animus-plugin-runtime       = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.5.1" }
 
 # --- ao-cli helper crates (pinned to main; switch to branch = "v0.5" after Wave 3) -
-# TODO(v0.5-wave3): repin all of these to `branch = "v0.5"` once that branch
-# exists on origin. Today there is no v0.5 branch on launchapp-dev/animus-cli.
 agent-runner               = { git = "https://github.com/launchapp-dev/animus-cli", rev = "e02ae75b79558029cf1dfb92b787d8fd8d54c641" }
 protocol                   = { git = "https://github.com/launchapp-dev/animus-cli", rev = "e02ae75b79558029cf1dfb92b787d8fd8d54c641", package = "protocol" }
 orchestrator-core          = { git = "https://github.com/launchapp-dev/animus-cli", rev = "e02ae75b79558029cf1dfb92b787d8fd8d54c641" }
@@ -37,7 +32,20 @@ orchestrator-git-ops       = { git = "https://github.com/launchapp-dev/animus-cl
 orchestrator-notifications = { git = "https://github.com/launchapp-dev/animus-cli", rev = "e02ae75b79558029cf1dfb92b787d8fd8d54c641" }
 orchestrator-logging       = { git = "https://github.com/launchapp-dev/animus-cli", rev = "e02ae75b79558029cf1dfb92b787d8fd8d54c641" }
 
-# --- stdlib-ish deps (move with the crate) ----------------------------------
+# v0.4.0: shared runtime modules moved out-of-tree to
+# `launchapp-dev/animus-runtime-shared`. The plugin re-exports the shared
+# surface via `lib.rs` so existing downstream consumers stay source-compat.
+#
+# RELEASE BLOCKER for tag v0.4.0: this currently points at a sibling path
+# checkout. The runtime-shared crate must be published as
+# `launchapp-dev/animus-runtime-shared` v0.1.0 BEFORE the v0.4.0 tag of
+# this plugin can be consumed standalone. After publication, swap the
+# `path = "../animus-runtime-shared"` line for
+# `git = "https://github.com/launchapp-dev/animus-runtime-shared", tag = "v0.1.0"`
+# and re-cut the plugin tag as v0.4.1.
+animus-runtime-shared      = { path = "../animus-runtime-shared" }
+
+# --- stdlib-ish deps (still needed by plugin-only modules) ------------------
 anyhow = "1.0"
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
@@ -56,6 +64,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 [dev-dependencies]
 assert_cmd = "2.0"
 tempfile = "3.10"
+animus-runtime-shared      = { path = "../animus-runtime-shared", features = ["test-fault"] }
 
 # v0.5 lift: mirror the relevant relaxations from ao-cli's workspace lints
 # so the (byte-identical) lifted modules clear `clippy -- -D warnings`. As
@@ -80,3 +89,8 @@ cast_precision_loss = "allow"
 cast_lossless = "allow"
 similar_names = "allow"
 wildcard_imports = "allow"
+
+# --- Local dev path overrides (untracked via .gitignore) --------------------
+# See .cargo/config.toml for the `paths` entries that point at sibling
+# checkouts during local iteration.
+

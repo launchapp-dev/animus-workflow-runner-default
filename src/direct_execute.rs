@@ -5,16 +5,14 @@
 //! changes. Bridges argv into [`crate::workflow_execute::execute_workflow_with_hub`]
 //! after constructing a fresh [`orchestrator_core::FileServiceHub`] and
 //! composing the back-channel emitter set
-//! ([`crate::workflow_event_emitter::SubprocessPipeEmitter`] +
-//! [`crate::reattach::ReattachListenerEmitter`]).
+//! ([`animus_runtime_shared::workflow_event_emitter::SubprocessPipeEmitter`] +
+//! [`animus_runtime_shared::reattach::ReattachListenerEmitter`]).
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use animus_workflow_runner_default::reattach::ReattachListenerEmitter;
-use animus_workflow_runner_default::workflow_event_emitter::{
-    FanoutEmitter, SharedWorkflowEventEmitter, SubprocessPipeEmitter,
-};
+use animus_runtime_shared::reattach::ReattachListenerEmitter;
+use animus_runtime_shared::workflow_event_emitter::{FanoutEmitter, SharedWorkflowEventEmitter, SubprocessPipeEmitter};
 use animus_workflow_runner_default::workflow_execute::{execute_workflow_with_hub, WorkflowExecuteInternalParams};
 use orchestrator_core::{FileServiceHub, WorkflowStatus};
 use orchestrator_logging::Logger;
@@ -428,20 +426,16 @@ mod tests {
         // the reattach socket env vars are set, so compose should yield None
         // (callers fall back to the noop emitter).
         let prev_pipe =
-            std::env::var(animus_workflow_runner_default::workflow_event_emitter::ANIMUS_WORKFLOW_EVENT_PIPE_ENV).ok();
-        let prev_reattach =
-            std::env::var(animus_workflow_runner_default::reattach::ANIMUS_WORKFLOW_REATTACH_SOCKET_ENV).ok();
-        std::env::remove_var(animus_workflow_runner_default::workflow_event_emitter::ANIMUS_WORKFLOW_EVENT_PIPE_ENV);
-        std::env::remove_var(animus_workflow_runner_default::reattach::ANIMUS_WORKFLOW_REATTACH_SOCKET_ENV);
+            std::env::var(animus_runtime_shared::workflow_event_emitter::ANIMUS_WORKFLOW_EVENT_PIPE_ENV).ok();
+        let prev_reattach = std::env::var(animus_runtime_shared::reattach::ANIMUS_WORKFLOW_REATTACH_SOCKET_ENV).ok();
+        std::env::remove_var(animus_runtime_shared::workflow_event_emitter::ANIMUS_WORKFLOW_EVENT_PIPE_ENV);
+        std::env::remove_var(animus_runtime_shared::reattach::ANIMUS_WORKFLOW_REATTACH_SOCKET_ENV);
         assert!(compose_event_emitter().is_none());
         if let Some(v) = prev_pipe {
-            std::env::set_var(
-                animus_workflow_runner_default::workflow_event_emitter::ANIMUS_WORKFLOW_EVENT_PIPE_ENV,
-                v,
-            );
+            std::env::set_var(animus_runtime_shared::workflow_event_emitter::ANIMUS_WORKFLOW_EVENT_PIPE_ENV, v);
         }
         if let Some(v) = prev_reattach {
-            std::env::set_var(animus_workflow_runner_default::reattach::ANIMUS_WORKFLOW_REATTACH_SOCKET_ENV, v);
+            std::env::set_var(animus_runtime_shared::reattach::ANIMUS_WORKFLOW_REATTACH_SOCKET_ENV, v);
         }
     }
 }
