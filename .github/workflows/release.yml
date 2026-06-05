@@ -62,7 +62,7 @@ jobs:
 
       - name: Build release binary
         shell: bash
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }}
 
       - name: Stage artifact
         shell: bash
