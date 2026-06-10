@@ -247,6 +247,206 @@ fn runtime_contract_additional_server_names(contract: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Convert the assembled runtime contract's `mcp` block into the canonical
+/// plugin-protocol `mcp_servers` map the provider receives as
+/// `AgentRunRequest.mcp_servers`: a JSON object keyed by server name where a
+/// stdio entry is `{"command", "args", "env"}` and a remote entry is
+/// `{"type": "http"|"sse", "url", "headers"}`.
+///
+/// Mirrors ao-cli's `contract_mcp_servers_for_wire` (the ad-hoc
+/// `animus agent run` / `animus chat` channel) so both dispatch paths
+/// resolve the SAME map for the same contract, including the secret
+/// handling: a resolved `Authorization` header or literal `env` value is
+/// never copied. A remote entry whose resolved `Authorization` header was
+/// stripped (the broker `manual_bearer` / `client_credentials` /
+/// `refresh_token` flows) is repointed at the local `animus-mcp-proxy`
+/// stdio bridge — exactly how `authorization_code` servers are already
+/// shaped — so the provider still reaches the server while the secret never
+/// rides the wire. An entry whose stripped secret cannot be proxied (a
+/// stdio server with literal `env` values) is omitted entirely.
+fn runtime_contract_wire_mcp_servers(contract: &Value, project_root: &str) -> serde_json::Map<String, Value> {
+    let mut servers = serde_json::Map::new();
+
+    if let Some(stdio) = contract.pointer("/mcp/stdio").and_then(Value::as_object) {
+        if let Some(command) = stdio.get("command").and_then(Value::as_str).filter(|c| !c.trim().is_empty()) {
+            let mut entry = serde_json::Map::new();
+            entry.insert("command".to_string(), Value::String(command.to_string()));
+            if let Some(args) = stdio.get("args") {
+                entry.insert("args".to_string(), args.clone());
+            }
+            let name = contract
+                .pointer("/mcp/agent_id")
+                .and_then(Value::as_str)
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or("animus");
+            servers.insert(name.to_string(), Value::Object(entry));
+        }
+    }
+
+    if let Some(additional) = contract.pointer("/mcp/additional_servers").and_then(Value::as_object) {
+        for (name, entry) in additional {
+            if let Some(wire_entry) = wire_mcp_server_entry(name, entry, project_root) {
+                servers.insert(name.clone(), wire_entry);
+            } else {
+                tracing::warn!(
+                    server = %name,
+                    "Skipping mcp_servers wire entry for an MCP server that is malformed or whose resolved secret cannot be forwarded"
+                );
+            }
+        }
+    }
+
+    servers
+}
+
+/// Shape one `/mcp/additional_servers` entry for the wire map. A remote
+/// entry carrying a resolved `Authorization` header is rewritten to the
+/// local `animus-mcp-proxy` stdio entry (the proxy resolves the live token
+/// itself at connect time). Returns `None` when the entry carries a
+/// resolved secret the proxy cannot serve (a literal — non-`${VAR}` —
+/// `env` value without a proxyable remote URL); the caller omits the
+/// server. The resolved secret itself is NEVER copied onto the wire.
+fn wire_mcp_server_entry(name: &str, entry: &Value, project_root: &str) -> Option<Value> {
+    let source = entry.as_object()?;
+    let mut wire = serde_json::Map::new();
+
+    let mut placeholder_env = serde_json::Map::new();
+    let mut stripped_env_secret = false;
+    if let Some(env) = source.get("env").and_then(Value::as_object) {
+        for (key, value) in env {
+            if value.as_str().is_some_and(is_env_placeholder) {
+                placeholder_env.insert(key.clone(), value.clone());
+            } else {
+                stripped_env_secret = true;
+            }
+        }
+    }
+
+    let mut kept_headers = serde_json::Map::new();
+    let mut stripped_authorization = false;
+    if let Some(headers) = source.get("headers").and_then(Value::as_object) {
+        for (key, value) in headers {
+            if key.eq_ignore_ascii_case("authorization") {
+                stripped_authorization = true;
+            } else {
+                kept_headers.insert(key.clone(), value.clone());
+            }
+        }
+    }
+
+    let url = source.get("url").and_then(Value::as_str).map(str::trim).filter(|url| !url.is_empty());
+
+    if stripped_authorization {
+        // A resolved bearer (broker manual_bearer / client_credentials /
+        // refresh_token flows) never rides the wire: repoint the entry at
+        // the local proxy, mirroring the authorization_code rewrite the
+        // contract assembler already performs. The proxy needs the upstream
+        // URL; a header-bearing entry without one is omitted.
+        return url.map(|url| mcp_proxy_wire_entry(name, url, placeholder_env, project_root));
+    }
+    if stripped_env_secret {
+        return None;
+    }
+    if !placeholder_env.is_empty() {
+        wire.insert("env".to_string(), Value::Object(placeholder_env));
+    }
+    if !kept_headers.is_empty() {
+        wire.insert("headers".to_string(), Value::Object(kept_headers));
+    }
+
+    if let Some(url) = url {
+        // Remote entry: keyed by `type` (from the contract's `transport`,
+        // defaulting to http); a vacuous empty `command`/`args` is dropped.
+        let kind = match source.get("transport").and_then(Value::as_str) {
+            Some("sse") => "sse",
+            _ => "http",
+        };
+        wire.insert("type".to_string(), Value::String(kind.to_string()));
+        wire.insert("url".to_string(), Value::String(url.to_string()));
+        if let Some(command) = source.get("command").and_then(Value::as_str).filter(|c| !c.trim().is_empty()) {
+            wire.insert("command".to_string(), Value::String(command.to_string()));
+            if let Some(args) = source.get("args") {
+                wire.insert("args".to_string(), args.clone());
+            }
+        }
+    } else {
+        // Stdio entry: keyed by `command`; the `transport` marker is dropped.
+        let command = source.get("command").and_then(Value::as_str).map(str::trim).filter(|c| !c.is_empty())?;
+        wire.insert("command".to_string(), Value::String(command.to_string()));
+        if let Some(args) = source.get("args") {
+            wire.insert("args".to_string(), args.clone());
+        }
+    }
+
+    Some(Value::Object(wire))
+}
+
+/// Whether an env value is an unresolved `${VAR}` / `${VAR:-default}`
+/// placeholder (safe to forward; the provider CLI expands it) rather than a
+/// literal value (which may be a resolved secret).
+fn is_env_placeholder(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.starts_with("${") && trimmed.ends_with('}')
+}
+
+/// Base name of the local MCP OAuth proxy binary (ships next to `animus`).
+const MCP_PROXY_BIN: &str = "animus-mcp-proxy";
+
+/// Resolve the `animus-mcp-proxy` binary path, mirroring
+/// `animus-runtime-shared`'s resolution order: sibling of the host-supplied
+/// `animus` CLI path, then sibling of the current executable, then a bare
+/// PATH lookup.
+fn mcp_proxy_command() -> String {
+    let file_name = format!("{MCP_PROXY_BIN}{}", std::env::consts::EXE_SUFFIX);
+
+    if let Some(host_cli) = crate::plugin::memory_mcp_stdio_command_override() {
+        if let Some(dir) = Path::new(&host_cli).parent() {
+            let candidate = dir.join(&file_name);
+            if candidate.exists() {
+                return candidate.display().to_string();
+            }
+        }
+    }
+
+    if let Some(candidate) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join(&file_name)))
+        .filter(|candidate| candidate.exists())
+    {
+        return candidate.display().to_string();
+    }
+
+    MCP_PROXY_BIN.to_string()
+}
+
+/// Wire-shape stdio entry that launches the local `animus-mcp-proxy` for a
+/// secret-bearing remote MCP server. Mirrors the entry the contract
+/// assembler emits for `authorization_code` servers: the proxy resolves the
+/// live credential itself (`--server`/`--project-root`/`--url` only — no
+/// secret on argv), so only `${VAR}` placeholder env values are carried.
+fn mcp_proxy_wire_entry(
+    name: &str,
+    url: &str,
+    placeholder_env: serde_json::Map<String, Value>,
+    project_root: &str,
+) -> Value {
+    let args = vec![
+        "--server".to_string(),
+        name.to_string(),
+        "--project-root".to_string(),
+        project_root.to_string(),
+        "--url".to_string(),
+        url.to_string(),
+    ];
+    let mut entry = serde_json::Map::new();
+    entry.insert("command".to_string(), Value::String(mcp_proxy_command()));
+    entry.insert("args".to_string(), serde_json::json!(args));
+    if !placeholder_env.is_empty() {
+        entry.insert("env".to_string(), Value::Object(placeholder_env));
+    }
+    Value::Object(entry)
+}
+
 pub fn load_agent_runtime_config(project_root: &str) -> orchestrator_core::AgentRuntimeConfig {
     orchestrator_core::load_agent_runtime_config_or_default(Path::new(project_root))
 }
@@ -1558,10 +1758,19 @@ async fn run_workflow_phase_with_agent(params: PhaseAgentParams<'_>) -> Result<A
                             workflow_id, phase_id, mcp_stdio_command, mcp_stdio_args, mcp_additional_servers
                         );
                     }
-                    context
-                        .as_object_mut()
-                        .expect("json object")
-                        .insert("runtime_contract".to_string(), runtime_contract);
+                    // Mirror the phase's resolved MCP server set onto the
+                    // plugin-protocol `mcp_servers` channel (canonical
+                    // name-keyed map) so providers that consume
+                    // `AgentRunRequest.mcp_servers` see the same servers the
+                    // runtime contract carries. An empty resolved set
+                    // populates nothing, and an already-present
+                    // `mcp_servers` key is never clobbered.
+                    let wire_mcp_servers = runtime_contract_wire_mcp_servers(&runtime_contract, project_root);
+                    let context_object = context.as_object_mut().expect("json object");
+                    if !wire_mcp_servers.is_empty() && !context_object.contains_key("mcp_servers") {
+                        context_object.insert("mcp_servers".to_string(), Value::Object(wire_mcp_servers));
+                    }
+                    context_object.insert("runtime_contract".to_string(), runtime_contract);
                 } else {
                     info!(
                         workflow_id = %workflow_id,
@@ -2248,6 +2457,167 @@ mod tests {
         let plan = phase_session_resume_plan("wf-1", "requirements", "session-123", 1, 1);
 
         assert!(plan.reused);
+    }
+
+    #[test]
+    fn wire_mcp_servers_populated_from_contract_stdio_and_remote_blocks() {
+        let contract = serde_json::json!({
+            "mcp": {
+                "agent_id": "animus",
+                "stdio": { "command": "/usr/local/bin/animus", "args": ["--project-root", "/p", "mcp", "serve"] },
+                "additional_servers": {
+                    "trading": { "command": "", "args": [], "env": {}, "transport": "http", "url": "https://example.com/mcp/trading" },
+                    "local-tools": { "command": "tools-mcp", "args": ["--serve"], "env": {}, "transport": "stdio" },
+                }
+            }
+        });
+        let servers = super::runtime_contract_wire_mcp_servers(&contract, "/p");
+
+        let animus = servers.get("animus").expect("stdio animus entry present");
+        assert_eq!(
+            animus.pointer("/command").and_then(serde_json::Value::as_str),
+            Some("/usr/local/bin/animus"),
+            "entry: {animus}"
+        );
+        assert!(animus.get("type").is_none(), "stdio entries are keyed by command, not type; got {animus}");
+
+        let trading = servers.get("trading").expect("remote entry present");
+        assert_eq!(trading.pointer("/type").and_then(serde_json::Value::as_str), Some("http"), "entry: {trading}");
+        assert_eq!(
+            trading.pointer("/url").and_then(serde_json::Value::as_str),
+            Some("https://example.com/mcp/trading")
+        );
+        assert!(trading.get("transport").is_none(), "the contract transport key must not leak; got {trading}");
+        assert!(trading.get("command").is_none(), "a remote entry's vacuous empty command is dropped; got {trading}");
+
+        let local = servers.get("local-tools").expect("stdio project entry present");
+        assert_eq!(local.pointer("/command").and_then(serde_json::Value::as_str), Some("tools-mcp"));
+        assert!(local.get("transport").is_none());
+    }
+
+    #[test]
+    fn wire_mcp_servers_proxies_bearer_entries_and_omits_literal_env() {
+        // A resolved Authorization header (the broker manual_bearer /
+        // client_credentials / refresh_token flows) must never be duplicated
+        // onto the mcp_servers channel; the entry is repointed at the local
+        // `animus-mcp-proxy` stdio bridge instead — same treatment the
+        // authorization_code flow already gets — so the provider still
+        // reaches the server. A stdio server with a literal env value cannot
+        // be proxied and stays omitted entirely.
+        let contract = serde_json::json!({
+            "mcp": {
+                "additional_servers": {
+                    "bearer-api": {
+                        "command": "", "args": [], "env": {},
+                        "transport": "http",
+                        "url": "https://api.example.com/mcp",
+                        "headers": { "Authorization": "Bearer tok-secret-123" }
+                    },
+                    "cc-api": {
+                        "command": "", "args": [], "env": { "EXTRA": "${EXTRA}" },
+                        "transport": "http",
+                        "url": "https://cc.example.com/mcp",
+                        "headers": { "Authorization": "Bearer cc-secret-456" }
+                    },
+                    "literal-env": {
+                        "command": "env-mcp", "args": [],
+                        "env": { "API_KEY": "resolved-secret" },
+                        "transport": "stdio"
+                    },
+                    "placeholder-env": {
+                        "command": "ok-mcp", "args": [],
+                        "env": { "API_KEY": "${API_KEY}" },
+                        "transport": "stdio"
+                    }
+                }
+            }
+        });
+        let servers = super::runtime_contract_wire_mcp_servers(&contract, "/proj");
+
+        for (name, url, token) in [
+            ("bearer-api", "https://api.example.com/mcp", "tok-secret-123"),
+            ("cc-api", "https://cc.example.com/mcp", "cc-secret-456"),
+        ] {
+            let entry = servers.get(name).unwrap_or_else(|| panic!("{name} must be proxied, not omitted"));
+            let command = entry.pointer("/command").and_then(serde_json::Value::as_str).expect("proxy command");
+            assert!(command.contains("animus-mcp-proxy"), "{name}: expected the proxy binary; got {command}");
+            let args: Vec<&str> = entry
+                .pointer("/args")
+                .and_then(serde_json::Value::as_array)
+                .map(|a| a.iter().filter_map(serde_json::Value::as_str).collect())
+                .unwrap_or_default();
+            assert_eq!(args, vec!["--server", name, "--project-root", "/proj", "--url", url], "{name} args");
+            assert!(entry.get("url").is_none(), "{name}: proxy entry carries no upstream url; got {entry}");
+            assert!(entry.get("headers").is_none(), "{name}: proxy entry carries no headers; got {entry}");
+            assert!(entry.get("type").is_none(), "{name}: proxy entry is stdio-shaped; got {entry}");
+            assert!(!serde_json::to_string(entry).unwrap().contains(token), "{name}: token leaked: {entry}");
+        }
+        // Placeholder env survives onto the proxy entry; nothing literal does.
+        assert_eq!(
+            servers.get("cc-api").and_then(|e| e.pointer("/env/EXTRA")).and_then(serde_json::Value::as_str),
+            Some("${EXTRA}")
+        );
+        assert!(!servers.contains_key("literal-env"), "a literal-env stdio server must be omitted; got {servers:?}");
+        let ok = servers.get("placeholder-env").expect("placeholder-only env servers are forwarded");
+        assert_eq!(ok.pointer("/env/API_KEY").and_then(serde_json::Value::as_str), Some("${API_KEY}"));
+        let serialized = serde_json::to_string(&servers).unwrap();
+        assert!(
+            !serialized.contains("tok-secret-123")
+                && !serialized.contains("cc-secret-456")
+                && !serialized.contains("resolved-secret"),
+            "{serialized}"
+        );
+    }
+
+    #[test]
+    fn wire_mcp_servers_passes_authorization_code_proxy_entries_through() {
+        // An authorization_code server arrives already rewritten to the
+        // proxy by the contract assembler; the wire shaping must carry it
+        // as a plain stdio entry, unchanged.
+        let contract = serde_json::json!({
+            "mcp": {
+                "additional_servers": {
+                    "github": {
+                        "command": "/usr/local/bin/animus-mcp-proxy",
+                        "args": ["--server", "github", "--project-root", "/proj", "--url", "https://api.githubcopilot.com/mcp/"],
+                        "env": {},
+                        "transport": "stdio"
+                    }
+                }
+            }
+        });
+        let servers = super::runtime_contract_wire_mcp_servers(&contract, "/proj");
+        let github = servers.get("github").expect("auth_code proxy entry rides the wire");
+        assert_eq!(
+            github.pointer("/command").and_then(serde_json::Value::as_str),
+            Some("/usr/local/bin/animus-mcp-proxy")
+        );
+        assert!(github.get("transport").is_none() && github.get("type").is_none(), "entry: {github}");
+    }
+
+    #[test]
+    fn wire_mcp_servers_empty_contract_yields_empty_map() {
+        let contract = serde_json::json!({ "cli": { "name": "codex" }, "mcp": {} });
+        let servers = super::runtime_contract_wire_mcp_servers(&contract, "/proj");
+        assert!(servers.is_empty(), "no resolved servers must yield an empty map; got {servers:?}");
+        let no_mcp = serde_json::json!({ "cli": { "name": "codex" } });
+        assert!(super::runtime_contract_wire_mcp_servers(&no_mcp, "/proj").is_empty());
+    }
+
+    #[test]
+    fn wire_mcp_servers_marks_sse_transport_as_sse_type() {
+        let contract = serde_json::json!({
+            "mcp": {
+                "additional_servers": {
+                    "events": { "command": "", "args": [], "env": {}, "transport": "sse", "url": "https://example.com/sse" }
+                }
+            }
+        });
+        let servers = super::runtime_contract_wire_mcp_servers(&contract, "/proj");
+        assert_eq!(
+            servers.get("events").and_then(|entry| entry.pointer("/type")).and_then(serde_json::Value::as_str),
+            Some("sse")
+        );
     }
 
     #[test]
