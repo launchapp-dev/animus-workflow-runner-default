@@ -18,7 +18,7 @@ use animus_runtime_shared::phase_prompt::{
     PhasePromptInputs, PhaseRenderParams,
 };
 use animus_runtime_shared::runtime_contract::{
-    apply_phase_capability_launch_flags, inject_agent_tool_policy, inject_default_stdio_mcp_with_config,
+    apply_phase_capability_launch_flags, inject_agent_tool_policy, inject_default_stdio_mcp_for_workflow,
     inject_memory_mcp_for_capable_agent, inject_named_mcp_servers, inject_project_mcp_servers,
     inject_response_schema_into_launch_args, inject_workflow_mcp_servers, phase_output_json_schema_for,
     phase_response_json_schema_for, set_mcp_tool_policy,
@@ -464,6 +464,78 @@ fn configured_tool_profile(phase_runtime_settings: Option<&WorkflowPhaseRuntimeS
         .and_then(|settings| settings.tool_profile.as_deref())
         .map(str::trim)
         .filter(|value| !value.is_empty())
+}
+
+/// v0.4.3: forward the phase's permission/approval intent on the runtime
+/// contract so the agent-runner maps it onto the session request.
+///
+/// - `permission_mode` (resolved by the kernel cascade: phase
+///   `runtime.permission_mode` > agent profile `permission_mode`, see
+///   `AgentRuntimeConfig::phase_permission_mode`) rides the contract's
+///   top-level `permission_mode` key and becomes the typed
+///   `SessionRequest.permission_mode` (claude `--permission-mode`, codex
+///   `-c approval_policy`, gemini `--approval-mode`).
+/// - `approvals: true` is set when the phase's agent profile carries an
+///   `approval_policy`; the agent-runner lifts it into `extras.approvals`
+///   so the v0.1.13.5 transports activate the claude
+///   `--permission-prompt-tool` hook / approvals prompt preamble.
+fn apply_phase_permission_contract_keys(
+    runtime_contract: &mut Value,
+    phase_runtime_settings: Option<&WorkflowPhaseRuntimeSettings>,
+    phase_has_approval_policy: bool,
+) {
+    if let Some(mode) = phase_runtime_settings
+        .and_then(|settings| settings.permission_mode.as_deref())
+        .map(str::trim)
+        .filter(|mode| !mode.is_empty())
+    {
+        runtime_contract
+            .as_object_mut()
+            .expect("json object")
+            .insert("permission_mode".to_string(), serde_json::json!(mode));
+    }
+    if phase_has_approval_policy {
+        runtime_contract.as_object_mut().expect("json object").insert("approvals".to_string(), Value::Bool(true));
+    }
+}
+
+#[cfg(test)]
+mod phase_permission_contract_tests {
+    use super::*;
+
+    #[test]
+    fn permission_mode_from_phase_settings_lands_on_contract() {
+        let mut contract = serde_json::json!({ "cli": { "name": "claude" } });
+        let settings =
+            WorkflowPhaseRuntimeSettings { permission_mode: Some("acceptEdits".to_string()), ..Default::default() };
+        apply_phase_permission_contract_keys(&mut contract, Some(&settings), false);
+        assert_eq!(
+            contract.get("permission_mode").and_then(Value::as_str),
+            Some("acceptEdits"),
+            "the resolved phase permission mode must ride the contract's top-level key"
+        );
+        assert!(contract.get("approvals").is_none(), "no approval policy must mean no approvals flag");
+    }
+
+    #[test]
+    fn approval_policy_sets_contract_approvals_flag() {
+        let mut contract = serde_json::json!({ "cli": { "name": "codex" } });
+        apply_phase_permission_contract_keys(&mut contract, None, true);
+        assert_eq!(
+            contract.get("approvals").and_then(Value::as_bool),
+            Some(true),
+            "an agent profile approval_policy must flag the contract for extras.approvals"
+        );
+        assert!(contract.get("permission_mode").is_none());
+    }
+
+    #[test]
+    fn blank_permission_mode_is_not_forwarded() {
+        let mut contract = serde_json::json!({});
+        let settings = WorkflowPhaseRuntimeSettings { permission_mode: Some("   ".to_string()), ..Default::default() };
+        apply_phase_permission_contract_keys(&mut contract, Some(&settings), false);
+        assert!(contract.get("permission_mode").is_none(), "blank modes must be dropped");
+    }
 }
 
 fn resolve_claude_profile_env(
@@ -1677,15 +1749,26 @@ async fn run_workflow_phase_with_agent(params: PhaseAgentParams<'_>) -> Result<A
                         &ctx.agent_runtime_config,
                     );
                     inject_cli_launch_overrides(&mut runtime_contract, &effective_tool_id, phase_runtime_settings);
+                    apply_phase_permission_contract_keys(
+                        &mut runtime_contract,
+                        phase_runtime_settings,
+                        ctx.phase_has_approval_policy(phase_id),
+                    );
                     // codex P2 #1: thread host-supplied `mcp_config` through to
                     // the stdio injection (in addition to the
                     // endpoint/agent_id threaded above). When no host override
                     // is supplied (CLI path, tests), fall back to the default
                     // config — matching pre-fix behavior.
-                    inject_default_stdio_mcp_with_config(
+                    // v0.4.3: pin the spawned `animus mcp serve` to the
+                    // phase's agent profile (`--agent-id`) and this workflow
+                    // (`--workflow-id`) so the kernel's suspend-mode HITL
+                    // surface activates for ask/request_approval.
+                    inject_default_stdio_mcp_for_workflow(
                         &mut runtime_contract,
                         project_root,
                         effective_mcp_runtime_config,
+                        ctx.phase_agent_id(phase_id).as_deref(),
+                        Some(workflow_id),
                     );
                     inject_agent_tool_policy(&mut runtime_contract, ctx, phase_id);
                     inject_project_mcp_servers(&mut runtime_contract, project_root, ctx, phase_id);
@@ -2030,7 +2113,7 @@ pub struct PhaseRunParams<'a> {
     pub routing: &'a protocol::PhaseRoutingConfig,
     pub phase_timeout_secs: Option<u64>,
     /// Optional host-supplied MCP runtime config. Threaded into
-    /// [`inject_default_stdio_mcp_with_config`] so the daemon can override
+    /// [`inject_default_stdio_mcp_for_workflow`] so the daemon can override
     /// the stdio command / endpoint / transport per call. When `None`,
     /// callers fall back to `McpRuntimeConfig::default()`.
     pub mcp_config: Option<&'a protocol::McpRuntimeConfig>,
@@ -2147,6 +2230,7 @@ async fn run_workflow_phase_inner(params: &PhaseRunParams<'_>) -> Result<PhaseRu
                 fallback_models: ctx_fallback_models,
                 fallback_tools: ctx_fallback_tools,
                 reasoning_effort: merged_runtime.phase_reasoning_effort(phase_id).map(ToOwned::to_owned),
+                permission_mode: ctx.phase_permission_mode(phase_id),
                 web_search: merged_runtime.phase_web_search(phase_id),
                 network_access: merged_runtime.phase_network_access(phase_id),
                 timeout_secs: merged_runtime.phase_timeout_secs(phase_id),
