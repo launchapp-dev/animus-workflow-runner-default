@@ -1,6 +1,6 @@
 [package]
 name = "animus-workflow-runner-default"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 description = "Reference workflow_runner plugin for Animus v0.5 (stdio JSON-RPC + direct-execute CLI; thin wrapper over animus-runtime-shared)"
 license = "Elastic-2.0"
@@ -21,21 +21,26 @@ animus-subject-protocol     = { git = "https://github.com/launchapp-dev/animus-p
 animus-workflow-runner-protocol = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.5.1" }
 animus-plugin-runtime       = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.5.1" }
 
-# --- ao-cli helper crates (pinned to main; switch to branch = "v0.5" after Wave 3) -
-agent-runner               = { git = "https://github.com/launchapp-dev/animus-cli", rev = "e02ae75b79558029cf1dfb92b787d8fd8d54c641" }
-protocol                   = { git = "https://github.com/launchapp-dev/animus-cli", rev = "e02ae75b79558029cf1dfb92b787d8fd8d54c641", package = "protocol" }
-orchestrator-core          = { git = "https://github.com/launchapp-dev/animus-cli", rev = "e02ae75b79558029cf1dfb92b787d8fd8d54c641" }
-orchestrator-config        = { git = "https://github.com/launchapp-dev/animus-cli", rev = "e02ae75b79558029cf1dfb92b787d8fd8d54c641" }
-orchestrator-store         = { git = "https://github.com/launchapp-dev/animus-cli", rev = "e02ae75b79558029cf1dfb92b787d8fd8d54c641" }
-orchestrator-providers     = { git = "https://github.com/launchapp-dev/animus-cli", rev = "e02ae75b79558029cf1dfb92b787d8fd8d54c641" }
-orchestrator-git-ops       = { git = "https://github.com/launchapp-dev/animus-cli", rev = "e02ae75b79558029cf1dfb92b787d8fd8d54c641" }
-orchestrator-notifications = { git = "https://github.com/launchapp-dev/animus-cli", rev = "e02ae75b79558029cf1dfb92b787d8fd8d54c641" }
-orchestrator-logging       = { git = "https://github.com/launchapp-dev/animus-cli", rev = "e02ae75b79558029cf1dfb92b787d8fd8d54c641" }
+# --- ao-cli helper crates (pinned to agent/workflow-runner-default/v0.4-mcp-passdown:
+# the e02ae75 base + the MCP pass-down fixes: additional-server headers,
+# typed SessionRequest.mcp_servers, non-enforced additional-server injection) -
+agent-runner               = { git = "https://github.com/launchapp-dev/animus-cli", rev = "2be4d39a686d7886eeefd71d8fbd4ca8dd02c43e" }
+protocol                   = { git = "https://github.com/launchapp-dev/animus-cli", rev = "2be4d39a686d7886eeefd71d8fbd4ca8dd02c43e", package = "protocol" }
+orchestrator-core          = { git = "https://github.com/launchapp-dev/animus-cli", rev = "2be4d39a686d7886eeefd71d8fbd4ca8dd02c43e" }
+orchestrator-config        = { git = "https://github.com/launchapp-dev/animus-cli", rev = "2be4d39a686d7886eeefd71d8fbd4ca8dd02c43e" }
+orchestrator-store         = { git = "https://github.com/launchapp-dev/animus-cli", rev = "2be4d39a686d7886eeefd71d8fbd4ca8dd02c43e" }
+orchestrator-providers     = { git = "https://github.com/launchapp-dev/animus-cli", rev = "2be4d39a686d7886eeefd71d8fbd4ca8dd02c43e" }
+orchestrator-git-ops       = { git = "https://github.com/launchapp-dev/animus-cli", rev = "2be4d39a686d7886eeefd71d8fbd4ca8dd02c43e" }
+orchestrator-notifications = { git = "https://github.com/launchapp-dev/animus-cli", rev = "2be4d39a686d7886eeefd71d8fbd4ca8dd02c43e" }
+orchestrator-logging       = { git = "https://github.com/launchapp-dev/animus-cli", rev = "2be4d39a686d7886eeefd71d8fbd4ca8dd02c43e" }
 
 # v0.4.1: shared runtime modules consumed from out-of-tree
 # `launchapp-dev/animus-runtime-shared`. The plugin re-exports the shared
 # surface via `lib.rs` so existing downstream consumers stay source-compat.
-animus-runtime-shared      = { git = "https://github.com/launchapp-dev/animus-runtime-shared", tag = "v0.1.1" }
+# v0.4.2: pinned to the `pin-mcp-passdown-v0.4` rev (v0.1.1 + animus-cli
+# pins bumped to the mcp-passdown rev) so the whole graph unifies on one
+# animus-cli source.
+animus-runtime-shared      = { git = "https://github.com/launchapp-dev/animus-runtime-shared", rev = "dc0177273b9055655a9ff33201a4dd872c6207d2" }
 
 # --- stdlib-ish deps (still needed by plugin-only modules) ------------------
 anyhow = "1.0"
@@ -56,7 +61,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 [dev-dependencies]
 assert_cmd = "2.0"
 tempfile = "3.10"
-animus-runtime-shared      = { git = "https://github.com/launchapp-dev/animus-runtime-shared", tag = "v0.1.1", features = ["test-fault"] }
+animus-runtime-shared      = { git = "https://github.com/launchapp-dev/animus-runtime-shared", rev = "dc0177273b9055655a9ff33201a4dd872c6207d2", features = ["test-fault"] }
 
 # v0.5 lift: mirror the relevant relaxations from ao-cli's workspace lints
 # so the (byte-identical) lifted modules clear `clippy -- -D warnings`. As
