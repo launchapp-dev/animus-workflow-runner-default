@@ -13,16 +13,13 @@ use orchestrator_config::{
 };
 use orchestrator_core::{
     dispatch_workflow_event, ensure_workflow_config_compiled, load_workflow_config,
-    project_requirement_workflow_status,
-    providers::SubjectContext,
-    providers::{BuiltinGitProvider, GitProvider},
-    register_workflow_runner_pid,
-    services::ServiceHub,
+    project_requirement_workflow_status, providers::SubjectContext, register_workflow_runner_pid, services::ServiceHub,
     stop_agent_runner_process, unregister_workflow_runner_pid, OrchestratorTask, OrchestratorWorkflow,
     PhaseDecisionVerdict, SubjectRef, WorkflowEvent, WorkflowRunInput, WorkflowStatus, SUBJECT_KIND_CUSTOM,
 };
 
 use crate::ensure_execution_cwd::ensure_execution_cwd;
+use crate::git_provider::{BuiltinGitProvider, GitProvider};
 use crate::phase_executor::{run_workflow_phase, PhaseExecuteOverrides, PhaseExecutionOutcome, PhaseRunParams};
 use crate::phase_output::{
     is_phase_completed, persist_phase_output, phase_output_dir, read_persisted_decision, PersistedPhaseOutput,

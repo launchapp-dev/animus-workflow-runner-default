@@ -10,6 +10,7 @@ pub mod agent_state;
 pub mod config_context;
 pub mod direct_exec;
 pub mod ensure_execution_cwd;
+pub mod git_provider;
 // `ipc` here is the agent-runner Unix-socket bridge used by `phase_executor`
 // to dispatch agent processes — it is NOT the plugin-host JSON-RPC stdio
 // boundary. The kernel-extraction-v0.5.md brief's "delete ipc.rs" guidance
@@ -44,6 +45,7 @@ pub use agent_state::{
     send_agent_message, AgentMemoryDocument, AgentMemoryEntry, AgentMessage,
 };
 pub use ensure_execution_cwd::ensure_execution_cwd;
+pub use git_provider::{BuiltinGitProvider, CreatePrInput, GitProvider, MergeResult, PullRequestInfo, WorktreeInfo};
 pub use payload_traversal::{
     fallback_implementation_commit_message, parse_commit_message_from_text, parse_phase_decision_from_text,
 };
