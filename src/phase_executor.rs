@@ -7,26 +7,32 @@ use crate::phase_targets::PhaseTargetPlanner;
 use crate::skill_dispatch;
 use animus_runtime_shared::config_context::RuntimeConfigContext;
 use animus_runtime_shared::ipc::{
-    build_runtime_contract_with_resume_and_mcp_config, collect_json_payload_lines, connect_runner, event_matches_run,
-    run_dir as ipc_run_dir, runner_config_dir, write_json_line,
+    build_runtime_contract_with_resume_and_mcp_config, collect_json_payload_lines, event_matches_run,
+    run_dir as ipc_run_dir, write_json_line,
 };
 use animus_runtime_shared::payload_traversal::{parse_commit_message_from_text, parse_phase_decision_from_text};
 use animus_runtime_shared::phase_git::commit_implementation_changes;
-use animus_runtime_shared::phase_output::persist_phase_output;
+use animus_runtime_shared::phase_output::persist_phase_output_with_metadata;
 use animus_runtime_shared::phase_prompt::{
     phase_requires_commit_message_with_ctx, phase_result_kind_for_ctx, render_phase_prompt_with_ctx_overrides,
     PhasePromptInputs, PhaseRenderParams,
 };
+use animus_runtime_shared::phase_skills::{
+    apply_phase_skills, apply_phase_skills_preview, apply_skill_capability_overrides, inject_skill_mcp_servers,
+    load_workflow_skills_payload_from_env, phase_skills_resolution, populate_phase_skills_metadata, AppliedPhaseSkills,
+    PhaseSkillsResolution, WorkflowSkillsPayload,
+};
 use animus_runtime_shared::runtime_contract::{
-    apply_phase_capability_launch_flags, inject_agent_tool_policy, inject_default_stdio_mcp_for_workflow,
-    inject_memory_mcp_for_capable_agent, inject_named_mcp_servers, inject_project_mcp_servers,
-    inject_response_schema_into_launch_args, inject_workflow_mcp_servers, phase_output_json_schema_for,
-    phase_response_json_schema_for, set_mcp_tool_policy,
+    apply_phase_capability_launch_flags, inject_agent_tool_policy, inject_default_stdio_mcp_for_agent,
+    inject_memory_mcp_for_capable_agent, inject_project_mcp_servers, inject_response_schema_into_launch_args,
+    inject_workflow_mcp_servers, phase_output_json_schema_for, phase_response_json_schema_for, set_mcp_tool_policy,
 };
 use animus_runtime_shared::runtime_support::{
     inject_cli_launch_env, inject_cli_launch_overrides, phase_max_continuations, phase_runner_attempts,
     WorkflowPhaseRuntimeSettings,
 };
+use animus_session_backend::session::{SessionEvent, SessionRequest};
+use orchestrator_plugin_host::session::{provider_install_command, SessionBackendResolver};
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -42,7 +48,10 @@ use tokio::time::sleep;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use protocol::{canonical_model_id, AgentRunEvent, AgentRunRequest, ModelId, RunId, PROTOCOL_VERSION};
+use protocol::{
+    canonical_model_id, AgentRunEvent, AgentRunRequest, ArtifactInfo, ArtifactType, ModelId, OutputStreamType, RunId,
+    Timestamp, TokenUsage, ToolCallInfo, ToolResultInfo, PROTOCOL_VERSION,
+};
 
 #[derive(Debug, Clone, Default)]
 pub struct PhaseExecuteOverrides {
@@ -466,6 +475,58 @@ fn configured_tool_profile(phase_runtime_settings: Option<&WorkflowPhaseRuntimeS
         .filter(|value| !value.is_empty())
 }
 
+/// True when the phase's agent profile carries an `approval_policy`. The
+/// workflow YAML `agents:` overlay is checked first (matching the
+/// YAML-wins precedence everywhere else); the loaded agent runtime config
+/// — which `load_agent_runtime_config_with_metadata` already folds the
+/// workflow overlay onto — is the fallback.
+fn phase_has_approval_policy(ctx: &RuntimeConfigContext, phase_id: &str) -> bool {
+    let Some(agent_id) = ctx.phase_agent_id(phase_id) else {
+        return false;
+    };
+    ctx.workflow_config
+        .config
+        .agent_profiles
+        .get(&agent_id)
+        .and_then(|profile| profile.approval_policy.as_ref())
+        .is_some()
+        || ctx
+            .agent_runtime_config
+            .agent_profile(&agent_id)
+            .and_then(|profile| profile.approval_policy.as_ref())
+            .is_some()
+}
+
+/// Pin the DEFAULT `animus mcp serve` stdio injection to this workflow via
+/// `--workflow-id` so the kernel's suspend-mode HITL surface activates for
+/// `animus.agent.ask` / `animus.agent.request_approval` (v0.4.3 behavior,
+/// reapplied locally because the shared
+/// `inject_default_stdio_mcp_for_agent` only pins `--agent-id`).
+/// Host-supplied `stdio_args_json` is passed through untouched.
+fn pin_default_stdio_mcp_to_workflow(
+    runtime_contract: &mut Value,
+    mcp_config: &protocol::McpRuntimeConfig,
+    workflow_id: &str,
+) {
+    if mcp_config.stdio_args_json.as_deref().map(str::trim).is_some_and(|value| !value.is_empty()) {
+        return;
+    }
+    if workflow_id.trim().is_empty() {
+        return;
+    }
+    let Some(args) = runtime_contract.pointer_mut("/mcp/stdio/args").and_then(Value::as_array_mut) else {
+        return;
+    };
+    if !args.iter().any(|arg| arg.as_str() == Some("serve")) {
+        return;
+    }
+    if args.iter().any(|arg| arg.as_str() == Some("--workflow-id")) {
+        return;
+    }
+    args.push(Value::String("--workflow-id".to_string()));
+    args.push(Value::String(workflow_id.to_string()));
+}
+
 /// v0.4.3: forward the phase's permission/approval intent on the runtime
 /// contract so the agent-runner maps it onto the session request.
 ///
@@ -676,6 +737,226 @@ pub(crate) fn validate_basic_json_schema(instance: &Value, schema: &Value) -> Re
     }
 }
 
+/// Map a workflow-phase [`AgentRunRequest`] onto the [`SessionRequest`] the
+/// provider-plugin session backends consume. The full runtime contract is
+/// forwarded via `extras.runtime_contract` (the expert full-override channel
+/// — its `cli.launch` block replaces the transport's own argv assembly, the
+/// same way the deleted agent-runner sidecar consumed it). The contract's
+/// top-level `permission_mode` / `approvals` keys (set by
+/// `apply_phase_permission_contract_keys`) ride the typed
+/// `SessionRequest.permission_mode` field and `extras.approvals`
+/// respectively, matching the deleted sidecar's mapping.
+fn session_request_from_agent_request(project_root: &str, request: &AgentRunRequest) -> SessionRequest {
+    let context = &request.context;
+    let runtime_contract = context.get("runtime_contract");
+    let trimmed_str = |value: Option<&Value>| -> Option<String> {
+        value.and_then(Value::as_str).map(str::trim).filter(|text| !text.is_empty()).map(ToString::to_string)
+    };
+
+    let tool = trimmed_str(runtime_contract.and_then(|contract| contract.pointer("/cli/name")))
+        .or_else(|| trimmed_str(context.get("tool")))
+        .unwrap_or_else(|| "claude".to_string());
+    let prompt = context.get("prompt").and_then(Value::as_str).unwrap_or_default().to_string();
+    let cwd = trimmed_str(context.get("cwd")).unwrap_or_else(|| project_root.to_string());
+    let mcp_endpoint = trimmed_str(runtime_contract.and_then(|contract| contract.pointer("/mcp/endpoint")));
+    let permission_mode = trimmed_str(runtime_contract.and_then(|contract| contract.get("permission_mode")));
+    let approvals =
+        runtime_contract.and_then(|contract| contract.get("approvals")).and_then(Value::as_bool).unwrap_or(false);
+    let env_vars: Vec<(String, String)> = runtime_contract
+        .and_then(|contract| contract.pointer("/cli/launch/env"))
+        .and_then(Value::as_object)
+        .map(|env| {
+            env.iter().filter_map(|(key, value)| value.as_str().map(|text| (key.clone(), text.to_string()))).collect()
+        })
+        .unwrap_or_default();
+
+    let mut extras = serde_json::Map::new();
+    if let Some(contract) = runtime_contract {
+        extras.insert("runtime_contract".to_string(), contract.clone());
+    }
+    if approvals {
+        extras.insert("approvals".to_string(), Value::Bool(true));
+    }
+    // Forward the context keys `PluginSessionBackend::build_run_params`
+    // reads at the top level of `extras` (system_prompt, mcp_servers, ...).
+    for key in
+        ["system_prompt", "claude_profile", "mcp_servers", "tools", "response_schema", "session_id", "reasoning_effort"]
+    {
+        if let Some(value) = context.get(key) {
+            extras.entry(key.to_string()).or_insert_with(|| value.clone());
+        }
+    }
+
+    SessionRequest {
+        tool,
+        model: request.model.0.clone(),
+        prompt,
+        cwd: PathBuf::from(cwd),
+        project_root: Some(PathBuf::from(project_root)),
+        mcp_endpoint,
+        permission_mode,
+        timeout_secs: request.timeout_secs,
+        env_vars,
+        extras: Value::Object(extras),
+    }
+}
+
+/// Durable-checkpoint coordinates the session event bridge needs to record
+/// the provider plugin's external session id as soon as it is reported.
+struct SessionCheckpointTarget {
+    scoped_state_root: PathBuf,
+    workflow_id: String,
+    phase_id: String,
+    /// The host-local control session id (`SessionRun.session_id` for
+    /// plugin-backed sessions). `PluginSessionBackend` emits it on the FIRST
+    /// `Started` event; it is NOT a provider-issued resumable id and must
+    /// never be persisted as one — only a LATER `Started` carrying a
+    /// different id (extracted from the plugin's `agent/run` response) is
+    /// the real provider session id.
+    control_session_id: Option<String>,
+}
+
+/// Bridge a provider session's [`SessionEvent`] stream into the
+/// `AgentRunEvent` JSONL byte stream `process_phase_event_stream` consumes.
+/// Returns the read half of an in-memory duplex pipe; a background task
+/// drains the session events, translates them, and writes one JSON line per
+/// event (then shuts the pipe down so the line reader sees EOF).
+///
+/// Codex P1 (v0.4.4): the deleted agent-runner sidecar used to copy the
+/// provider's `Started { session_id }` into the runner-sessions sidecar
+/// file that the mid-stream poller read into the durable checkpoint. With
+/// no sidecar writer left, the bridge records the session id on the
+/// checkpoint DIRECTLY whenever a `Started` event carries one — otherwise
+/// restart auto-resume would find `provider_session_id = None` and mark an
+/// in-flight phase unrecoverable.
+fn spawn_session_event_bridge(
+    mut events: tokio::sync::mpsc::Receiver<SessionEvent>,
+    run_id: RunId,
+    checkpoint: SessionCheckpointTarget,
+) -> tokio::io::DuplexStream {
+    let (mut writer, reader) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        while let Some(event) = events.recv().await {
+            if let SessionEvent::Started { session_id: Some(ref session_id), .. } = event {
+                // Codex P1 follow-up: skip the host-local control id — it is
+                // not resumable. Persisting it would make restart recovery
+                // attempt `agent/resume` with an id the provider never
+                // minted instead of correctly blocking as unrecoverable.
+                if checkpoint.control_session_id.as_deref() != Some(session_id.as_str()) {
+                    record_provider_session_id(&checkpoint, &run_id, session_id);
+                }
+            }
+            let agent_event = agent_event_from_session(event, &run_id);
+            if let Err(error) = write_json_line(&mut writer, &agent_event).await {
+                debug!(run_id = %run_id.0, %error, "session event bridge writer closed; dropping remaining events");
+                break;
+            }
+        }
+        use tokio::io::AsyncWriteExt;
+        let _ = writer.shutdown().await;
+    });
+    reader
+}
+
+/// Copy a provider-reported session id onto the durable phase checkpoint
+/// (best effort — a failed write is logged, never fails the run; the
+/// post-stream sidecar sweep remains as a second chance).
+fn record_provider_session_id(checkpoint: &SessionCheckpointTarget, run_id: &RunId, session_id: &str) {
+    let trimmed = session_id.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if let Err(error) = animus_runtime_shared::phase_session::update_provider_session_id(
+        &checkpoint.scoped_state_root,
+        &checkpoint.workflow_id,
+        &checkpoint.phase_id,
+        trimmed,
+    ) {
+        warn!(
+            run_id = %run_id.0,
+            workflow_id = %checkpoint.workflow_id,
+            phase_id = %checkpoint.phase_id,
+            %error,
+            "failed to record provider session id on checkpoint from session event"
+        );
+    }
+}
+
+/// Translate a [`SessionEvent`] into the legacy [`AgentRunEvent`] shape so
+/// the existing stream processor, persistence, and failure classification
+/// keep working unchanged. Mirrors the kernel CLI's provider-client mapping:
+/// recoverable provider errors become stderr output chunks (the run
+/// continues), unrecoverable ones keep the terminal `Error` variant.
+fn agent_event_from_session(event: SessionEvent, run_id: &RunId) -> AgentRunEvent {
+    match event {
+        SessionEvent::Started { .. } => AgentRunEvent::Started { run_id: run_id.clone(), timestamp: Timestamp::now() },
+        SessionEvent::TextDelta { text } | SessionEvent::FinalText { text } => {
+            AgentRunEvent::OutputChunk { run_id: run_id.clone(), stream_type: OutputStreamType::Stdout, text }
+        }
+        SessionEvent::ToolCall { tool_name, arguments, server: _ } => AgentRunEvent::ToolCall {
+            run_id: run_id.clone(),
+            tool_info: ToolCallInfo { tool_name, parameters: arguments, timestamp: Timestamp::now() },
+        },
+        SessionEvent::ToolResult { tool_name, output, success } => AgentRunEvent::ToolResult {
+            run_id: run_id.clone(),
+            result_info: ToolResultInfo { tool_name, result: output, duration_ms: 0, success },
+        },
+        SessionEvent::Thinking { text } => AgentRunEvent::Thinking { run_id: run_id.clone(), content: text },
+        SessionEvent::Artifact { artifact_id, metadata } => AgentRunEvent::Artifact {
+            run_id: run_id.clone(),
+            artifact_info: ArtifactInfo {
+                artifact_id,
+                artifact_type: ArtifactType::Other,
+                file_path: metadata.get("file_path").and_then(Value::as_str).map(ToOwned::to_owned),
+                size_bytes: metadata.get("size_bytes").and_then(Value::as_u64),
+                mime_type: metadata.get("mime_type").and_then(Value::as_str).map(ToOwned::to_owned),
+            },
+        },
+        SessionEvent::Metadata { metadata } => AgentRunEvent::Metadata {
+            run_id: run_id.clone(),
+            cost: metadata.get("cost").and_then(Value::as_f64),
+            tokens: extract_session_token_usage(&metadata),
+        },
+        SessionEvent::Error { message, recoverable } => {
+            if recoverable {
+                AgentRunEvent::OutputChunk {
+                    run_id: run_id.clone(),
+                    stream_type: OutputStreamType::Stderr,
+                    text: message,
+                }
+            } else {
+                AgentRunEvent::Error { run_id: run_id.clone(), error: message }
+            }
+        }
+        SessionEvent::Finished { exit_code } => {
+            AgentRunEvent::Finished { run_id: run_id.clone(), exit_code, duration_ms: 0 }
+        }
+    }
+}
+
+/// Map provider-emitted metadata frames into a [`TokenUsage`] when the
+/// payload carries usage counters (canonical `token_usage` / `tokens` keys
+/// first, then the per-provider variants the deleted sidecar produced).
+fn extract_session_token_usage(metadata: &Value) -> Option<TokenUsage> {
+    if metadata.is_null() {
+        return None;
+    }
+    const KEYS: &[&str] = &["token_usage", "tokens", "usage", "claude_usage", "codex_usage", "gemini_stats"];
+    let payload = KEYS.iter().find_map(|key| metadata.get(*key)).unwrap_or(metadata);
+
+    let read_u32 = |keys: &[&str]| -> Option<u32> {
+        keys.iter().find_map(|key| payload.get(*key)).and_then(Value::as_u64).map(|count| count as u32)
+    };
+
+    let input = read_u32(&["input", "input_tokens", "prompt_tokens"])?;
+    let output = read_u32(&["output", "output_tokens", "completion_tokens"])?;
+    let reasoning = read_u32(&["reasoning", "reasoning_tokens"]);
+    let cache_read = read_u32(&["cache_read", "cache_read_input_tokens", "cache_read_tokens"]);
+    let cache_write = read_u32(&["cache_write", "cache_creation_input_tokens", "cache_write_tokens"]);
+
+    Some(TokenUsage { input, output, reasoning, cache_read, cache_write })
+}
+
 pub async fn run_workflow_phase_attempt(
     project_root: &str,
     workflow_id: &str,
@@ -684,7 +965,6 @@ pub async fn run_workflow_phase_attempt(
 ) -> Result<PhaseExecutionOutcome> {
     let ctx = RuntimeConfigContext::load(project_root);
     let parse_commit_message = phase_requires_commit_message_with_ctx(&ctx, phase_id);
-    let config_dir = runner_config_dir(Path::new(project_root));
 
     let scoped_state_root =
         protocol::scoped_state_root(Path::new(project_root)).unwrap_or_else(|| Path::new(project_root).join(".animus"));
@@ -773,23 +1053,49 @@ pub async fn run_workflow_phase_attempt(
         run_id = %request.run_id.0,
         request_mcp_stdio_command = ?request_mcp_stdio_command,
         request_mcp_stdio_args = ?request_mcp_stdio_args,
-        "Dispatching workflow phase request to agent runner"
+        "Dispatching workflow phase request to provider plugin session"
     );
-    let stream = connect_runner(&config_dir)
-        .await
-        .with_context(|| format!("failed to connect runner for workflow {} phase {}", workflow_id, phase_id))?;
-    let (read_half, mut write_half) = tokio::io::split(stream);
-    write_json_line(&mut write_half, request).await?;
+    // v0.4.4: the agent-runner sidecar (and its Unix-socket bridge) was
+    // deleted upstream in ao-cli v0.5.3 — provider plugins own session
+    // execution end to end. Resolve the provider plugin for the requested
+    // tool and start the session through `SessionBackendResolver`, then
+    // bridge the typed `SessionEvent` stream back into the AgentRunEvent
+    // JSONL shape `process_phase_event_stream` consumes (so the durability
+    // machinery — checkpoints, notification log, sidecar polling — keeps
+    // working byte-identically).
+    let session_request = session_request_from_agent_request(project_root, request);
+    let resolver = SessionBackendResolver::with_plugin_discovery(Path::new(project_root));
+    if let Err(resolve_err) = resolver.resolve(&session_request) {
+        let install_command = provider_install_command(&session_request.tool);
+        return Err(anyhow!(
+            "provider plugin unavailable for tool '{}' (workflow {} phase {}): {}; install with: {}",
+            session_request.tool,
+            workflow_id,
+            phase_id,
+            resolve_err,
+            install_command
+        ));
+    }
+    let session_run = resolver.start_session(session_request).await.map_err(|err| {
+        anyhow!("failed to start provider session for workflow {} phase {}: {}", workflow_id, phase_id, err)
+    })?;
+    let checkpoint_target = SessionCheckpointTarget {
+        scoped_state_root: scoped_state_root.clone(),
+        workflow_id: workflow_id.to_string(),
+        phase_id: phase_id.to_string(),
+        control_session_id: session_run.session_id.clone(),
+    };
+    let read_half = spawn_session_event_bridge(session_run.events, request.run_id.clone(), checkpoint_target);
 
-    // FATAL: the request has already been written to the runner, so the
-    // agent may be doing side-effecting work right now. If we can't flip
-    // the checkpoint to Running the recovery oracle will not shield this
-    // phase on daemon restart (`list_running_checkpoints` only returns
-    // Running entries). We MUST tag the failure with
-    // `TerminalCheckpointError` so the agent retry/failover loop refuses
-    // to re-dispatch — re-dispatching while the first runner is still
-    // executing would duplicate the side-effecting work, which is exactly
-    // the crash-replay hazard we are fixing.
+    // FATAL: the provider session has started, so the agent may be doing
+    // side-effecting work right now. If we can't flip the checkpoint to
+    // Running the recovery oracle will not shield this phase on daemon
+    // restart (`list_running_checkpoints` only returns Running entries).
+    // We MUST tag the failure with `TerminalCheckpointError` so the agent
+    // retry/failover loop refuses to re-dispatch — re-dispatching while
+    // the first provider session is still executing would duplicate the
+    // side-effecting work, which is exactly the crash-replay hazard we
+    // are fixing.
     if let Err(err) =
         animus_runtime_shared::phase_session::update_session_running(&scoped_state_root, workflow_id, phase_id)
     {
@@ -1432,7 +1738,7 @@ struct PhaseAgentParams<'a> {
     dispatch_input: Option<&'a str>,
     schedule_input: Option<&'a str>,
     routing: &'a protocol::PhaseRoutingConfig,
-    resolved_phase_skills: &'a skill_dispatch::ResolvedPhaseSkillSet,
+    resolved_phase_skills: &'a PhaseSkillsResolution,
     phase_timeout_secs: Option<u64>,
     mcp_config: Option<&'a protocol::McpRuntimeConfig>,
 }
@@ -1442,7 +1748,7 @@ struct AgentPhaseRunOutcome {
     selected_tool: Option<String>,
     selected_model: Option<String>,
     effective_capabilities: protocol::PhaseCapabilities,
-    applied_skills: skill_dispatch::AppliedPhaseSkills,
+    applied_skills: AppliedPhaseSkills,
 }
 
 fn phase_session_resume_plan(
@@ -1463,6 +1769,15 @@ fn phase_session_resume_plan(
         reused: reuses_existing_session,
         phase_thread_isolated: true,
     }
+}
+
+/// Daemon-supplied per-dispatch skills payload, read from
+/// [`animus_runtime_shared::phase_skills::ANIMUS_PHASE_SKILLS_ENV`] once per
+/// runner process (the daemon sets the env var at plugin spawn, so it is
+/// fixed for the process lifetime).
+fn workflow_skills_payload() -> Option<&'static WorkflowSkillsPayload> {
+    static PAYLOAD: std::sync::OnceLock<Option<WorkflowSkillsPayload>> = std::sync::OnceLock::new();
+    PAYLOAD.get_or_init(load_workflow_skills_payload_from_env).as_ref()
 }
 
 fn phase_requires_structured_completion(ctx: &RuntimeConfigContext, phase_id: &str) -> bool {
@@ -1492,10 +1807,10 @@ fn resolve_phase_skill_target(
     explicit_tool_override: Option<&str>,
     explicit_model_override: Option<&str>,
     base_caps: &protocol::PhaseCapabilities,
-    resolved_phase_skills: &skill_dispatch::ResolvedPhaseSkillSet,
+    resolved_phase_skills: &PhaseSkillsResolution,
     routing_complexity: Option<protocol::ModelRoutingComplexity>,
     routing: &protocol::PhaseRoutingConfig,
-) -> Result<(String, String, protocol::PhaseCapabilities, skill_dispatch::AppliedPhaseSkills)> {
+) -> Result<(String, String, protocol::PhaseCapabilities, AppliedPhaseSkills)> {
     const MAX_SKILL_TARGET_RESOLUTION_PASSES: usize = 3;
 
     let initial_tool_id = target_tool_id.to_string();
@@ -1509,9 +1824,9 @@ fn resolve_phase_skill_target(
         explicit_model_override.map(canonical_model_id).filter(|value| !value.trim().is_empty());
 
     for iteration in 0..MAX_SKILL_TARGET_RESOLUTION_PASSES {
-        let applied_skills = skill_dispatch::apply_phase_skills(resolved_phase_skills, &tool_id, &model_id);
+        let applied_skills = apply_phase_skills(resolved_phase_skills, &tool_id, Some(&model_id));
         let effective_caps =
-            skill_dispatch::apply_skill_capability_overrides(base_caps, &applied_skills.application.capabilities);
+            apply_skill_capability_overrides(base_caps.clone(), &applied_skills.application.capabilities);
         let requested_model = explicit_model_override
             .clone()
             .or_else(|| applied_skills.application.model.as_deref().map(canonical_model_id));
@@ -1553,9 +1868,8 @@ fn resolve_phase_skill_target(
         exhausted_iteration_budget = iteration + 1 == MAX_SKILL_TARGET_RESOLUTION_PASSES;
     }
 
-    let applied_skills = skill_dispatch::apply_phase_skills(resolved_phase_skills, &tool_id, &model_id);
-    let effective_caps =
-        skill_dispatch::apply_skill_capability_overrides(base_caps, &applied_skills.application.capabilities);
+    let applied_skills = apply_phase_skills(resolved_phase_skills, &tool_id, Some(&model_id));
+    let effective_caps = apply_skill_capability_overrides(base_caps.clone(), &applied_skills.application.capabilities);
     if exhausted_iteration_budget {
         warn!(
             phase_id,
@@ -1582,7 +1896,8 @@ async fn run_workflow_phase_with_agent(params: PhaseAgentParams<'_>) -> Result<A
     let overrides = params.overrides;
     let pipeline_vars = params.pipeline_vars;
     let base_caps = ctx.phase_capabilities(phase_id);
-    let planning_caps = skill_dispatch::preview_phase_capabilities(&base_caps, params.resolved_phase_skills);
+    let planning_preview = apply_phase_skills_preview(params.resolved_phase_skills, None, None);
+    let planning_caps = apply_skill_capability_overrides(base_caps.clone(), &planning_preview.application.capabilities);
     let routing_complexity = routing_complexity(params.task_complexity);
     let settings_tool = phase_runtime_settings.and_then(|s| s.tool.as_deref());
     let settings_model = phase_runtime_settings.and_then(|s| s.model.as_deref());
@@ -1752,7 +2067,7 @@ async fn run_workflow_phase_with_agent(params: PhaseAgentParams<'_>) -> Result<A
                     apply_phase_permission_contract_keys(
                         &mut runtime_contract,
                         phase_runtime_settings,
-                        ctx.phase_has_approval_policy(phase_id),
+                        phase_has_approval_policy(ctx, phase_id),
                     );
                     // codex P2 #1: thread host-supplied `mcp_config` through to
                     // the stdio injection (in addition to the
@@ -1763,26 +2078,24 @@ async fn run_workflow_phase_with_agent(params: PhaseAgentParams<'_>) -> Result<A
                     // phase's agent profile (`--agent-id`) and this workflow
                     // (`--workflow-id`) so the kernel's suspend-mode HITL
                     // surface activates for ask/request_approval.
-                    inject_default_stdio_mcp_for_workflow(
+                    inject_default_stdio_mcp_for_agent(
                         &mut runtime_contract,
                         project_root,
                         effective_mcp_runtime_config,
                         ctx.phase_agent_id(phase_id).as_deref(),
-                        Some(workflow_id),
                     );
+                    pin_default_stdio_mcp_to_workflow(&mut runtime_contract, effective_mcp_runtime_config, workflow_id);
                     inject_agent_tool_policy(&mut runtime_contract, ctx, phase_id);
                     inject_project_mcp_servers(&mut runtime_contract, project_root, ctx, phase_id);
                     inject_workflow_mcp_servers(&mut runtime_contract, ctx, phase_id);
                     if let Some(policy) = applied_skills.application.tool_policy.as_ref() {
                         set_mcp_tool_policy(&mut runtime_contract, policy);
                     }
-                    inject_named_mcp_servers(
-                        &mut runtime_contract,
-                        project_root,
-                        ctx,
-                        phase_id,
-                        &applied_skills.application.mcp_servers,
-                    )?;
+                    // Skill-declared MCP servers join after the existing
+                    // project/workflow MCP injection. Unknown server names
+                    // warn and are skipped (consistent with the
+                    // missing-skill policy) instead of failing the phase.
+                    inject_skill_mcp_servers(&mut runtime_contract, project_root, ctx, phase_id, &applied_skills);
                     inject_memory_mcp_for_capable_agent(&mut runtime_contract, project_root, ctx, phase_id);
                     skill_dispatch::inject_skill_overrides(
                         &mut runtime_contract,
@@ -2074,7 +2387,7 @@ fn write_manual_phase_markers(path: &Path, markers: &BTreeMap<String, bool>) -> 
         file.write_all(payload.as_bytes())?;
         file.sync_all()?;
     }
-    orchestrator_store::fsync_rename(&tmp_path, path)?;
+    orchestrator_core::store::fsync_rename(&tmp_path, path)?;
     Ok(())
 }
 
@@ -2150,16 +2463,11 @@ async fn run_workflow_phase_inner(params: &PhaseRunParams<'_>) -> Result<PhaseRu
         Some(Path::new(project_root)),
     )?;
 
-    let mut merged_runtime = runtime_loaded.config.clone();
-    for (id, profile) in &workflow_config.config.agent_profiles {
-        merged_runtime.agents.insert(id.clone(), profile.clone());
-    }
-    if !workflow_config.config.tools_allowlist.is_empty() {
-        let mut combined: std::collections::HashSet<String> = merged_runtime.tools_allowlist.iter().cloned().collect();
-        combined.extend(workflow_config.config.tools_allowlist.iter().cloned());
-        merged_runtime.tools_allowlist = combined.into_iter().collect();
-        merged_runtime.tools_allowlist.sort();
-    }
+    // v0.4.4: `load_agent_runtime_config_with_metadata` already folds the
+    // workflow YAML overlay (agent profiles, phase definitions, tools and
+    // the tools_allowlist union) onto the runtime config upstream, so the
+    // previous hand-rolled profile/allowlist merge here is redundant.
+    let merged_runtime = runtime_loaded.config.clone();
 
     let ctx =
         RuntimeConfigContext { agent_runtime_config: merged_runtime.clone(), workflow_config: workflow_config.clone() };
@@ -2208,9 +2516,15 @@ async fn run_workflow_phase_inner(params: &PhaseRunParams<'_>) -> Result<PhaseRu
 
     match definition.mode {
         orchestrator_core::PhaseExecutionMode::Agent => {
-            let resolved_phase_skills = skill_dispatch::resolve_phase_skills(&ctx, Path::new(project_root), phase_id)?;
-            metadata.requested_skills = resolved_phase_skills.requested_skills.clone();
-            metadata.resolved_skills = resolved_phase_skills.resolved_skills.clone();
+            // v0.4.4: prefer the daemon-resolved dispatch payload
+            // (ANIMUS_PHASE_SKILLS_JSON, read once per runner process),
+            // falling back to local resolution when no payload or no
+            // matching phase entry exists (older daemon, direct `execute`
+            // invocations, phases the daemon sweep did not enumerate).
+            let resolved_phase_skills =
+                phase_skills_resolution(workflow_skills_payload(), project_root, &ctx, phase_id);
+            metadata.requested_skills = resolved_phase_skills.requested.clone();
+            metadata.resolved_skills = resolved_phase_skills.resolved.clone();
             let cli_tool_override = overrides.and_then(|o| o.tool.as_deref());
             let cli_model_override = overrides.and_then(|o| o.model.as_deref());
 
@@ -2230,7 +2544,7 @@ async fn run_workflow_phase_inner(params: &PhaseRunParams<'_>) -> Result<PhaseRu
                 fallback_models: ctx_fallback_models,
                 fallback_tools: ctx_fallback_tools,
                 reasoning_effort: merged_runtime.phase_reasoning_effort(phase_id).map(ToOwned::to_owned),
-                permission_mode: ctx.phase_permission_mode(phase_id),
+                permission_mode: ctx.agent_runtime_config.phase_permission_mode(phase_id).map(ToOwned::to_owned),
                 web_search: merged_runtime.phase_web_search(phase_id),
                 network_access: merged_runtime.phase_network_access(phase_id),
                 timeout_secs: merged_runtime.phase_timeout_secs(phase_id),
@@ -2263,9 +2577,7 @@ async fn run_workflow_phase_inner(params: &PhaseRunParams<'_>) -> Result<PhaseRu
             metadata.selected_tool = agent_result.selected_tool.clone();
             metadata.selected_model = agent_result.selected_model.clone();
             metadata.effective_capabilities = agent_result.effective_capabilities.clone();
-            metadata.applied_skills = agent_result.applied_skills.applied_skills.clone();
-            metadata.skill_application = (!agent_result.applied_skills.application.is_empty())
-                .then_some(agent_result.applied_skills.application.clone());
+            populate_phase_skills_metadata(&mut metadata, &resolved_phase_skills, &agent_result.applied_skills);
             if !metadata.requested_skills.is_empty() {
                 signals.push(PhaseExecutionSignal {
                     event_type: "workflow-phase-skills-resolved".to_string(),
@@ -2437,7 +2749,14 @@ async fn run_workflow_phase_inner(params: &PhaseRunParams<'_>) -> Result<PhaseRu
                     result_payload: Some(result_payload),
                 };
 
-                persist_phase_output(project_root, workflow_id, phase_id, phase_attempt, &outcome)?;
+                persist_phase_output_with_metadata(
+                    project_root,
+                    workflow_id,
+                    phase_id,
+                    phase_attempt,
+                    &outcome,
+                    Some(&metadata),
+                )?;
 
                 return Ok(PhaseRunResult { model: None, tool: None, outcome, metadata, signals });
             }

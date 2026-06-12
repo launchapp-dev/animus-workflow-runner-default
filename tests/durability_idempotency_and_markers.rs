@@ -28,6 +28,8 @@ fn runtime_with_phase(phase_id: &str, idempotency: Idempotency) -> AgentRuntimeC
     phases.insert(
         phase_id.to_string(),
         PhaseExecutionDefinition {
+            worktree: None,
+            evals: None,
             mode: PhaseExecutionMode::Agent,
             agent_id: Some("default".to_string()),
             directive: None,
