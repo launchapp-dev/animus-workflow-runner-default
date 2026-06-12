@@ -1,7 +1,7 @@
 //! `animus-workflow-runner-default` — reference `workflow_runner` plugin for
 //! Animus v0.5. Plugin-private modules (`phase_executor`, `workflow_execute`,
 //! `phase_targets`, `phase_failover`, `phase_command`, `skill_dispatch`,
-//! `direct_exec`, `direct_execute`, `phase_event_recorder`, `plugin`) live
+//! `git_provider`, `direct_execute`, `phase_event_recorder`, `plugin`) live
 //! here; the shared runtime modules (`agent_state`, `config_context`, `ipc`,
 //! `phase_session`, `phase_output`, `phase_prompt`, `phase_git`, `reattach`,
 //! `runtime_contract`, `runtime_support`, `workflow_event_emitter`,
@@ -10,7 +10,7 @@
 //! `phase_metadata`) live in `animus-runtime-shared` and are re-exported
 //! below.
 
-pub mod direct_exec;
+pub mod git_provider;
 pub mod phase_command;
 pub mod phase_event_recorder;
 pub mod phase_executor;

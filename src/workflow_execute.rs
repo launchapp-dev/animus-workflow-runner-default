@@ -13,19 +13,18 @@ use orchestrator_config::{
 };
 use orchestrator_core::{
     dispatch_workflow_event, ensure_workflow_config_compiled, load_workflow_config,
-    project_requirement_workflow_status,
-    providers::SubjectContext,
-    providers::{BuiltinGitProvider, GitProvider},
-    register_workflow_runner_pid,
-    services::ServiceHub,
-    stop_agent_runner_process, unregister_workflow_runner_pid, OrchestratorTask, OrchestratorWorkflow,
+    project_requirement_workflow_status, register_workflow_runner_pid, services::ServiceHub,
+    subject_adapter::SubjectContext, unregister_workflow_runner_pid, OrchestratorTask, OrchestratorWorkflow,
     PhaseDecisionVerdict, SubjectRef, WorkflowEvent, WorkflowRunInput, WorkflowStatus, SUBJECT_KIND_CUSTOM,
 };
+
+use crate::git_provider::{BuiltinGitProvider, GitProvider};
 
 use crate::phase_executor::{run_workflow_phase, PhaseExecuteOverrides, PhaseExecutionOutcome, PhaseRunParams};
 use animus_runtime_shared::ensure_execution_cwd::ensure_execution_cwd;
 use animus_runtime_shared::phase_output::{
-    is_phase_completed, persist_phase_output, phase_output_dir, read_persisted_decision, PersistedPhaseOutput,
+    is_phase_completed, persist_phase_output_with_metadata, phase_output_dir, read_persisted_decision,
+    PersistedPhaseOutput,
 };
 use animus_runtime_shared::workflow_event_emitter::{
     RuntimeWorkflowEvent, RuntimeWorkflowEventKind, SharedWorkflowEventEmitter,
@@ -364,6 +363,7 @@ pub async fn execute_workflow_with_hub(
                     &workflow.id,
                     &phase_filter,
                     &result.outcome,
+                    Some(&result.metadata),
                 );
                 let _ = phase_attempt; // unused without marker write
                 emit(PhaseEvent::Completed {
@@ -594,12 +594,13 @@ pub async fn execute_workflow_with_hub(
                 // tick and either retries the persistence or surfaces the
                 // failure for human review.
                 if !matches!(&result.outcome, PhaseExecutionOutcome::ManualPending { .. }) {
-                    if let Err(persist_err) = persist_phase_output(
+                    if let Err(persist_err) = persist_phase_output_with_metadata(
                         &params.project_root,
                         &workflow.id,
                         &phase_id,
                         phase_attempt,
                         &result.outcome,
+                        Some(&result.metadata),
                     ) {
                         // The phase completed but the durable output
                         // marker did not. Advancing the workflow to the
@@ -716,7 +717,7 @@ pub async fn execute_workflow_with_hub(
                         let outcome = dispatch_workflow_event(
                             hub.clone(),
                             &params.project_root,
-                            WorkflowEvent::Pause { workflow_id: workflow.id.clone() },
+                            WorkflowEvent::Pause { workflow_id: workflow.id.clone(), reason_detail: None },
                         )
                         .await?;
                         workflow = outcome
@@ -1033,6 +1034,7 @@ fn persist_phase_output_without_marker(
     workflow_id: &str,
     phase_id: &str,
     outcome: &PhaseExecutionOutcome,
+    metadata: Option<&animus_runtime_shared::phase_metadata::PhaseExecutionMetadata>,
 ) -> anyhow::Result<()> {
     let dir = phase_output_dir(project_root, workflow_id);
     std::fs::create_dir_all(&dir)?;
@@ -1067,6 +1069,8 @@ fn persist_phase_output_without_marker(
             ),
         };
 
+    let (requested_skills, resolved_skills, applied_skills) =
+        metadata.map(animus_runtime_shared::phase_output::persisted_skills_from_metadata).unwrap_or_default();
     let output = PersistedPhaseOutput {
         phase_id: phase_id.to_string(),
         completed_at: chrono::Utc::now().to_rfc3339(),
@@ -1079,6 +1083,9 @@ fn persist_phase_output_without_marker(
         evidence,
         guardrail_violations,
         payload,
+        requested_skills,
+        resolved_skills,
+        applied_skills,
     };
 
     let serialized = serde_json::to_string_pretty(&output)?;
@@ -1787,23 +1794,12 @@ async fn cleanup_worktree_with_fallback(
         });
     };
 
-    // Stop the scoped agent-runner for this worktree before removing it.
-    // Without this, each removed worktree leaves its agent-runner process running
-    // as an orphan, causing a process leak that accumulates over time.
-    let runner_stopped = match stop_agent_runner_process(Path::new(worktree_path)).await {
-        Ok(true) => {
-            tracing::info!(worktree_path, "Stopped scoped agent-runner before worktree removal");
-            true
-        }
-        Ok(false) => {
-            tracing::debug!(worktree_path, "No scoped agent-runner found for worktree");
-            false
-        }
-        Err(e) => {
-            tracing::warn!(worktree_path, error = %e, "Failed to stop scoped agent-runner; proceeding with worktree removal");
-            false
-        }
-    };
+    // The agent-runner sidecar was removed upstream in ao-cli v0.5.3
+    // (provider plugins own CLI invocation end to end), so there is no
+    // scoped runner process to stop before removing the worktree. The
+    // `runner_stopped` field is kept in the cleanup payload for wire
+    // compatibility and always reports `false`.
+    let runner_stopped = false;
 
     match git_provider.remove_worktree(project_root, worktree_path).await {
         Ok(()) => serde_json::json!({
@@ -2885,7 +2881,7 @@ mod phase_filter_marker_tests {
         let attempt: u32 = 1;
 
         let outcome = sample_completed_outcome(phase_id);
-        persist_phase_output_without_marker(project_root, workflow_id, phase_id, &outcome)
+        persist_phase_output_without_marker(project_root, workflow_id, phase_id, &outcome, None)
             .expect("phase-filter persist must succeed");
 
         let json_path = phase_output_dir(project_root, workflow_id).join(format!("{phase_id}.json"));
@@ -2922,7 +2918,7 @@ mod phase_filter_marker_tests {
         // 1. User runs `--phase implementation` for inspection — must NOT
         //    leave a recovery marker behind.
         let outcome = sample_completed_outcome(phase_id);
-        persist_phase_output_without_marker(project_root, workflow_id, phase_id, &outcome)
+        persist_phase_output_without_marker(project_root, workflow_id, phase_id, &outcome, None)
             .expect("phase-filter persist must succeed");
         assert!(
             !is_phase_completed(project_root, workflow_id, phase_id, attempt),
@@ -2954,7 +2950,7 @@ mod phase_filter_marker_tests {
         let phase_id = "qa";
 
         let first = sample_completed_outcome(phase_id);
-        persist_phase_output_without_marker(project_root, workflow_id, phase_id, &first).expect("first write");
+        persist_phase_output_without_marker(project_root, workflow_id, phase_id, &first, None).expect("first write");
         let json_path = phase_output_dir(project_root, workflow_id).join(format!("{phase_id}.json"));
         let first_payload = std::fs::read_to_string(&json_path).expect("read first");
 
@@ -2963,7 +2959,7 @@ mod phase_filter_marker_tests {
             d.reason = "second invocation reason".to_string();
             d.confidence = 0.42;
         }
-        persist_phase_output_without_marker(project_root, workflow_id, phase_id, &second).expect("second write");
+        persist_phase_output_without_marker(project_root, workflow_id, phase_id, &second, None).expect("second write");
         let second_payload = std::fs::read_to_string(&json_path).expect("read second");
 
         assert_ne!(first_payload, second_payload, "second --phase run must overwrite, not append");

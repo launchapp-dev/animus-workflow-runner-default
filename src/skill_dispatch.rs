@@ -1,140 +1,15 @@
-use std::path::Path;
+//! Launch-contract injection for applied phase skills.
+//!
+//! v0.4.4: the skill resolution / application / capability-override layer
+//! moved to `animus_runtime_shared::phase_skills` (the kernel and the
+//! ad-hoc `animus agent run --skill` path share it). What remains here is
+//! the launch-affecting injection of an applied skill's `extra_args`,
+//! `env`, and `codex_config_overrides` onto the runtime contract's
+//! `/cli/launch` block.
 
-use anyhow::Result;
-use orchestrator_config::{
-    apply_skill_for_execution, merge_skill_applications, parse_skill_capability_key, preview_skill_application,
-    skill_resolution::{resolve_skills_for_project, ResolvedSkill},
-    SkillApplicationResult, SkillCapabilityKey,
-};
-use protocol::PhaseCapabilities;
-use serde::{Deserialize, Serialize};
+use animus_runtime_shared::runtime_support::{inject_cli_launch_env, inject_codex_config_overrides_list};
+use orchestrator_config::SkillApplicationResult;
 use serde_json::Value;
-use tracing::warn;
-
-use animus_runtime_shared::config_context::RuntimeConfigContext;
-
-fn collect_phase_skills(ctx: &RuntimeConfigContext, phase_id: &str) -> Vec<String> {
-    let wf_phase_skills =
-        ctx.workflow_config.config.phase_definitions.get(phase_id).map(|def| &def.skills).filter(|s| !s.is_empty());
-    if let Some(skills) = wf_phase_skills {
-        return skills.clone();
-    }
-
-    if let Some(phase_skills) =
-        ctx.agent_runtime_config.phase_execution(phase_id).map(|def| &def.skills).filter(|s| !s.is_empty())
-    {
-        return phase_skills.clone();
-    }
-
-    let agent_id = ctx.phase_agent_id(phase_id);
-    if let Some(id) = agent_id.as_deref() {
-        let wf_profile_skills =
-            ctx.workflow_config.config.agent_profiles.get(id).map(|p| &p.skills).filter(|s| !s.is_empty());
-        if let Some(skills) = wf_profile_skills {
-            return skills.clone();
-        }
-
-        if let Some(profile_skills) =
-            ctx.agent_runtime_config.agent_profile(id).map(|p| &p.skills).filter(|s| !s.is_empty())
-        {
-            return profile_skills.clone();
-        }
-    }
-
-    Vec::new()
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ResolvedPhaseSkillSet {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub requested_skills: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub resolved_skills: Vec<ResolvedSkill>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct AppliedPhaseSkills {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub requested_skills: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub resolved_skills: Vec<ResolvedSkill>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub applied_skills: Vec<ResolvedSkill>,
-    #[serde(default, skip_serializing_if = "SkillApplicationResult::is_empty")]
-    pub application: SkillApplicationResult,
-}
-
-pub fn resolve_phase_skills(
-    ctx: &RuntimeConfigContext,
-    project_root: &Path,
-    phase_id: &str,
-) -> Result<ResolvedPhaseSkillSet> {
-    let skills = collect_phase_skills(ctx, phase_id);
-    if skills.is_empty() {
-        return Ok(ResolvedPhaseSkillSet::default());
-    }
-
-    let resolved = resolve_skills_for_project(&skills, project_root)?;
-
-    Ok(ResolvedPhaseSkillSet { requested_skills: skills, resolved_skills: resolved })
-}
-
-pub fn preview_phase_capabilities(base: &PhaseCapabilities, resolved: &ResolvedPhaseSkillSet) -> PhaseCapabilities {
-    let preview_results = resolved
-        .resolved_skills
-        .iter()
-        .filter_map(|skill| preview_skill_application(&skill.definition))
-        .collect::<Vec<_>>();
-    if preview_results.is_empty() {
-        return base.clone();
-    }
-
-    let preview = merge_skill_applications(&preview_results);
-    apply_skill_capability_overrides(base, &preview.capabilities)
-}
-
-pub fn apply_phase_skills(resolved: &ResolvedPhaseSkillSet, tool_id: &str, model_id: &str) -> AppliedPhaseSkills {
-    let mut applied_skills = Vec::new();
-    let mut applications = Vec::new();
-
-    for skill in &resolved.resolved_skills {
-        if let Some(application) = apply_skill_for_execution(&skill.definition, tool_id, Some(model_id)) {
-            applied_skills.push(skill.clone());
-            applications.push(application);
-        }
-    }
-
-    AppliedPhaseSkills {
-        requested_skills: resolved.requested_skills.clone(),
-        resolved_skills: resolved.resolved_skills.clone(),
-        applied_skills,
-        application: merge_skill_applications(&applications),
-    }
-}
-
-pub fn apply_skill_capability_overrides(
-    base: &PhaseCapabilities,
-    overrides: &std::collections::BTreeMap<String, bool>,
-) -> PhaseCapabilities {
-    let mut caps = base.clone();
-    for (name, enabled) in overrides {
-        match parse_skill_capability_key(name) {
-            Some(SkillCapabilityKey::WritesFiles) => caps.writes_files = *enabled,
-            Some(SkillCapabilityKey::MutatesState) => caps.mutates_state = *enabled,
-            Some(SkillCapabilityKey::RequiresCommit) => caps.requires_commit = *enabled,
-            Some(SkillCapabilityKey::EnforceProductChanges) => caps.enforce_product_changes = *enabled,
-            Some(SkillCapabilityKey::IsResearch) => caps.is_research = *enabled,
-            Some(SkillCapabilityKey::IsUiUx) => caps.is_ui_ux = *enabled,
-            Some(SkillCapabilityKey::IsReview) => caps.is_review = *enabled,
-            Some(SkillCapabilityKey::IsTesting) => caps.is_testing = *enabled,
-            Some(SkillCapabilityKey::IsRequirements) => caps.is_requirements = *enabled,
-            None => {
-                warn!(capability = %name, "Ignoring unknown skill capability override");
-            }
-        }
-    }
-    caps
-}
 
 /// Returns the index where skill-supplied `extra_args` should be inserted in
 /// `/cli/launch/args` so they land before the prompt and never split a
@@ -159,23 +34,17 @@ fn skill_extra_args_insert_index(args: &[Value]) -> usize {
 
 pub fn inject_skill_overrides(runtime_contract: &mut Value, tool_id: &str, skill_result: &SkillApplicationResult) {
     // Codex P2 #3: for Claude/Codex/Gemini launch contracts the prompt is the
-    // trailing positional argument. `inject_cli_extra_args` already uses the
-    // pre-prompt insertion index for its sibling overrides; do the same here
-    // so skill-supplied flags are seen as flags by the CLI, not as part of
-    // the prompt text.
-    //
-    // Tool-specific edge cases:
-    //   - Gemini emits the prompt as `-p <prompt>` (the prompt is the value
-    //     of the `-p` flag, not a bare trailing positional). Inserting at
-    //     `len-1` would land between `-p` and its value. Detect the `-p`
-    //     pair at the tail and insert one slot earlier.
-    //   - When the launch args vector is empty (no prompt positional yet),
-    //     insert at the end so the order is still deterministic.
+    // trailing positional argument, so skill-supplied flags must be inserted
+    // BEFORE it (the CLI would otherwise read them as prompt text). The
+    // shared `inject_cli_extra_args_list` inserts at `len - 1`, which would
+    // split Gemini's trailing `-p <prompt>` flag/value pair — keep the
+    // gemini-aware local index here until the shared helper learns the
+    // `-p` tail case.
     if !skill_result.extra_args.is_empty() {
         if let Some(args) = runtime_contract.pointer_mut("/cli/launch/args").and_then(Value::as_array_mut) {
             let mut insert_at = skill_extra_args_insert_index(args);
             for arg in &skill_result.extra_args {
-                if !args.iter().any(|a| a.as_str() == Some(arg)) {
+                if !args.iter().any(|existing| existing.as_str() == Some(arg)) {
                     args.insert(insert_at, Value::String(arg.clone()));
                     insert_at += 1;
                 }
@@ -183,222 +52,19 @@ pub fn inject_skill_overrides(runtime_contract: &mut Value, tool_id: &str, skill
         }
     }
 
-    if !skill_result.env.is_empty() {
-        if runtime_contract.pointer("/cli/launch/env").is_none() {
-            if let Some(launch) = runtime_contract.pointer_mut("/cli/launch").and_then(Value::as_object_mut) {
-                launch.insert("env".to_string(), Value::Object(serde_json::Map::new()));
-            }
-        }
-        if let Some(env) = runtime_contract.pointer_mut("/cli/launch/env").and_then(Value::as_object_mut) {
-            for (key, value) in &skill_result.env {
-                env.entry(key.clone()).or_insert(Value::String(value.clone()));
-            }
-        }
-    }
-
-    if !skill_result.codex_config_overrides.is_empty() && tool_id.eq_ignore_ascii_case("codex") {
-        if let Some(args) = runtime_contract.pointer_mut("/cli/launch/args").and_then(Value::as_array_mut) {
-            for override_val in &skill_result.codex_config_overrides {
-                let flag = format!("--config-override={}", override_val);
-                if !args.iter().any(|a| a.as_str() == Some(&flag)) {
-                    args.push(Value::String(flag));
-                }
-            }
-        }
-    }
+    // Launch env + codex `-c` config overrides go through the shared
+    // helpers (the same ones the kernel's ad-hoc `--skill` launch graft
+    // uses): env entries never clobber existing keys, codex overrides
+    // upsert an existing `-c key=...` pair in place.
+    inject_cli_launch_env(runtime_contract, &skill_result.env);
+    inject_codex_config_overrides_list(runtime_contract, tool_id, &skill_result.codex_config_overrides);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use animus_runtime_shared::ipc::build_runtime_contract_with_resume;
-    use animus_runtime_shared::phase_prompt::{
-        render_phase_prompt_with_ctx_overrides, PhasePromptInputs, PhaseRenderParams,
-    };
-    use animus_runtime_shared::runtime_contract::{inject_named_mcp_servers, set_mcp_tool_policy};
-
-    use orchestrator_config::workflow_config::McpServerDefinition;
-    use orchestrator_core::{
-        builtin_agent_runtime_config, builtin_workflow_config, workflow_config_hash, write_agent_runtime_config,
-        write_workflow_config, LoadedWorkflowConfig, WorkflowConfigMetadata, WorkflowConfigSource,
-    };
+    use orchestrator_config::SkillApplicationResult;
     use serde_json::json;
-    use std::collections::BTreeMap;
-    use std::path::PathBuf;
-    use tempfile::TempDir;
-
-    fn write_installed_skill(temp: &TempDir) {
-        let scoped = protocol::scoped_state_root(temp.path()).expect("scoped state root");
-        let state_dir = scoped.join("state");
-        std::fs::create_dir_all(&state_dir).expect("state dir");
-        let registry = json!({
-            "installed": [{
-                "name": "registry-review",
-                "version": "1.2.3",
-                "source": "acme/registry-review",
-                "registry": "catalog",
-                "integrity": "sha256:test",
-                "artifact": "registry-review-1.2.3.tgz",
-                "definition": {
-                    "name": "registry-review",
-                    "description": "Registry-backed review skill",
-                    "activation": {
-                        "tools": ["codex"]
-                    },
-                    "prompt": {
-                        "system": "Registry system prompt",
-                        "prefix": "Registry prefix",
-                        "suffix": "Registry suffix",
-                        "directives": ["Validate references"]
-                    },
-                    "tool_policy": {
-                        "allow": ["Read"],
-                        "deny": ["Write"]
-                    },
-                    "model": {
-                        "preferred": "gemini-2.5-pro"
-                    },
-                    "mcp_servers": ["docs"],
-                    "capabilities": {
-                        "writes_files": false
-                    },
-                    "extra_args": ["--skill-flag"],
-                    "env": {
-                        "SKILL_MODE": "review"
-                    },
-                    "codex_config_overrides": ["profile=review"]
-                }
-            }]
-        });
-        std::fs::write(state_dir.join("skills-registry.v1.json"), serde_json::to_vec_pretty(&registry).expect("json"))
-            .expect("registry state");
-    }
-
-    // TODO: skill_dispatch test intermittently sees scoped_state_root resolve to a
-    // different path between writing the skills-registry.v1.json fixture and the
-    // resolver reading it. Same root cause as test_persist_and_load_phase_output.
-    // Passes reliably in isolation. Reproduce and fix scoped_state_root resolution
-    // race separately.
-    #[ignore = "intermittent scoped_state_root race on skills-registry fixture; passes in isolation"]
-    #[test]
-    fn runtime_resolves_installed_registry_skills_into_prompt_and_contract() {
-        let _guard = crate::test_env::scoped_state_serializer();
-        let temp = tempfile::tempdir().expect("tempdir");
-        let mut workflow = builtin_workflow_config();
-        workflow.mcp_servers.insert(
-            "docs".to_string(),
-            McpServerDefinition {
-                command: "docs-mcp".to_string(),
-                args: vec!["--serve".to_string()],
-                transport: None,
-                url: None,
-                config: BTreeMap::new(),
-                tools: Vec::new(),
-                env: BTreeMap::from([("DOCS_TOKEN".to_string(), "abc123".to_string())]),
-            },
-        );
-        write_workflow_config(temp.path(), &workflow).expect("workflow config");
-        write_installed_skill(&temp);
-        let mut runtime = builtin_agent_runtime_config();
-        runtime.phases.get_mut("implementation").expect("implementation phase").skills =
-            vec!["registry-review".to_string()];
-        write_agent_runtime_config(temp.path(), &runtime).expect("runtime config");
-
-        let project_root = temp.path().to_string_lossy().to_string();
-        let ctx = RuntimeConfigContext::load(&project_root);
-        let resolved = resolve_phase_skills(&ctx, temp.path(), "implementation").expect("resolve skills");
-        assert_eq!(resolved.requested_skills, vec!["registry-review"]);
-        assert!(matches!(
-            resolved.resolved_skills.first().map(|skill| &skill.source),
-            Some(orchestrator_config::skill_scoping::SkillSourceOrigin::Installed { .. })
-        ));
-
-        let preview_caps = preview_phase_capabilities(&ctx.phase_capabilities("implementation"), &resolved);
-        let applied = apply_phase_skills(&resolved, "codex", "gpt-5.3-codex");
-        let effective_caps = apply_skill_capability_overrides(&preview_caps, &applied.application.capabilities);
-        assert_eq!(applied.application.model.as_deref(), Some("gemini-2.5-pro"));
-        assert!(!effective_caps.writes_files, "skill capability should override implementation write default");
-
-        let rendered = render_phase_prompt_with_ctx_overrides(
-            &ctx,
-            &PhaseRenderParams {
-                project_root: &project_root,
-                execution_cwd: &project_root,
-                workflow_id: "wf-test",
-                subject_id: "TASK-620",
-                subject_title: "Runtime skill integration",
-                subject_description: "Verify runtime skill resolution",
-                phase_id: "implementation",
-            },
-            PhasePromptInputs::default(),
-            Some(effective_caps.clone()),
-            Some(&applied.application),
-        );
-        assert!(
-            rendered.system_prompt.as_deref().is_some_and(|value| value.contains("Registry system prompt")),
-            "expected skill system prompt in rendered prompt: {rendered:?}"
-        );
-        assert!(rendered.final_prompt.contains("Registry prefix"));
-        assert!(rendered.final_prompt.contains("Skill directives:"));
-        assert!(rendered.final_prompt.contains("Validate references"));
-        assert!(rendered.final_prompt.contains("Registry suffix"));
-
-        let mut runtime_contract =
-            build_runtime_contract_with_resume("codex", "gpt-5.3-codex", &rendered.final_prompt, None)
-                .expect("runtime contract");
-        set_mcp_tool_policy(
-            &mut runtime_contract,
-            applied.application.tool_policy.as_ref().expect("skill tool policy"),
-        );
-        inject_named_mcp_servers(
-            &mut runtime_contract,
-            &project_root,
-            &ctx,
-            "implementation",
-            &applied.application.mcp_servers,
-        )
-        .expect("skill mcp servers");
-        inject_skill_overrides(&mut runtime_contract, "codex", &applied.application);
-
-        assert_eq!(runtime_contract.pointer("/mcp/tool_policy/allow/0").and_then(Value::as_str), Some("Read"));
-        assert_eq!(
-            runtime_contract.pointer("/mcp/additional_servers/docs/command").and_then(Value::as_str),
-            Some("docs-mcp")
-        );
-        assert_eq!(
-            runtime_contract.pointer("/mcp/additional_servers/docs/env/DOCS_TOKEN").and_then(Value::as_str),
-            Some("abc123")
-        );
-        assert_eq!(runtime_contract.pointer("/cli/launch/env/SKILL_MODE").and_then(Value::as_str), Some("review"));
-        let args = runtime_contract.pointer("/cli/launch/args").and_then(Value::as_array).expect("launch args");
-        assert!(args.iter().any(|value| value.as_str() == Some("--skill-flag")));
-        assert!(args.iter().any(|value| value.as_str() == Some("--config-override=profile=review")));
-    }
-
-    #[test]
-    fn resolve_phase_skills_reports_missing_skill_in_runtime_path() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let mut runtime = builtin_agent_runtime_config();
-        runtime.phases.get_mut("implementation").expect("implementation phase").skills =
-            vec!["missing-runtime-skill".to_string()];
-        let workflow = builtin_workflow_config();
-        let ctx = RuntimeConfigContext {
-            agent_runtime_config: runtime,
-            workflow_config: LoadedWorkflowConfig {
-                metadata: WorkflowConfigMetadata {
-                    schema: workflow.schema.clone(),
-                    version: workflow.version,
-                    hash: workflow_config_hash(&workflow),
-                    source: WorkflowConfigSource::Builtin,
-                },
-                config: workflow,
-                path: PathBuf::from("builtin"),
-            },
-        };
-        let error =
-            resolve_phase_skills(&ctx, temp.path(), "implementation").expect_err("missing skill should fail loudly");
-        assert!(error.to_string().contains("missing-runtime-skill"), "error should name missing skill: {error}");
-    }
 
     /// Codex P2 #3: skill-supplied `extra_args` must land before the trailing
     /// prompt positional so the CLI parses them as flags. Pre-fix, `extra_args`
@@ -471,11 +137,62 @@ mod tests {
         assert_eq!(arg_strings, vec!["--flag", "the-prompt-text"]);
     }
 
+    /// Skill env entries land on `/cli/launch/env` without clobbering keys
+    /// that are already present (explicit launch env wins over the skill).
     #[test]
-    fn skill_capability_overrides_can_enable_state_mutations() {
-        let overrides = BTreeMap::from([("mutates_state".to_string(), true)]);
-        let effective = apply_skill_capability_overrides(&PhaseCapabilities::default(), &overrides);
-        assert!(effective.mutates_state);
-        assert!(!effective.is_strictly_read_only());
+    fn inject_skill_overrides_env_does_not_clobber_existing_keys() {
+        let mut runtime_contract = json!({
+            "cli": { "launch": { "args": ["exec", "prompt"], "env": { "SKILL_MODE": "explicit" } } }
+        });
+        let skill_result = SkillApplicationResult {
+            env: std::collections::BTreeMap::from([
+                ("SKILL_MODE".to_string(), "review".to_string()),
+                ("SKILL_EXTRA".to_string(), "1".to_string()),
+            ]),
+            ..Default::default()
+        };
+
+        inject_skill_overrides(&mut runtime_contract, "codex", &skill_result);
+
+        assert_eq!(
+            runtime_contract.pointer("/cli/launch/env/SKILL_MODE").and_then(Value::as_str),
+            Some("explicit"),
+            "existing launch env keys must win over the skill"
+        );
+        assert_eq!(runtime_contract.pointer("/cli/launch/env/SKILL_EXTRA").and_then(Value::as_str), Some("1"));
+    }
+
+    /// Codex config overrides ride the shared `-c key=value` upsert (the
+    /// kernel's ad-hoc `--skill` graft uses the same helper), replacing an
+    /// existing pair for the same key instead of appending a duplicate.
+    #[test]
+    fn inject_skill_overrides_codex_config_overrides_upsert_dash_c_pairs() {
+        let mut runtime_contract = json!({
+            "cli": { "launch": { "args": ["exec", "-c", "profile=base", "prompt"] } }
+        });
+        let skill_result = SkillApplicationResult {
+            codex_config_overrides: vec!["profile=review".to_string(), "sandbox=workspace".to_string()],
+            ..Default::default()
+        };
+
+        inject_skill_overrides(&mut runtime_contract, "codex", &skill_result);
+
+        let args = runtime_contract.pointer("/cli/launch/args").and_then(Value::as_array).expect("launch args");
+        let arg_strings: Vec<&str> = args.iter().filter_map(|value| value.as_str()).collect();
+        assert!(
+            arg_strings.windows(2).any(|pair| pair == ["-c", "profile=review"]),
+            "existing -c pair must be upserted: {arg_strings:?}"
+        );
+        assert!(
+            arg_strings.windows(2).any(|pair| pair == ["-c", "sandbox=workspace"]),
+            "new -c pair must be inserted: {arg_strings:?}"
+        );
+        assert!(!arg_strings.contains(&"profile=base"), "stale override value must be replaced: {arg_strings:?}");
+
+        // Non-codex tools are untouched.
+        let mut gemini_contract = json!({ "cli": { "launch": { "args": ["-p", "prompt"] } } });
+        inject_skill_overrides(&mut gemini_contract, "gemini", &skill_result);
+        let gemini_args = gemini_contract.pointer("/cli/launch/args").and_then(Value::as_array).expect("args");
+        assert_eq!(gemini_args.len(), 2, "codex overrides must not leak onto non-codex tools");
     }
 }
