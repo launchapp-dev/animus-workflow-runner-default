@@ -35,6 +35,13 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # The ao-cli v0.5.14 pin pulls orchestrator-core's `keyring` dependency
+      # (OS-keychain secrets, v0.5.8+), whose linux-native backend links
+      # libdbus. Mirrors the same step in ao-cli's own release workflow.
+      - name: Install Linux build deps (libdbus for keyring crate)
+        if: contains(matrix.target, 'linux')
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+
       - name: Cache Cargo build artifacts
         uses: Swatinem/rust-cache@v2
         with:
