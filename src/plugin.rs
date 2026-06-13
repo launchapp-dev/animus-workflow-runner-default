@@ -209,7 +209,7 @@ pub fn plugin_initialize_result(params: &InitializeParams) -> Result<InitializeR
             extra: serde_json::to_value(WorkflowRunnerCapabilities {
                 phase_decision_parsing: true,
                 rework_context_support: true,
-                post_success_actions: true,
+                post_success_actions: false,
                 crash_recovery: true,
                 manual_pause_support: true,
             })
@@ -443,6 +443,25 @@ pub async fn handle_workflow_run_phase(request: WorkflowPhaseRunRequest) -> Resu
     let mcp_config: Option<protocol::McpRuntimeConfig> =
         request.mcp_config.clone().and_then(|value| serde_json::from_value(value).ok());
 
+    // Hydrate prior-completed-phase outputs (e.g. an earlier impl phase's
+    // `commit_message`) so a command phase invoked through this per-phase
+    // entrypoint can resolve `{{commit_message}}` and scalar result_payload
+    // vars. The in-process accumulation loop in `execute_workflow_with_hub`
+    // never runs on this path, so we rebuild the map from durable state.
+    let prior_outputs = match state.hub.workflows().get(&request.workflow_id).await {
+        Ok(workflow) => {
+            let phase_order: Vec<(String, u32)> =
+                workflow.phases.iter().map(|p| (p.phase_id.clone(), p.attempt)).collect();
+            crate::workflow_execute::collect_prior_outputs_for_phase(
+                &project_root,
+                &request.workflow_id,
+                &request.phase_id,
+                &phase_order,
+            )
+        }
+        Err(_) => std::collections::HashMap::new(),
+    };
+
     let started = std::time::Instant::now();
     let run_result = crate::phase_executor::run_workflow_phase(&crate::phase_executor::PhaseRunParams {
         project_root: &project_root,
@@ -457,6 +476,7 @@ pub async fn handle_workflow_run_phase(request: WorkflowPhaseRunRequest) -> Resu
         phase_attempt: request.phase_attempt,
         overrides: Some(&overrides),
         pipeline_vars: if pipeline_vars.is_empty() { None } else { Some(&pipeline_vars) },
+        prior_outputs: if prior_outputs.is_empty() { None } else { Some(&prior_outputs) },
         dispatch_input: request.dispatch_input.as_deref(),
         schedule_input: request.schedule_input.as_deref(),
         routing: &routing,

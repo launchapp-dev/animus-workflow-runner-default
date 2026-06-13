@@ -9,7 +9,7 @@ use tokio::process::Command;
 
 use orchestrator_config::{
     collect_workflow_refs, ensure_pack_execution_requirements, resolve_active_pack_for_workflow_ref,
-    resolve_pack_registry, workflow_config::MergeStrategy,
+    resolve_pack_registry,
 };
 use orchestrator_core::{
     dispatch_workflow_event, ensure_workflow_config_compiled, load_workflow_config,
@@ -17,8 +17,6 @@ use orchestrator_core::{
     subject_adapter::SubjectContext, unregister_workflow_runner_pid, OrchestratorTask, OrchestratorWorkflow,
     PhaseDecisionVerdict, SubjectRef, WorkflowEvent, WorkflowRunInput, WorkflowStatus, SUBJECT_KIND_CUSTOM,
 };
-
-use crate::git_provider::{BuiltinGitProvider, GitProvider};
 
 use crate::phase_executor::{run_workflow_phase, PhaseExecuteOverrides, PhaseExecutionOutcome, PhaseRunParams};
 use animus_runtime_shared::ensure_execution_cwd::ensure_execution_cwd;
@@ -318,6 +316,14 @@ pub async fn execute_workflow_with_hub(
         );
         let phase_start = Instant::now();
 
+        // Single-phase (`--phase`) execution still hydrates prior-completed-phase
+        // outputs from durable state so a command phase such as `commit` can
+        // resolve `{{commit_message}}` authored by an earlier phase.
+        let single_phase_order: Vec<(String, u32)> =
+            workflow.phases.iter().map(|p| (p.phase_id.clone(), p.attempt)).collect();
+        let single_phase_prior_outputs =
+            collect_prior_outputs_for_phase(&params.project_root, &workflow.id, &phase_filter, &single_phase_order);
+
         let phase_overrides = PhaseExecuteOverrides {
             tool: params.tool.clone(),
             model: params.model.clone(),
@@ -336,6 +342,7 @@ pub async fn execute_workflow_with_hub(
             phase_attempt,
             overrides: Some(&phase_overrides),
             pipeline_vars: if workflow_vars.is_empty() { None } else { Some(&workflow_vars) },
+            prior_outputs: if single_phase_prior_outputs.is_empty() { None } else { Some(&single_phase_prior_outputs) },
             dispatch_input: phase_inputs.dispatch_input.as_deref(),
             schedule_input: phase_inputs.schedule_input.as_deref(),
             routing: &routing,
@@ -464,6 +471,17 @@ pub async fn execute_workflow_with_hub(
         let phase_id = phases_to_run[phase_idx].clone();
         let phase_attempt = workflow.phases.iter().find(|p| p.phase_id == phase_id).map(|p| p.attempt).unwrap_or(0);
 
+        // Recompute prior-completed-phase outputs from durable state for the
+        // phase about to run. Deriving from durable state each iteration
+        // (rather than incrementally accumulating) keeps the map correct
+        // across resume, marker replay, and backward `Rework` transitions:
+        // it always reflects exactly the marker-gated outputs of phases that
+        // precede `phase_id` in pipeline order, never stale outputs from
+        // phases that are no longer prior.
+        let phase_order: Vec<(String, u32)> = workflow.phases.iter().map(|p| (p.phase_id.clone(), p.attempt)).collect();
+        let prior_outputs =
+            collect_prior_outputs_for_phase(&params.project_root, &workflow.id, &phase_id, &phase_order);
+
         if is_phase_completed(&params.project_root, &workflow.id, &phase_id, phase_attempt) {
             match read_persisted_decision(&params.project_root, &workflow.id, &phase_id) {
                 Ok(decision) => {
@@ -540,6 +558,7 @@ pub async fn execute_workflow_with_hub(
             phase_attempt,
             overrides: Some(&phase_overrides),
             pipeline_vars: if workflow_vars.is_empty() { None } else { Some(&workflow_vars) },
+            prior_outputs: if prior_outputs.is_empty() { None } else { Some(&prior_outputs) },
             dispatch_input: phase_inputs.dispatch_input.as_deref(),
             schedule_input: phase_inputs.schedule_input.as_deref(),
             routing: &routing,
@@ -832,30 +851,26 @@ pub async fn execute_workflow_with_hub(
     });
     if workflow.status == WorkflowStatus::Completed {
         project_requirement_success_status(hub.clone(), &workflow.subject, &workflow_ref).await?;
-        post_success = if let Some(ref t) = task {
-            execute_post_success_actions(&params.project_root, t, &workflow, &workflow_config, &execution_cwd).await
-        } else {
-            serde_json::json!({
-                "status": "skipped",
-                "reason": "post-success actions require a task subject",
-            })
-        };
 
-        match post_success["status"].as_str() {
-            Some("conflict") => {
-                let reason = post_success_failure_reason(&post_success)
-                    .unwrap_or_else(|| "post-success merge conflict".to_string());
-                workflow = hub.workflows().mark_merge_conflict(&workflow.id, reason).await?;
-                reported_workflow_status = workflow.status;
-            }
-            Some("failed") => {
-                let reason = post_success_failure_reason(&post_success)
-                    .unwrap_or_else(|| "post-success action failed".to_string());
-                workflow = hub.workflows().mark_completed_failed(&workflow.id, reason).await?;
-                reported_workflow_status = workflow.status;
-            }
-            _ => {}
+        // The runtime no longer performs git side-effects (push / PR /
+        // merge). Those are workflow command phases now. The workflow's
+        // final status is therefore independent of any git automation.
+        let mut completion = serde_json::json!({
+            "status": "not-applicable",
+            "reason": "git automation handled by workflow command phases",
+        });
+
+        // The runtime DOES clean up the isolated worktree it placed the
+        // agent into. This is a runtime responsibility, not a merge policy:
+        // it runs on completion whenever the task carries a worktree path.
+        // When the worktree is dirty (the runtime no longer auto-commits)
+        // cleanup reports `skipped` and preserves it; the workflow status is
+        // unaffected — it depends only on the workflow's own phases.
+        if let Some(ref t) = task {
+            completion["cleanup_worktree"] = cleanup_worktree_with_fallback(&params.project_root, t).await;
         }
+
+        post_success = completion;
     }
 
     match reported_workflow_status {
@@ -996,6 +1011,86 @@ fn phase_rework_context(outcome: &PhaseExecutionOutcome) -> Option<String> {
     }
 }
 
+fn accumulate_prior_output_fields(
+    prior_outputs: &mut HashMap<String, String>,
+    commit_message: Option<&str>,
+    result_payload: Option<&Value>,
+) {
+    if let Some(Value::Object(fields)) = result_payload {
+        for (key, value) in fields {
+            let scalar = match value {
+                Value::String(text) => Some(text.clone()),
+                Value::Number(number) => Some(number.to_string()),
+                Value::Bool(flag) => Some(flag.to_string()),
+                _ => None,
+            };
+            if let Some(scalar) = scalar {
+                // Never let an empty `commit_message` payload scalar clobber a
+                // valid value: a prior phase may carry the optional field as
+                // `""` (e.g. a review `phase_decision`), and the top-level
+                // commit_message merged below already enforces non-empty.
+                if key == "commit_message" && scalar.trim().is_empty() {
+                    continue;
+                }
+                prior_outputs.insert(key.clone(), scalar);
+            }
+        }
+    }
+
+    if let Some(message) = commit_message.map(str::trim).filter(|value| !value.is_empty()) {
+        prior_outputs.insert("commit_message".to_string(), message.to_string());
+    }
+}
+
+/// Build the prior-completed-phase output map for `current_phase_id` from
+/// durable state. Walks the pipeline phase order up to (but not including)
+/// the current phase and accumulates each phase's persisted `commit_message`
+/// plus the scalar `result_payload` fields, gated by the phase's completion
+/// marker so ad-hoc `--phase` outputs (persisted without a marker) are
+/// ignored. Used by the per-phase `workflow/run_phase` plugin entrypoint,
+/// where the in-process accumulation loop never ran.
+pub(crate) fn collect_prior_outputs_for_phase(
+    project_root: &str,
+    workflow_id: &str,
+    current_phase_id: &str,
+    phase_order: &[(String, u32)],
+) -> HashMap<String, String> {
+    let mut prior_outputs = HashMap::new();
+    for (prior_phase_id, prior_attempt) in phase_order {
+        if prior_phase_id == current_phase_id {
+            break;
+        }
+        if !is_phase_completed(project_root, workflow_id, prior_phase_id, *prior_attempt) {
+            continue;
+        }
+        hydrate_prior_outputs_from_persisted(&mut prior_outputs, project_root, workflow_id, prior_phase_id);
+    }
+    prior_outputs
+}
+
+pub(crate) fn hydrate_prior_outputs_from_persisted(
+    prior_outputs: &mut HashMap<String, String>,
+    project_root: &str,
+    workflow_id: &str,
+    phase_id: &str,
+) {
+    // `<phase>.json` is not attempt-keyed, so re-running a completed phase via
+    // `--phase` (which persists output WITHOUT a marker) overwrites the file
+    // the original completion marker pointed at. The marker gate above cannot
+    // detect that desync. The same hazard already affects
+    // `read_persisted_decision` crash-replay, so fixing it belongs in the
+    // persistence model (attempt-keyed output file or marker-embedded content
+    // hash), out of scope here.
+    let file_path = phase_output_dir(project_root, workflow_id).join(format!("{phase_id}.json"));
+    let Ok(contents) = std::fs::read_to_string(&file_path) else {
+        return;
+    };
+    let Ok(output) = serde_json::from_str::<PersistedPhaseOutput>(&contents) else {
+        return;
+    };
+    accumulate_prior_output_fields(prior_outputs, output.commit_message.as_deref(), output.payload.as_ref());
+}
+
 fn is_terminal_workflow_status(status: WorkflowStatus) -> bool {
     matches!(
         status,
@@ -1101,245 +1196,6 @@ fn persist_phase_output_without_marker(
     Ok(())
 }
 
-fn post_success_failure_reason(post_success: &Value) -> Option<String> {
-    post_success
-        .get("error")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-        .or_else(|| post_success.get("reason").and_then(Value::as_str).map(ToOwned::to_owned))
-        .or_else(|| {
-            post_success.get("actions").and_then(Value::as_object).and_then(|actions| {
-                actions.values().find_map(|action| {
-                    if action.get("status").and_then(Value::as_str) == Some("failed")
-                        || action.get("status").and_then(Value::as_str) == Some("conflict")
-                    {
-                        action.get("error").and_then(Value::as_str).map(ToOwned::to_owned)
-                    } else {
-                        None
-                    }
-                })
-            })
-        })
-}
-
-async fn execute_post_success_actions(
-    project_root: &str,
-    task: &OrchestratorTask,
-    workflow: &OrchestratorWorkflow,
-    workflow_config: &orchestrator_core::WorkflowConfig,
-    execution_cwd: &str,
-) -> Value {
-    let workflow_ref = workflow.workflow_ref.as_deref().unwrap_or(workflow_config.default_workflow_ref.as_str());
-    let workflow_def = workflow_config
-        .workflows
-        .iter()
-        .find(|p| p.id.eq_ignore_ascii_case(workflow_ref))
-        .or_else(|| workflow_config.workflows.iter().find(|p| p.id.eq_ignore_ascii_case("standard")))
-        .or_else(|| {
-            workflow_config.workflows.iter().find(|p| p.id.eq_ignore_ascii_case(&workflow_config.default_workflow_ref))
-        })
-        .cloned();
-
-    let Some(workflow_def) = workflow_def else {
-        return serde_json::json!({
-            "status": "skipped",
-            "reason": "workflow configuration not found",
-        });
-    };
-
-    let Some(merge_cfg) = workflow_def.post_success.and_then(|post_success| post_success.merge) else {
-        return serde_json::json!({
-            "status": "skipped",
-            "reason": "post_success.merge not configured",
-            "workflow_ref": workflow_def.id,
-        });
-    };
-
-    let Some(source_branch) = resolve_source_branch(task, execution_cwd).await else {
-        return serde_json::json!({
-            "status": "skipped",
-            "reason": "unable to resolve source branch",
-            "workflow_ref": workflow_def.id,
-        });
-    };
-
-    let git_provider = Arc::new(BuiltinGitProvider::new(project_root));
-    let target_branch = merge_cfg.target_branch.clone();
-
-    let mut action_result = serde_json::json!({
-        "status": "skipped",
-        "workflow_ref": workflow_def.id,
-        "target_branch": target_branch,
-        "strategy": merge_strategy_name(&merge_cfg.strategy),
-        "create_pr": merge_cfg.create_pr,
-        "auto_merge": merge_cfg.auto_merge,
-        "cleanup_worktree": merge_cfg.cleanup_worktree,
-        "actions": {
-            "push": { "status": "skipped" },
-            "create_pr": { "status": "skipped" },
-            "merge": { "status": "skipped" },
-            "cleanup_worktree": { "status": "skipped" },
-        },
-    });
-
-    if merge_cfg.create_pr {
-        if let Some(push_action) =
-            perform_push_with_fallback(&*git_provider, execution_cwd, "origin", &source_branch).await
-        {
-            let push_ok = push_action.get("status").and_then(|v| v.as_str()) == Some("completed");
-            let logger = orchestrator_logging::Logger::for_project(std::path::Path::new(project_root));
-            if push_ok {
-                logger.info("git.push", format!("pushed {}", source_branch)).branch(&source_branch).emit();
-            } else {
-                logger
-                    .error("git.push", format!("push failed {}", source_branch))
-                    .branch(&source_branch)
-                    .err(push_action.to_string())
-                    .emit();
-            }
-            action_result["actions"]["push"] = push_action;
-        }
-
-        let push_status = action_result["actions"]["push"]["status"].as_str().unwrap_or("skipped").to_owned();
-        if push_status != "completed" {
-            action_result["status"] = serde_json::json!("failed");
-            action_result["actions"]["create_pr"] = serde_json::json!({
-                "status": "skipped",
-                "reason": format!("push did not succeed (status: {}), skipping PR creation", push_status),
-            });
-            action_result["source_branch"] = serde_json::json!(source_branch);
-            if merge_cfg.cleanup_worktree {
-                action_result["actions"]["cleanup_worktree"] =
-                    cleanup_worktree_with_fallback(&*git_provider, project_root, task).await;
-            }
-            return action_result;
-        }
-
-        let has_commits = match run_git_output(
-            "git",
-            execution_cwd,
-            &["log", "--oneline", &format!("origin/{}..{}", target_branch, source_branch)],
-        )
-        .await
-        {
-            Ok(output) if output.status.success() => {
-                let log_output = String::from_utf8_lossy(&output.stdout);
-                !log_output.trim().is_empty()
-            }
-            _ => true,
-        };
-
-        if !has_commits {
-            action_result["status"] = serde_json::json!("completed");
-            action_result["actions"]["create_pr"] = serde_json::json!({
-                "status": "skipped",
-                "reason": format!("no commits between origin/{} and {}, skipping PR creation", target_branch, source_branch),
-            });
-            action_result["source_branch"] = serde_json::json!(source_branch);
-            if merge_cfg.cleanup_worktree {
-                action_result["actions"]["cleanup_worktree"] =
-                    cleanup_worktree_with_fallback(&*git_provider, project_root, task).await;
-            }
-            return action_result;
-        }
-
-        let title = if task.title.trim().is_empty() {
-            format!("[{}] Automated update", task.id)
-        } else {
-            format!("[{}] {}", task.id, task.title.trim())
-        };
-        let body = if task.description.trim().is_empty() {
-            format!("Automated update for task {}.", task.id)
-        } else {
-            format!("Automated update for task {}.\n\n{}", task.id, task.description.trim())
-        };
-        action_result["actions"]["create_pr"] =
-            create_pull_request_via_gh(task, project_root, &target_branch, &source_branch, &title, &body).await;
-        {
-            let pr_result = &action_result["actions"]["create_pr"];
-            let logger = orchestrator_logging::Logger::for_project(std::path::Path::new(project_root));
-            if pr_result.get("status").and_then(|v| v.as_str()) == Some("completed") {
-                let pr_url = pr_result.get("pr_url").and_then(|v| v.as_str()).unwrap_or("");
-                logger
-                    .info("git.pr", format!("created PR {}", pr_url))
-                    .branch(&source_branch)
-                    .task(&task.id)
-                    .meta(serde_json::json!({"pr_url": pr_url, "title": title}))
-                    .emit();
-            } else {
-                let err = pr_result.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
-                logger
-                    .error("git.pr", format!("PR creation failed for {}", source_branch))
-                    .branch(&source_branch)
-                    .task(&task.id)
-                    .err(err)
-                    .emit();
-            }
-        }
-        let pr_status = action_result["actions"]["create_pr"]["status"].clone();
-        action_result["status"] = pr_status;
-        action_result["source_branch"] = serde_json::json!(source_branch);
-        if merge_cfg.cleanup_worktree {
-            action_result["actions"]["cleanup_worktree"] =
-                cleanup_worktree_with_fallback(&*git_provider, project_root, task).await;
-        }
-        return action_result;
-    }
-
-    if merge_cfg.auto_merge {
-        action_result["actions"]["merge"] = perform_auto_merge_with_git(
-            project_root,
-            execution_cwd,
-            &source_branch,
-            &target_branch,
-            &merge_cfg.strategy,
-        )
-        .await;
-        action_result["status"] = action_result["actions"]["merge"]["status"].clone();
-    }
-
-    action_result["source_branch"] = serde_json::json!(source_branch);
-    if merge_cfg.cleanup_worktree {
-        action_result["actions"]["cleanup_worktree"] =
-            cleanup_worktree_with_fallback(&*git_provider, project_root, task).await;
-        if action_result["actions"]["cleanup_worktree"]["status"] == "completed" && action_result["status"] == "skipped"
-        {
-            action_result["status"] = serde_json::json!("completed");
-        }
-    }
-    action_result
-}
-
-async fn resolve_source_branch(task: &OrchestratorTask, execution_cwd: &str) -> Option<String> {
-    if let Some(branch) = task.branch_name.as_deref().map(str::trim).filter(|branch| !branch.is_empty()) {
-        return Some(branch.to_string());
-    }
-
-    if execution_cwd.is_empty() || !Path::new(execution_cwd).exists() {
-        return None;
-    }
-
-    let output = run_git_output("git", execution_cwd, &["branch", "--show-current"]).await.ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if branch.is_empty() {
-        None
-    } else {
-        Some(branch)
-    }
-}
-
-fn merge_strategy_name(strategy: &MergeStrategy) -> &'static str {
-    match strategy {
-        MergeStrategy::Squash => "squash",
-        MergeStrategy::Merge => "merge",
-        MergeStrategy::Rebase => "rebase",
-    }
-}
-
 fn command_summary(output: &std::process::Output) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     if !stderr.is_empty() {
@@ -1347,14 +1203,6 @@ fn command_summary(output: &std::process::Output) -> String {
     } else {
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
-}
-
-fn looks_like_merge_conflict(text: &str) -> bool {
-    let text = text.to_ascii_lowercase();
-    text.contains("merge conflict")
-        || text.contains("conflict")
-        || text.contains("automatic merge failed")
-        || text.contains("merge blocked")
 }
 
 async fn run_git_output(program: &str, cwd: &str, args: &[&str]) -> Result<std::process::Output> {
@@ -1369,424 +1217,7 @@ async fn run_git_output(program: &str, cwd: &str, args: &[&str]) -> Result<std::
         .with_context(|| format!("failed to run command {program} in {cwd}"))
 }
 
-async fn perform_push_with_fallback(
-    git_provider: &dyn GitProvider,
-    execution_cwd: &str,
-    remote: &str,
-    branch: &str,
-) -> Option<Value> {
-    match git_provider.push_branch(execution_cwd, remote, branch).await {
-        Ok(_) => Some(serde_json::json!({
-            "status": "completed",
-            "method": "git-provider",
-            "branch": branch,
-            "remote": remote,
-        })),
-        Err(provider_error) => {
-            let direct = run_git_output("git", execution_cwd, &["push", remote, branch]).await;
-            match direct {
-                Ok(output) if output.status.success() => Some(serde_json::json!({
-                    "status": "completed",
-                    "method": "git-direct",
-                    "branch": branch,
-                    "remote": remote,
-                    "provider_error": provider_error.to_string(),
-                })),
-                Ok(output) => Some(serde_json::json!({
-                    "status": "failed",
-                    "method": "git-direct",
-                    "branch": branch,
-                    "remote": remote,
-                    "error": command_summary(&output),
-                    "provider_error": provider_error.to_string(),
-                })),
-                Err(command_error) => Some(serde_json::json!({
-                    "status": "failed",
-                    "method": "git-direct",
-                    "branch": branch,
-                    "remote": remote,
-                    "error": command_error.to_string(),
-                    "provider_error": provider_error.to_string(),
-                })),
-            }
-        }
-    }
-}
-
-async fn create_pull_request_via_gh(
-    task: &OrchestratorTask,
-    execution_cwd: &str,
-    target_branch: &str,
-    source_branch: &str,
-    title: &str,
-    body: &str,
-) -> Value {
-    let args = ["pr", "create", "--base", target_branch, "--head", source_branch, "--title", title, "--body", body];
-    match run_git_output("gh", execution_cwd, &args).await {
-        Ok(output) if output.status.success() => {
-            let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            serde_json::json!({
-                "status": "completed",
-                "method": "gh",
-                "task_id": task.id,
-                "source_branch": source_branch,
-                "target_branch": target_branch,
-                "url": if url.is_empty() { None::<String> } else { Some(url) },
-            })
-        }
-        Ok(output) => {
-            let message = command_summary(&output);
-            let msg_lower = message.to_ascii_lowercase();
-            if msg_lower.contains("already exists")
-                || msg_lower.contains("already open")
-                || msg_lower.contains("no commits between")
-            {
-                serde_json::json!({
-                    "status": "completed",
-                    "method": "gh",
-                    "task_id": task.id,
-                    "source_branch": source_branch,
-                    "target_branch": target_branch,
-                    "error": message,
-                })
-            } else {
-                serde_json::json!({
-                    "status": "failed",
-                    "method": "gh",
-                    "task_id": task.id,
-                    "source_branch": source_branch,
-                    "target_branch": target_branch,
-                    "error": message,
-                })
-            }
-        }
-        Err(error) => serde_json::json!({
-            "status": "failed",
-            "method": "gh",
-            "task_id": task.id,
-            "source_branch": source_branch,
-            "target_branch": target_branch,
-            "error": error.to_string(),
-        }),
-    }
-}
-
-async fn checkout_target_branch(git_cwd: &str, target_branch: &str) -> Result<()> {
-    let checkout_output = run_git_output("git", git_cwd, &["checkout", target_branch]).await;
-    match checkout_output {
-        Ok(output) if output.status.success() => Ok(()),
-        Ok(output) => {
-            let primary_error = command_summary(&output);
-            let fallback_ref = format!("origin/{target_branch}");
-            let fallback =
-                run_git_output("git", git_cwd, &["checkout", "-b", target_branch, fallback_ref.as_str()]).await;
-            match fallback {
-                Ok(fb_output) if fb_output.status.success() => Ok(()),
-                Ok(fb_output) => anyhow::bail!(
-                    "failed to checkout target branch '{target_branch}': {primary_error}; fallback failed: {}",
-                    command_summary(&fb_output),
-                ),
-                Err(fb_err) => anyhow::bail!(
-                    "failed to checkout target branch '{target_branch}': {primary_error}; fallback failed: {fb_err}",
-                ),
-            }
-        }
-        Err(error) => {
-            let fallback_ref = format!("origin/{target_branch}");
-            let fallback =
-                run_git_output("git", git_cwd, &["checkout", "-b", target_branch, fallback_ref.as_str()]).await;
-            match fallback {
-                Ok(fb_output) if fb_output.status.success() => Ok(()),
-                Ok(fb_output) => anyhow::bail!(
-                    "failed to checkout target branch '{target_branch}': {error}; fallback failed: {}",
-                    command_summary(&fb_output),
-                ),
-                Err(fb_err) => anyhow::bail!(
-                    "failed to checkout target branch '{target_branch}': {error}; fallback failed: {fb_err}",
-                ),
-            }
-        }
-    }
-}
-
-fn parse_worktree_path_for_branch(raw: &str, target_branch: &str) -> Option<String> {
-    let target_ref = format!("refs/heads/{target_branch}");
-    let mut current_path: Option<String> = None;
-    let mut current_branch: Option<String> = None;
-
-    for line in raw.lines().chain(std::iter::once("")) {
-        if let Some(path) = line.strip_prefix("worktree ") {
-            current_path = Some(path.trim().to_string());
-            continue;
-        }
-        if let Some(branch) = line.strip_prefix("branch ") {
-            current_branch = Some(branch.trim().to_string());
-            continue;
-        }
-        if line.trim().is_empty() {
-            if current_branch.as_deref() == Some(target_ref.as_str()) {
-                return current_path;
-            }
-            current_path = None;
-            current_branch = None;
-        }
-    }
-
-    None
-}
-
-async fn resolve_target_merge_cwd(project_root: &str, target_branch: &str) -> Result<String> {
-    let worktree_list = run_git_output("git", project_root, &["worktree", "list", "--porcelain"]).await?;
-    if !worktree_list.status.success() {
-        anyhow::bail!(
-            "failed to inspect git worktrees while resolving target branch '{}': {}",
-            target_branch,
-            command_summary(&worktree_list)
-        );
-    }
-
-    let stdout = String::from_utf8_lossy(&worktree_list.stdout);
-    if let Some(path) = parse_worktree_path_for_branch(&stdout, target_branch) {
-        return Ok(path);
-    }
-
-    checkout_target_branch(project_root, target_branch).await?;
-    Ok(project_root.to_string())
-}
-
-async fn current_branch(cwd: &str) -> Result<String> {
-    let output = run_git_output("git", cwd, &["branch", "--show-current"]).await?;
-    if !output.status.success() {
-        anyhow::bail!("failed to resolve current branch in {}: {}", cwd, command_summary(&output));
-    }
-
-    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if branch.is_empty() {
-        anyhow::bail!("git reported an empty current branch in {}", cwd);
-    }
-
-    Ok(branch)
-}
-
-async fn perform_rebase_strategy(
-    source_execution_cwd: &str,
-    target_execution_cwd: &str,
-    source_branch: &str,
-    target_branch: &str,
-) -> Value {
-    let current_source_branch = match current_branch(source_execution_cwd).await {
-        Ok(branch) => branch,
-        Err(error) => {
-            return serde_json::json!({
-                "status": "failed",
-                "method": "git",
-                "source_branch": source_branch,
-                "target_branch": target_branch,
-                "strategy": "rebase",
-                "error": error.to_string(),
-            });
-        }
-    };
-
-    if current_source_branch != source_branch {
-        return serde_json::json!({
-            "status": "failed",
-            "method": "git",
-            "source_branch": source_branch,
-            "target_branch": target_branch,
-            "strategy": "rebase",
-            "error": format!(
-                "source execution cwd '{}' is on branch '{}' instead of '{}'",
-                source_execution_cwd, current_source_branch, source_branch
-            ),
-        });
-    }
-
-    let rebase_output = run_git_output("git", source_execution_cwd, &["rebase", target_branch]).await;
-    match rebase_output {
-        Ok(output) if output.status.success() => {
-            let ff_merge = run_git_output("git", target_execution_cwd, &["merge", "--ff-only", source_branch]).await;
-            match ff_merge {
-                Ok(merge_out) if merge_out.status.success() => serde_json::json!({
-                    "status": "completed",
-                    "method": "git",
-                    "source_branch": source_branch,
-                    "target_branch": target_branch,
-                    "strategy": "rebase",
-                }),
-                Ok(merge_out) => serde_json::json!({
-                    "status": "failed",
-                    "method": "git",
-                    "source_branch": source_branch,
-                    "target_branch": target_branch,
-                    "strategy": "rebase",
-                    "error": format!("rebase succeeded but ff-merge failed: {}", command_summary(&merge_out)),
-                }),
-                Err(err) => serde_json::json!({
-                    "status": "failed",
-                    "method": "git",
-                    "source_branch": source_branch,
-                    "target_branch": target_branch,
-                    "strategy": "rebase",
-                    "error": format!("rebase succeeded but ff-merge failed: {err}"),
-                }),
-            }
-        }
-        Ok(output) => {
-            let _ = run_git_output("git", source_execution_cwd, &["rebase", "--abort"]).await;
-            let summary = command_summary(&output);
-            let status = if looks_like_merge_conflict(&summary) { "conflict" } else { "failed" };
-            serde_json::json!({
-                "status": status,
-                "method": "git",
-                "source_branch": source_branch,
-                "target_branch": target_branch,
-                "strategy": "rebase",
-                "error": summary,
-            })
-        }
-        Err(error) => serde_json::json!({
-            "status": "failed",
-            "method": "git",
-            "source_branch": source_branch,
-            "target_branch": target_branch,
-            "strategy": "rebase",
-            "error": error.to_string(),
-        }),
-    }
-}
-
-async fn has_staged_changes(cwd: &str) -> Result<bool> {
-    let output = run_git_output("git", cwd, &["diff", "--cached", "--quiet"]).await?;
-    match output.status.code() {
-        Some(0) => Ok(false),
-        Some(1) => Ok(true),
-        _ => anyhow::bail!("failed to inspect staged changes in {}: {}", cwd, command_summary(&output)),
-    }
-}
-
-async fn perform_auto_merge_with_git(
-    project_root: &str,
-    source_execution_cwd: &str,
-    source_branch: &str,
-    target_branch: &str,
-    strategy: &MergeStrategy,
-) -> Value {
-    let target_execution_cwd = match resolve_target_merge_cwd(project_root, target_branch).await {
-        Ok(cwd) => cwd,
-        Err(error) => {
-            return serde_json::json!({
-                "status": "failed",
-                "method": "git",
-                "source_branch": source_branch,
-                "target_branch": target_branch,
-                "strategy": merge_strategy_name(strategy),
-                "error": error.to_string(),
-            });
-        }
-    };
-
-    if matches!(strategy, MergeStrategy::Rebase) {
-        return perform_rebase_strategy(source_execution_cwd, &target_execution_cwd, source_branch, target_branch)
-            .await;
-    }
-
-    let mut merge_args: Vec<&str> = vec!["merge"];
-    match strategy {
-        MergeStrategy::Squash => merge_args.push("--squash"),
-        MergeStrategy::Merge => merge_args.push("--no-ff"),
-        MergeStrategy::Rebase => unreachable!(),
-    };
-    merge_args.push("--no-edit");
-    merge_args.push(source_branch);
-
-    let output = run_git_output("git", &target_execution_cwd, &merge_args).await;
-    match output {
-        Ok(output) if output.status.success() && matches!(strategy, MergeStrategy::Squash) => {
-            match has_staged_changes(&target_execution_cwd).await {
-                Ok(true) => {
-                    let message = format!("Squash merge branch '{source_branch}' into '{target_branch}'");
-                    let commit =
-                        run_git_output("git", &target_execution_cwd, &["commit", "-m", message.as_str()]).await;
-                    match commit {
-                        Ok(commit_output) if commit_output.status.success() => serde_json::json!({
-                            "status": "completed",
-                            "method": "git",
-                            "source_branch": source_branch,
-                            "target_branch": target_branch,
-                            "strategy": merge_strategy_name(strategy),
-                        }),
-                        Ok(commit_output) => serde_json::json!({
-                            "status": "failed",
-                            "method": "git",
-                            "source_branch": source_branch,
-                            "target_branch": target_branch,
-                            "strategy": merge_strategy_name(strategy),
-                            "error": format!("squash merge staged changes but commit failed: {}", command_summary(&commit_output)),
-                        }),
-                        Err(error) => serde_json::json!({
-                            "status": "failed",
-                            "method": "git",
-                            "source_branch": source_branch,
-                            "target_branch": target_branch,
-                            "strategy": merge_strategy_name(strategy),
-                            "error": format!("squash merge staged changes but commit failed: {error}"),
-                        }),
-                    }
-                }
-                Ok(false) => serde_json::json!({
-                    "status": "completed",
-                    "method": "git",
-                    "source_branch": source_branch,
-                    "target_branch": target_branch,
-                    "strategy": merge_strategy_name(strategy),
-                    "result": "no-op",
-                }),
-                Err(error) => serde_json::json!({
-                    "status": "failed",
-                    "method": "git",
-                    "source_branch": source_branch,
-                    "target_branch": target_branch,
-                    "strategy": merge_strategy_name(strategy),
-                    "error": error.to_string(),
-                }),
-            }
-        }
-        Ok(output) if output.status.success() => serde_json::json!({
-            "status": "completed",
-            "method": "git",
-            "source_branch": source_branch,
-            "target_branch": target_branch,
-            "strategy": merge_strategy_name(strategy),
-        }),
-        Ok(output) => {
-            let summary = command_summary(&output);
-            let status = if looks_like_merge_conflict(&summary) { "conflict" } else { "failed" };
-            serde_json::json!({
-                "status": status,
-                "method": "git",
-                "source_branch": source_branch,
-                "target_branch": target_branch,
-                "strategy": merge_strategy_name(strategy),
-                "error": summary,
-            })
-        }
-        Err(error) => serde_json::json!({
-            "status": "failed",
-            "method": "git",
-            "source_branch": source_branch,
-            "target_branch": target_branch,
-            "strategy": merge_strategy_name(strategy),
-            "error": error.to_string(),
-        }),
-    }
-}
-
-async fn cleanup_worktree_with_fallback(
-    git_provider: &dyn GitProvider,
-    project_root: &str,
-    task: &OrchestratorTask,
-) -> Value {
+async fn cleanup_worktree_with_fallback(project_root: &str, task: &OrchestratorTask) -> Value {
     let Some(worktree_path) = task.worktree_path.as_deref().filter(|path| !path.trim().is_empty()) else {
         return serde_json::json!({
             "status": "skipped",
@@ -1801,40 +1232,72 @@ async fn cleanup_worktree_with_fallback(
     // compatibility and always reports `false`.
     let runner_stopped = false;
 
-    match git_provider.remove_worktree(project_root, worktree_path).await {
-        Ok(()) => serde_json::json!({
+    let plain = run_git_output("git", project_root, &["worktree", "remove", worktree_path]).await;
+    if matches!(&plain, Ok(output) if output.status.success()) {
+        return serde_json::json!({
             "status": "completed",
-            "method": "git-provider",
+            "method": "git",
+            "worktree_path": worktree_path,
+            "runner_stopped": runner_stopped,
+        });
+    }
+    let plain_error = match &plain {
+        Ok(output) => command_summary(output),
+        Err(error) => error.to_string(),
+    };
+
+    // The runtime no longer auto-commits agent work — committing is a
+    // workflow command phase. A worktree that still has uncommitted changes
+    // therefore holds the only copy of that work, so we must NOT force-remove
+    // it (that would silently discard the agent's edits). Preserve it and
+    // report; an operator or a commit command phase can resolve it.
+    match animus_runtime_shared::phase_git::git_has_pending_changes(worktree_path) {
+        Ok(true) => {
+            return serde_json::json!({
+                "status": "skipped",
+                "reason": "worktree has uncommitted changes; refusing to force-remove (commit is a workflow command phase)",
+                "worktree_path": worktree_path,
+                "plain_error": plain_error,
+                "runner_stopped": runner_stopped,
+            });
+        }
+        Ok(false) => {}
+        Err(error) => {
+            return serde_json::json!({
+                "status": "skipped",
+                "reason": "unable to verify worktree is clean before force-removal; preserving worktree",
+                "worktree_path": worktree_path,
+                "error": error.to_string(),
+                "plain_error": plain_error,
+                "runner_stopped": runner_stopped,
+            });
+        }
+    }
+
+    let forced = run_git_output("git", project_root, &["worktree", "remove", worktree_path, "--force"]).await;
+    match forced {
+        Ok(output) if output.status.success() => serde_json::json!({
+            "status": "completed",
+            "method": "git-force",
             "worktree_path": worktree_path,
             "runner_stopped": runner_stopped,
         }),
-        Err(provider_error) => {
-            let output = run_git_output("git", project_root, &["worktree", "remove", worktree_path, "--force"]).await;
-            match output {
-                Ok(output) if output.status.success() => serde_json::json!({
-                    "status": "completed",
-                    "method": "git-direct",
-                    "worktree_path": worktree_path,
-                    "runner_stopped": runner_stopped,
-                }),
-                Ok(output) => serde_json::json!({
-                    "status": "failed",
-                    "method": "git-direct",
-                    "worktree_path": worktree_path,
-                    "error": command_summary(&output),
-                    "provider_error": provider_error.to_string(),
-                    "runner_stopped": runner_stopped,
-                }),
-                Err(error) => serde_json::json!({
-                    "status": "failed",
-                    "method": "git-direct",
-                    "worktree_path": worktree_path,
-                    "error": error.to_string(),
-                    "provider_error": provider_error.to_string(),
-                    "runner_stopped": runner_stopped,
-                }),
-            }
-        }
+        Ok(output) => serde_json::json!({
+            "status": "failed",
+            "method": "git-force",
+            "worktree_path": worktree_path,
+            "error": command_summary(&output),
+            "plain_error": plain_error,
+            "runner_stopped": runner_stopped,
+        }),
+        Err(error) => serde_json::json!({
+            "status": "failed",
+            "method": "git-force",
+            "worktree_path": worktree_path,
+            "error": error.to_string(),
+            "plain_error": plain_error,
+            "runner_stopped": runner_stopped,
+        }),
     }
 }
 
@@ -2004,6 +1467,120 @@ mod tests {
     };
     const REQUIREMENT_TASK_GENERATION_WORKFLOW_REF: &str = "animus.requirement/plan";
     const REQUIREMENT_TASK_GENERATION_RUN_WORKFLOW_REF: &str = "animus.requirement/execute";
+
+    #[test]
+    fn accumulate_prior_outputs_captures_commit_message_and_payload_scalars() {
+        let mut prior = HashMap::new();
+
+        let payload = serde_json::json!({
+            "kind": "implementation_result",
+            "summary": "added login flow",
+            "files_changed": 3,
+            "passing": true,
+            "nested": {"ignored": "value"},
+            "list": [1, 2, 3],
+        });
+        accumulate_prior_output_fields(&mut prior, Some("feat: implement login"), Some(&payload));
+
+        assert_eq!(prior.get("commit_message").map(String::as_str), Some("feat: implement login"));
+        assert_eq!(prior.get("summary").map(String::as_str), Some("added login flow"));
+        assert_eq!(prior.get("files_changed").map(String::as_str), Some("3"));
+        assert_eq!(prior.get("passing").map(String::as_str), Some("true"));
+        assert!(!prior.contains_key("nested"));
+        assert!(!prior.contains_key("list"));
+    }
+
+    #[test]
+    fn hydrate_prior_outputs_from_persisted_recovers_commit_message_and_payload() {
+        use animus_runtime_shared::phase_output::persist_phase_output;
+
+        let _serial = crate::test_env::scoped_state_serializer();
+        let tmp = std::env::temp_dir().join(format!("wfr-test-hydrate-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create test dir");
+        let project_root = tmp.to_str().unwrap();
+        let workflow_id = "wf-hydrate-001";
+
+        let outcome = PhaseExecutionOutcome::Completed {
+            commit_message: Some("feat: implement login".to_string()),
+            phase_decision: None,
+            result_payload: Some(serde_json::json!({
+                "kind": "implementation_result",
+                "summary": "added login flow",
+            })),
+        };
+        persist_phase_output(project_root, workflow_id, "implementation", 1, &outcome).unwrap();
+
+        let mut prior = HashMap::new();
+        hydrate_prior_outputs_from_persisted(&mut prior, project_root, workflow_id, "implementation");
+
+        assert_eq!(prior.get("commit_message").map(String::as_str), Some("feat: implement login"));
+        assert_eq!(prior.get("summary").map(String::as_str), Some("added login flow"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn collect_prior_outputs_for_phase_requires_completion_marker() {
+        use animus_runtime_shared::phase_output::persist_phase_output;
+
+        let _serial = crate::test_env::scoped_state_serializer();
+        let tmp = std::env::temp_dir().join(format!("wfr-test-collect-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create test dir");
+        let project_root = tmp.to_str().unwrap();
+        let workflow_id = "wf-collect-001";
+
+        let marked = PhaseExecutionOutcome::Completed {
+            commit_message: Some("feat: implement login".to_string()),
+            phase_decision: None,
+            result_payload: Some(serde_json::json!({ "summary": "added login flow" })),
+        };
+        // `persist_phase_output` also writes the attempt-keyed completion marker.
+        persist_phase_output(project_root, workflow_id, "implementation", 0, &marked).unwrap();
+
+        // A bare `--phase` run persists output WITHOUT a marker; it must be ignored.
+        let unmarked = PhaseExecutionOutcome::Completed {
+            commit_message: Some("adhoc: should be ignored".to_string()),
+            phase_decision: None,
+            result_payload: None,
+        };
+        persist_phase_output_without_marker(project_root, workflow_id, "review", &unmarked, None).unwrap();
+
+        let phase_order =
+            vec![("implementation".to_string(), 0u32), ("review".to_string(), 0u32), ("commit".to_string(), 0u32)];
+        let prior = collect_prior_outputs_for_phase(project_root, workflow_id, "commit", &phase_order);
+
+        assert_eq!(prior.get("commit_message").map(String::as_str), Some("feat: implement login"));
+        assert_eq!(prior.get("summary").map(String::as_str), Some("added login flow"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn accumulate_prior_outputs_latest_non_empty_commit_message_wins() {
+        let mut prior = HashMap::new();
+        prior.insert("commit_message".to_string(), "old".to_string());
+
+        // A later phase that carries an empty commit_message must not clobber.
+        accumulate_prior_output_fields(&mut prior, Some("   "), None);
+        assert_eq!(prior.get("commit_message").map(String::as_str), Some("old"));
+
+        accumulate_prior_output_fields(&mut prior, Some("new"), None);
+        assert_eq!(prior.get("commit_message").map(String::as_str), Some("new"));
+    }
+
+    #[test]
+    fn empty_payload_commit_message_does_not_clobber_prior_value() {
+        let mut prior = HashMap::new();
+        accumulate_prior_output_fields(&mut prior, Some("feat: implement login"), None);
+
+        // A later phase whose payload carries `commit_message: ""` (and no
+        // top-level commit_message) must not erase the earlier value.
+        let payload = serde_json::json!({ "commit_message": "", "summary": "review passed" });
+        accumulate_prior_output_fields(&mut prior, None, Some(&payload));
+
+        assert_eq!(prior.get("commit_message").map(String::as_str), Some("feat: implement login"));
+        assert_eq!(prior.get("summary").map(String::as_str), Some("review passed"));
+    }
 
     #[tokio::test]
     async fn resolve_execution_subject_context_uses_requirement_metadata() {
@@ -2716,9 +2293,7 @@ workflows:
 }
 
 #[cfg(test)]
-mod post_success_merge_tests {
-    #![allow(clippy::await_holding_lock)]
-
+mod worktree_cleanup_tests {
     use super::*;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -2737,12 +2312,6 @@ mod post_success_merge_tests {
     fn run_git_ok(cwd: &Path, args: &[&str]) {
         let output = run_git(cwd, args);
         assert!(output.status.success(), "git {:?} failed in {}: {}", args, cwd.display(), command_summary(&output));
-    }
-
-    fn git_stdout(cwd: &Path, args: &[&str]) -> String {
-        let output = run_git(cwd, args);
-        assert!(output.status.success(), "git {:?} failed in {}: {}", args, cwd.display(), command_summary(&output));
-        String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
     fn init_repo() -> (TempDir, PathBuf) {
@@ -2764,78 +2333,65 @@ mod post_success_merge_tests {
         (temp, worktree_path)
     }
 
-    fn commit_file(cwd: &Path, file_name: &str, contents: &str, message: &str) {
-        fs::write(cwd.join(file_name), contents).expect("write fixture file");
-        run_git_ok(cwd, &["add", file_name]);
-        run_git_ok(cwd, &["commit", "-m", message]);
+    fn task_with_worktree(worktree_path: Option<&str>) -> OrchestratorTask {
+        let value = serde_json::json!({
+            "id": "task-1",
+            "title": "cleanup fixture",
+            "description": "",
+            "type": "feature",
+            "status": "in-progress",
+            "priority": "medium",
+            "worktree_path": worktree_path,
+            "metadata": {
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z",
+                "created_by": "test",
+                "updated_by": "test",
+            },
+        });
+        serde_json::from_value(value).expect("deserialize OrchestratorTask fixture")
     }
 
     #[tokio::test]
-    async fn auto_merge_uses_target_branch_worktree_for_standard_merge() {
-        let (repo, source_worktree) = init_repo();
-        commit_file(&source_worktree, "feature.txt", "merged\n", "source change");
+    async fn cleanup_removes_runtime_created_worktree() {
+        let (repo, worktree_path) = init_repo();
+        let worktree_str = worktree_path.to_str().expect("worktree path utf8");
+        assert!(worktree_path.exists(), "worktree should exist before cleanup");
 
-        let result = perform_auto_merge_with_git(
-            repo.path().to_str().expect("repo path"),
-            source_worktree.to_str().expect("worktree path"),
-            "animus/task-1",
-            "main",
-            &MergeStrategy::Merge,
-        )
-        .await;
+        let task = task_with_worktree(Some(worktree_str));
+        let result = cleanup_worktree_with_fallback(repo.path().to_str().expect("repo path"), &task).await;
 
         assert_eq!(result["status"].as_str(), Some("completed"));
-        assert_eq!(git_stdout(repo.path(), &["branch", "--show-current"]), "main");
-        assert_eq!(git_stdout(&source_worktree, &["branch", "--show-current"]), "animus/task-1");
-        assert_eq!(fs::read_to_string(repo.path().join("feature.txt")).expect("merged file"), "merged\n");
+        assert_eq!(result["method"].as_str(), Some("git"));
+        assert_eq!(result["worktree_path"].as_str(), Some(worktree_str));
+        assert!(!worktree_path.exists(), "worktree should be removed after cleanup");
     }
 
     #[tokio::test]
-    async fn auto_merge_rebase_advances_target_branch() {
-        let (repo, source_worktree) = init_repo();
-        commit_file(repo.path(), "main.txt", "target\n", "target change");
-        commit_file(&source_worktree, "feature.txt", "rebased\n", "source change");
+    async fn cleanup_preserves_dirty_worktree_to_avoid_data_loss() {
+        let (repo, worktree_path) = init_repo();
+        // The runtime no longer auto-commits agent work (commit is a command
+        // phase). A worktree with uncommitted changes holds the only copy of
+        // that work, so cleanup must refuse to force-remove it.
+        fs::write(worktree_path.join("dirty.txt"), "uncommitted\n").expect("write dirty file");
+        let worktree_str = worktree_path.to_str().expect("worktree path utf8");
 
-        let result = perform_auto_merge_with_git(
-            repo.path().to_str().expect("repo path"),
-            source_worktree.to_str().expect("worktree path"),
-            "animus/task-1",
-            "main",
-            &MergeStrategy::Rebase,
-        )
-        .await;
+        let task = task_with_worktree(Some(worktree_str));
+        let result = cleanup_worktree_with_fallback(repo.path().to_str().expect("repo path"), &task).await;
 
-        assert_eq!(result["status"].as_str(), Some("completed"));
-        assert_eq!(
-            git_stdout(repo.path(), &["rev-parse", "main"]),
-            git_stdout(repo.path(), &["rev-parse", "animus/task-1"])
-        );
-        assert_eq!(git_stdout(repo.path(), &["log", "--format=%s", "-2", "main"]), "source change\ntarget change");
+        assert_eq!(result["status"].as_str(), Some("skipped"));
+        assert!(worktree_path.exists(), "dirty worktree must be preserved to avoid discarding uncommitted work");
+        assert!(worktree_path.join("dirty.txt").exists(), "uncommitted file must survive cleanup");
     }
 
     #[tokio::test]
-    async fn auto_merge_squash_creates_commit_and_leaves_target_clean() {
-        let (repo, source_worktree) = init_repo();
-        let before = git_stdout(repo.path(), &["rev-parse", "main"]);
-        commit_file(&source_worktree, "feature.txt", "squashed\n", "source change");
+    async fn cleanup_skips_when_no_worktree_path() {
+        let repo = TempDir::new().expect("temp dir");
+        let task = task_with_worktree(None);
+        let result = cleanup_worktree_with_fallback(repo.path().to_str().expect("repo path"), &task).await;
 
-        let result = perform_auto_merge_with_git(
-            repo.path().to_str().expect("repo path"),
-            source_worktree.to_str().expect("worktree path"),
-            "animus/task-1",
-            "main",
-            &MergeStrategy::Squash,
-        )
-        .await;
-
-        assert_eq!(result["status"].as_str(), Some("completed"));
-        assert_ne!(before, git_stdout(repo.path(), &["rev-parse", "main"]));
-        assert_eq!(
-            git_stdout(repo.path(), &["log", "--format=%s", "-1", "main"]),
-            "Squash merge branch 'animus/task-1' into 'main'"
-        );
-        assert_eq!(git_stdout(repo.path(), &["status", "--porcelain", "--untracked-files=no"]), "");
-        assert_eq!(fs::read_to_string(repo.path().join("feature.txt")).expect("squashed file"), "squashed\n");
+        assert_eq!(result["status"].as_str(), Some("skipped"));
+        assert_eq!(result["reason"].as_str(), Some("worktree path not available"));
     }
 }
 
