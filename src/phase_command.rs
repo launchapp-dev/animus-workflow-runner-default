@@ -21,6 +21,7 @@ pub(crate) struct CommandExecutionContext<'a> {
     pub subject_title: &'a str,
     pub subject_description: &'a str,
     pub pipeline_vars: Option<&'a HashMap<String, String>>,
+    pub prior_outputs: Option<&'a HashMap<String, String>>,
     pub dispatch_input: Option<&'a str>,
     pub schedule_input: Option<&'a str>,
 }
@@ -65,6 +66,14 @@ pub(crate) fn build_command_template_vars(context: &CommandExecutionContext<'_>)
     } else if let Some(schedule_input) = context.schedule_input.filter(|value| !value.is_empty()) {
         vars.entry("schedule_input".to_string()).or_insert_with(|| schedule_input.to_string());
         vars.entry("dispatch_input".to_string()).or_insert_with(|| schedule_input.to_string());
+    }
+
+    // Prior-phase outputs fill remaining gaps only: core context vars,
+    // explicit pipeline_vars, and reserved trigger inputs all win.
+    if let Some(prior_outputs) = context.prior_outputs {
+        for (key, value) in prior_outputs {
+            vars.entry(key.clone()).or_insert_with(|| value.clone());
+        }
     }
 
     vars
@@ -524,6 +533,59 @@ mod tests {
     /// each iteration leaked the phase-id string permanently; the heap-stress
     /// run was unsafe in long-lived plugin processes. With owned `String`s the
     /// loop runs end-to-end and the iterations complete cleanly.
+    fn base_context<'a>(prior_outputs: Option<&'a HashMap<String, String>>) -> CommandExecutionContext<'a> {
+        CommandExecutionContext {
+            project_root: "/repo",
+            execution_cwd: "/repo",
+            workflow_id: "wf-1",
+            phase_id: "commit",
+            workflow_ref: "default",
+            subject_id: "task:T-1",
+            subject_title: "Title",
+            subject_description: "Desc",
+            pipeline_vars: None,
+            prior_outputs,
+            dispatch_input: None,
+            schedule_input: None,
+        }
+    }
+
+    #[test]
+    fn prior_outputs_resolve_as_command_template_vars() {
+        let mut prior = HashMap::new();
+        prior.insert("commit_message".to_string(), "feat: add login flow".to_string());
+        prior.insert("summary".to_string(), "implemented login".to_string());
+
+        let context = base_context(Some(&prior));
+        let vars = build_command_template_vars(&context);
+
+        assert_eq!(vars.get("commit_message").map(String::as_str), Some("feat: add login flow"));
+        assert_eq!(vars.get("summary").map(String::as_str), Some("implemented login"));
+        assert_eq!(
+            orchestrator_config::expand_variables("git commit -m \"{{commit_message}}\"", &vars),
+            "git commit -m \"feat: add login flow\""
+        );
+        assert_eq!(orchestrator_config::expand_variables("{{summary}}", &vars), "implemented login");
+    }
+
+    #[test]
+    fn core_and_pipeline_vars_win_over_prior_outputs() {
+        let mut prior = HashMap::new();
+        prior.insert("project_root".to_string(), "/hijacked".to_string());
+        prior.insert("subject_id".to_string(), "task:HIJACK".to_string());
+        prior.insert("commit_message".to_string(), "fallback".to_string());
+
+        let mut pipeline = HashMap::new();
+        pipeline.insert("commit_message".to_string(), "from-pipeline".to_string());
+
+        let context = CommandExecutionContext { pipeline_vars: Some(&pipeline), ..base_context(Some(&prior)) };
+        let vars = build_command_template_vars(&context);
+
+        assert_eq!(vars.get("project_root").map(String::as_str), Some("/repo"));
+        assert_eq!(vars.get("subject_id").map(String::as_str), Some("task:T-1"));
+        assert_eq!(vars.get("commit_message").map(String::as_str), Some("from-pipeline"));
+    }
+
     #[tokio::test]
     async fn capture_command_stream_does_not_leak_phase_id_under_stress() {
         const ITERATIONS: usize = 10_000;

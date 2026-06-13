@@ -106,6 +106,7 @@ impl orchestrator_core::PhaseExecutor for CliPhaseExecutor {
             phase_attempt: 0,
             overrides: overrides.as_ref(),
             pipeline_vars: None,
+            prior_outputs: None,
             dispatch_input: None,
             schedule_input: None,
             routing: &routing,
@@ -1850,6 +1851,12 @@ pub struct PhaseRunParams<'a> {
     pub phase_attempt: u32,
     pub overrides: Option<&'a PhaseExecuteOverrides>,
     pub pipeline_vars: Option<&'a std::collections::HashMap<String, String>>,
+    /// Outputs accumulated from prior completed phases in the same workflow
+    /// run (latest-wins): the agent-authored `commit_message` plus the
+    /// flattened scalar fields of each phase's `result_payload`. Exposed to
+    /// command phases as template vars so e.g. a `commit` phase can render
+    /// `git commit -m "{{commit_message}}"`.
+    pub prior_outputs: Option<&'a std::collections::HashMap<String, String>>,
     pub dispatch_input: Option<&'a str>,
     pub schedule_input: Option<&'a str>,
     pub routing: &'a protocol::PhaseRoutingConfig,
@@ -1882,6 +1889,7 @@ async fn run_workflow_phase_inner(params: &PhaseRunParams<'_>) -> Result<PhaseRu
     let phase_attempt = params.phase_attempt;
     let overrides = params.overrides;
     let pipeline_vars = params.pipeline_vars;
+    let prior_outputs = params.prior_outputs;
     let dispatch_input = params.dispatch_input;
     let schedule_input = params.schedule_input;
     let workflow_config = load_workflow_config_strict(project_root)?;
@@ -2109,6 +2117,7 @@ async fn run_workflow_phase_inner(params: &PhaseRunParams<'_>) -> Result<PhaseRu
                 subject_title,
                 subject_description,
                 pipeline_vars,
+                prior_outputs,
                 dispatch_input,
                 schedule_input,
             };

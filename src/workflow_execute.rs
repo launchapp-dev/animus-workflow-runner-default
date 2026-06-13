@@ -313,6 +313,14 @@ pub async fn execute_workflow_with_hub(
         );
         let phase_start = Instant::now();
 
+        // Single-phase (`--phase`) execution still hydrates prior-completed-phase
+        // outputs from durable state so a command phase such as `commit` can
+        // resolve `{{commit_message}}` authored by an earlier phase.
+        let single_phase_order: Vec<(String, u32)> =
+            workflow.phases.iter().map(|p| (p.phase_id.clone(), p.attempt)).collect();
+        let single_phase_prior_outputs =
+            collect_prior_outputs_for_phase(&params.project_root, &workflow.id, &phase_filter, &single_phase_order);
+
         let phase_overrides = PhaseExecuteOverrides {
             tool: params.tool.clone(),
             model: params.model.clone(),
@@ -331,6 +339,7 @@ pub async fn execute_workflow_with_hub(
             phase_attempt,
             overrides: Some(&phase_overrides),
             pipeline_vars: if workflow_vars.is_empty() { None } else { Some(&workflow_vars) },
+            prior_outputs: if single_phase_prior_outputs.is_empty() { None } else { Some(&single_phase_prior_outputs) },
             dispatch_input: phase_inputs.dispatch_input.as_deref(),
             schedule_input: phase_inputs.schedule_input.as_deref(),
             routing: &routing,
@@ -453,10 +462,22 @@ pub async fn execute_workflow_with_hub(
     }
 
     let mut phase_idx: usize = workflow.current_phase_index;
+
     let mut reported_workflow_status = workflow.status;
     while phase_idx < phases_to_run.len() && !is_terminal_workflow_status(workflow.status) {
         let phase_id = phases_to_run[phase_idx].clone();
         let phase_attempt = workflow.phases.iter().find(|p| p.phase_id == phase_id).map(|p| p.attempt).unwrap_or(0);
+
+        // Recompute prior-completed-phase outputs from durable state for the
+        // phase about to run. Deriving from durable state each iteration
+        // (rather than incrementally accumulating) keeps the map correct
+        // across resume, marker replay, and backward `Rework` transitions:
+        // it always reflects exactly the marker-gated outputs of phases that
+        // precede `phase_id` in pipeline order, never stale outputs from
+        // phases that are no longer prior.
+        let phase_order: Vec<(String, u32)> = workflow.phases.iter().map(|p| (p.phase_id.clone(), p.attempt)).collect();
+        let prior_outputs =
+            collect_prior_outputs_for_phase(&params.project_root, &workflow.id, &phase_id, &phase_order);
 
         if is_phase_completed(&params.project_root, &workflow.id, &phase_id, phase_attempt) {
             match read_persisted_decision(&params.project_root, &workflow.id, &phase_id) {
@@ -534,6 +555,7 @@ pub async fn execute_workflow_with_hub(
             phase_attempt,
             overrides: Some(&phase_overrides),
             pipeline_vars: if workflow_vars.is_empty() { None } else { Some(&workflow_vars) },
+            prior_outputs: if prior_outputs.is_empty() { None } else { Some(&prior_outputs) },
             dispatch_input: phase_inputs.dispatch_input.as_deref(),
             schedule_input: phase_inputs.schedule_input.as_deref(),
             routing: &routing,
@@ -991,6 +1013,86 @@ fn phase_rework_context(outcome: &PhaseExecutionOutcome) -> Option<String> {
     }
 }
 
+fn accumulate_prior_output_fields(
+    prior_outputs: &mut HashMap<String, String>,
+    commit_message: Option<&str>,
+    result_payload: Option<&Value>,
+) {
+    if let Some(Value::Object(fields)) = result_payload {
+        for (key, value) in fields {
+            let scalar = match value {
+                Value::String(text) => Some(text.clone()),
+                Value::Number(number) => Some(number.to_string()),
+                Value::Bool(flag) => Some(flag.to_string()),
+                _ => None,
+            };
+            if let Some(scalar) = scalar {
+                // Never let an empty `commit_message` payload scalar clobber a
+                // valid value: a prior phase may carry the optional field as
+                // `""` (e.g. a review `phase_decision`), and the top-level
+                // commit_message merged below already enforces non-empty.
+                if key == "commit_message" && scalar.trim().is_empty() {
+                    continue;
+                }
+                prior_outputs.insert(key.clone(), scalar);
+            }
+        }
+    }
+
+    if let Some(message) = commit_message.map(str::trim).filter(|value| !value.is_empty()) {
+        prior_outputs.insert("commit_message".to_string(), message.to_string());
+    }
+}
+
+/// Build the prior-completed-phase output map for `current_phase_id` from
+/// durable state. Walks the pipeline phase order up to (but not including)
+/// the current phase and accumulates each phase's persisted `commit_message`
+/// plus the scalar `result_payload` fields, gated by the phase's completion
+/// marker so ad-hoc `--phase` outputs (persisted without a marker) are
+/// ignored. Used by the per-phase `workflow/run_phase` plugin entrypoint,
+/// where the in-process accumulation loop never ran.
+pub(crate) fn collect_prior_outputs_for_phase(
+    project_root: &str,
+    workflow_id: &str,
+    current_phase_id: &str,
+    phase_order: &[(String, u32)],
+) -> HashMap<String, String> {
+    let mut prior_outputs = HashMap::new();
+    for (prior_phase_id, prior_attempt) in phase_order {
+        if prior_phase_id == current_phase_id {
+            break;
+        }
+        if !is_phase_completed(project_root, workflow_id, prior_phase_id, *prior_attempt) {
+            continue;
+        }
+        hydrate_prior_outputs_from_persisted(&mut prior_outputs, project_root, workflow_id, prior_phase_id);
+    }
+    prior_outputs
+}
+
+pub(crate) fn hydrate_prior_outputs_from_persisted(
+    prior_outputs: &mut HashMap<String, String>,
+    project_root: &str,
+    workflow_id: &str,
+    phase_id: &str,
+) {
+    // TODO(codex-p2): `<phase>.json` is not attempt-keyed, so re-running a
+    // completed phase via `--phase` (which persists output WITHOUT a marker)
+    // overwrites the file the original completion marker pointed at. The
+    // marker gate above cannot detect that desync. The same hazard already
+    // affects `read_persisted_decision` crash-replay, so fixing it belongs in
+    // the persistence model (attempt-keyed output file or marker-embedded
+    // content hash), out of scope for this PR.
+    let file_path = phase_output_dir(project_root, workflow_id).join(format!("{phase_id}.json"));
+    let Ok(contents) = std::fs::read_to_string(&file_path) else {
+        return;
+    };
+    let Ok(output) = serde_json::from_str::<PersistedPhaseOutput>(&contents) else {
+        return;
+    };
+    accumulate_prior_output_fields(prior_outputs, output.commit_message.as_deref(), output.payload.as_ref());
+}
+
 fn is_terminal_workflow_status(status: WorkflowStatus) -> bool {
     matches!(
         status,
@@ -1359,6 +1461,116 @@ mod tests {
     };
     const REQUIREMENT_TASK_GENERATION_WORKFLOW_REF: &str = "animus.requirement/plan";
     const REQUIREMENT_TASK_GENERATION_RUN_WORKFLOW_REF: &str = "animus.requirement/execute";
+
+    #[test]
+    fn accumulate_prior_outputs_captures_commit_message_and_payload_scalars() {
+        let mut prior = HashMap::new();
+
+        let payload = serde_json::json!({
+            "kind": "implementation_result",
+            "summary": "added login flow",
+            "files_changed": 3,
+            "passing": true,
+            "nested": {"ignored": "value"},
+            "list": [1, 2, 3],
+        });
+        accumulate_prior_output_fields(&mut prior, Some("feat: implement login"), Some(&payload));
+
+        assert_eq!(prior.get("commit_message").map(String::as_str), Some("feat: implement login"));
+        assert_eq!(prior.get("summary").map(String::as_str), Some("added login flow"));
+        assert_eq!(prior.get("files_changed").map(String::as_str), Some("3"));
+        assert_eq!(prior.get("passing").map(String::as_str), Some("true"));
+        assert!(!prior.contains_key("nested"));
+        assert!(!prior.contains_key("list"));
+    }
+
+    #[test]
+    fn hydrate_prior_outputs_from_persisted_recovers_commit_message_and_payload() {
+        let tmp = std::env::temp_dir().join(format!("wfr-test-hydrate-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create test dir");
+        let project_root = tmp.to_str().unwrap();
+        let workflow_id = "wf-hydrate-001";
+
+        let outcome = PhaseExecutionOutcome::Completed {
+            commit_message: Some("feat: implement login".to_string()),
+            phase_decision: None,
+            result_payload: Some(serde_json::json!({
+                "kind": "implementation_result",
+                "summary": "added login flow",
+            })),
+        };
+        persist_phase_output(project_root, workflow_id, "implementation", 1, &outcome).unwrap();
+
+        let mut prior = HashMap::new();
+        hydrate_prior_outputs_from_persisted(&mut prior, project_root, workflow_id, "implementation");
+
+        assert_eq!(prior.get("commit_message").map(String::as_str), Some("feat: implement login"));
+        assert_eq!(prior.get("summary").map(String::as_str), Some("added login flow"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn collect_prior_outputs_for_phase_requires_completion_marker() {
+        use crate::phase_output::persist_phase_output;
+
+        let tmp = std::env::temp_dir().join(format!("wfr-test-collect-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).expect("create test dir");
+        let project_root = tmp.to_str().unwrap();
+        let workflow_id = "wf-collect-001";
+
+        let marked = PhaseExecutionOutcome::Completed {
+            commit_message: Some("feat: implement login".to_string()),
+            phase_decision: None,
+            result_payload: Some(serde_json::json!({ "summary": "added login flow" })),
+        };
+        // `persist_phase_output` also writes the attempt-keyed completion marker.
+        persist_phase_output(project_root, workflow_id, "implementation", 0, &marked).unwrap();
+
+        // A bare `--phase` run persists output WITHOUT a marker; it must be ignored.
+        let unmarked = PhaseExecutionOutcome::Completed {
+            commit_message: Some("adhoc: should be ignored".to_string()),
+            phase_decision: None,
+            result_payload: None,
+        };
+        persist_phase_output_without_marker(project_root, workflow_id, "review", &unmarked).unwrap();
+
+        let phase_order =
+            vec![("implementation".to_string(), 0u32), ("review".to_string(), 0u32), ("commit".to_string(), 0u32)];
+        let prior = collect_prior_outputs_for_phase(project_root, workflow_id, "commit", &phase_order);
+
+        assert_eq!(prior.get("commit_message").map(String::as_str), Some("feat: implement login"));
+        assert_eq!(prior.get("summary").map(String::as_str), Some("added login flow"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn accumulate_prior_outputs_latest_non_empty_commit_message_wins() {
+        let mut prior = HashMap::new();
+        prior.insert("commit_message".to_string(), "old".to_string());
+
+        // A later phase that carries an empty commit_message must not clobber.
+        accumulate_prior_output_fields(&mut prior, Some("   "), None);
+        assert_eq!(prior.get("commit_message").map(String::as_str), Some("old"));
+
+        accumulate_prior_output_fields(&mut prior, Some("new"), None);
+        assert_eq!(prior.get("commit_message").map(String::as_str), Some("new"));
+    }
+
+    #[test]
+    fn empty_payload_commit_message_does_not_clobber_prior_value() {
+        let mut prior = HashMap::new();
+        accumulate_prior_output_fields(&mut prior, Some("feat: implement login"), None);
+
+        // A later phase whose payload carries `commit_message: ""` (and no
+        // top-level commit_message) must not erase the earlier value.
+        let payload = serde_json::json!({ "commit_message": "", "summary": "review passed" });
+        accumulate_prior_output_fields(&mut prior, None, Some(&payload));
+
+        assert_eq!(prior.get("commit_message").map(String::as_str), Some("feat: implement login"));
+        assert_eq!(prior.get("summary").map(String::as_str), Some("review passed"));
+    }
 
     #[tokio::test]
     async fn resolve_execution_subject_context_uses_requirement_metadata() {
