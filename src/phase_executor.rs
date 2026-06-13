@@ -1217,8 +1217,17 @@ fn phase_session_resume_plan(
     attempt: usize,
 ) -> orchestrator_core::runtime_contract::CliSessionResumePlan {
     let reuses_existing_session = continuation > 0;
-    let effective_session_id =
-        if attempt > 1 { format!("{}-a{}", session_id, attempt) } else { session_id.to_string() };
+    // claude 2.1.x requires `--session-id` to be a valid UUID. Retry attempts
+    // (attempt > 1) must derive a fresh, VALID-UUID session id from the base.
+    // A UUIDv5 over (base session_id, attempt) is both a valid UUID and
+    // deterministic, so continuation-resume (reused: continuation > 0) resolves
+    // to the SAME session id when resuming the same attempt. Attempt 1 keeps the
+    // base v4 id for back-compat.
+    let effective_session_id = if attempt > 1 {
+        Uuid::new_v5(&Uuid::NAMESPACE_OID, format!("{session_id}-a{attempt}").as_bytes()).to_string()
+    } else {
+        session_id.to_string()
+    };
     orchestrator_core::runtime_contract::CliSessionResumePlan {
         mode: orchestrator_core::runtime_contract::CliSessionResumeMode::NativeId,
         session_key: format!("wf:{workflow_id}:{phase_id}"),
@@ -2273,10 +2282,31 @@ mod tests {
 
     #[test]
     fn retry_attempt_gets_fresh_session_id() {
-        let plan = phase_session_resume_plan("wf-1", "requirements", "session-123", 0, 2);
+        let base = Uuid::new_v4().to_string();
+        let plan = phase_session_resume_plan("wf-1", "requirements", &base, 0, 2);
 
         assert!(!plan.reused);
-        assert_eq!(plan.session_id.as_deref(), Some("session-123-a2"));
+        let sid = plan.session_id.expect("retry plan carries a session id");
+
+        // (a) The retry session id must be a valid UUID (claude 2.1.x rejects
+        // non-UUID `--session-id` values).
+        assert!(Uuid::parse_str(&sid).is_ok(), "retry session id must be a valid UUID, got {sid}");
+        // (b) It must differ from the base session id.
+        assert_ne!(sid, base);
+
+        // (c) It must be STABLE across two calls with the same (session_id,
+        // attempt) so continuation-resume resolves to the same session.
+        let plan_again = phase_session_resume_plan("wf-1", "requirements", &base, 0, 2);
+        assert_eq!(plan_again.session_id.as_deref(), Some(sid.as_str()));
+    }
+
+    #[test]
+    fn attempt_one_returns_base_session_unchanged() {
+        let base = Uuid::new_v4().to_string();
+        let plan = phase_session_resume_plan("wf-1", "requirements", &base, 0, 1);
+
+        assert_eq!(plan.session_id.as_deref(), Some(base.as_str()));
+        assert!(Uuid::parse_str(&base).is_ok());
     }
 
     #[test]
