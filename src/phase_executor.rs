@@ -11,7 +11,6 @@ use animus_runtime_shared::ipc::{
     run_dir as ipc_run_dir, write_json_line,
 };
 use animus_runtime_shared::payload_traversal::{parse_commit_message_from_text, parse_phase_decision_from_text};
-use animus_runtime_shared::phase_git::commit_implementation_changes;
 use animus_runtime_shared::phase_output::persist_phase_output_with_metadata;
 use animus_runtime_shared::phase_prompt::{
     phase_requires_commit_message_with_ctx, phase_result_kind_for_ctx, render_phase_prompt_with_ctx_overrides,
@@ -115,6 +114,7 @@ impl orchestrator_core::PhaseExecutor for CliPhaseExecutor {
             phase_attempt: 0,
             overrides: overrides.as_ref(),
             pipeline_vars: None,
+            prior_outputs: None,
             dispatch_input: None,
             schedule_input: None,
             routing: &routing,
@@ -2216,7 +2216,6 @@ async fn run_workflow_phase_with_agent(params: PhaseAgentParams<'_>) -> Result<A
                                         subject_title,
                                     )
                                 });
-                                commit_implementation_changes(execution_cwd, &resolved_commit_message)?;
                                 *commit_message = Some(resolved_commit_message);
                             }
                         }
@@ -2421,6 +2420,12 @@ pub struct PhaseRunParams<'a> {
     pub phase_attempt: u32,
     pub overrides: Option<&'a PhaseExecuteOverrides>,
     pub pipeline_vars: Option<&'a std::collections::HashMap<String, String>>,
+    /// Outputs accumulated from prior completed phases in the same workflow
+    /// run (latest-wins): the agent-authored `commit_message` plus the
+    /// flattened scalar fields of each phase's `result_payload`. Exposed to
+    /// command phases as template vars so e.g. a `commit` phase can render
+    /// `git commit -m "{{commit_message}}"`.
+    pub prior_outputs: Option<&'a std::collections::HashMap<String, String>>,
     pub dispatch_input: Option<&'a str>,
     pub schedule_input: Option<&'a str>,
     pub routing: &'a protocol::PhaseRoutingConfig,
@@ -2453,6 +2458,7 @@ async fn run_workflow_phase_inner(params: &PhaseRunParams<'_>) -> Result<PhaseRu
     let phase_attempt = params.phase_attempt;
     let overrides = params.overrides;
     let pipeline_vars = params.pipeline_vars;
+    let prior_outputs = params.prior_outputs;
     let dispatch_input = params.dispatch_input;
     let schedule_input = params.schedule_input;
     let workflow_config = load_workflow_config_strict(project_root)?;
@@ -2680,6 +2686,7 @@ async fn run_workflow_phase_inner(params: &PhaseRunParams<'_>) -> Result<PhaseRu
                 subject_title,
                 subject_description,
                 pipeline_vars,
+                prior_outputs,
                 dispatch_input,
                 schedule_input,
             };
