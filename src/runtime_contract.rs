@@ -351,7 +351,7 @@ pub fn inject_agent_tool_policy(runtime_contract: &mut Value, ctx: &RuntimeConfi
 
     let rt_profile = agent_id.as_deref().and_then(|id| ctx.agent_runtime_config.agent_profile(id));
 
-    let policy = wf_profile.map(|p| &p.tool_policy).or_else(|| rt_profile.map(|p| &p.tool_policy));
+    let policy = wf_profile.and_then(|p| p.tool_policy.as_ref()).or_else(|| rt_profile.map(|p| &p.tool_policy));
 
     let Some(policy) = policy else {
         return;
@@ -462,7 +462,7 @@ pub fn inject_workflow_mcp_servers(runtime_contract: &mut Value, ctx: &RuntimeCo
     let workflow_profile_servers: Vec<String> = agent_id
         .as_deref()
         .and_then(|id| ctx.workflow_config.config.agent_profiles.get(id))
-        .map(|profile| profile.mcp_servers.clone())
+        .and_then(|profile| profile.mcp_servers.clone())
         .unwrap_or_default();
     let runtime_profile_servers: Vec<String> = if workflow_profile_servers.is_empty() {
         agent_id
@@ -698,6 +698,7 @@ mod tests {
                 config: BTreeMap::new(),
                 tools: Vec::new(),
                 env: BTreeMap::new(),
+                oauth: None,
             },
         );
         workflow_config
@@ -821,6 +822,8 @@ mod tests {
             manual: None,
             default_tool: None,
             idempotency: Idempotency::Unknown,
+            evals: None,
+            worktree: None,
         };
         workflow_config.phase_definitions.insert(phase_id.to_string(), phase_definition);
         LoadedWorkflowConfig {

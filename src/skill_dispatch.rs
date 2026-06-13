@@ -29,7 +29,7 @@ fn collect_phase_skills(ctx: &RuntimeConfigContext, phase_id: &str) -> Vec<Strin
     let agent_id = ctx.phase_agent_id(phase_id);
     if let Some(id) = agent_id.as_deref() {
         let wf_profile_skills =
-            ctx.workflow_config.config.agent_profiles.get(id).map(|p| &p.skills).filter(|s| !s.is_empty());
+            ctx.workflow_config.config.agent_profiles.get(id).and_then(|p| p.skills.as_ref()).filter(|s| !s.is_empty());
         if let Some(skills) = wf_profile_skills {
             return skills.clone();
         }
@@ -293,6 +293,7 @@ mod tests {
                 config: BTreeMap::new(),
                 tools: Vec::new(),
                 env: BTreeMap::from([("DOCS_TOKEN".to_string(), "abc123".to_string())]),
+                oauth: None,
             },
         );
         write_workflow_config(temp.path(), &workflow).expect("workflow config");
