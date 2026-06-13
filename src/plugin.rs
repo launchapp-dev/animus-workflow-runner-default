@@ -204,7 +204,7 @@ pub fn plugin_initialize_result(params: &InitializeParams) -> Result<InitializeR
             extra: serde_json::to_value(WorkflowRunnerCapabilities {
                 phase_decision_parsing: true,
                 rework_context_support: true,
-                post_success_actions: true,
+                post_success_actions: false,
                 crash_recovery: true,
                 manual_pause_support: true,
             })

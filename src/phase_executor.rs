@@ -9,7 +9,6 @@ use crate::phase_command::{
     CommandExecutionContext,
 };
 use crate::phase_failover::PhaseFailureClassifier;
-use crate::phase_git::commit_implementation_changes;
 use crate::phase_output::persist_phase_output;
 use crate::phase_prompt::{
     phase_requires_commit_message_with_ctx, phase_result_kind_for_ctx, render_phase_prompt_with_ctx_overrides,
@@ -1647,7 +1646,6 @@ async fn run_workflow_phase_with_agent(params: PhaseAgentParams<'_>) -> Result<A
                                         subject_title,
                                     )
                                 });
-                                commit_implementation_changes(execution_cwd, &resolved_commit_message)?;
                                 *commit_message = Some(resolved_commit_message);
                             }
                         }
