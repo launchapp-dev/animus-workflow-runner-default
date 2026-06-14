@@ -60,6 +60,12 @@ jobs:
           fi
           echo "value=${VERSION}" >> "$GITHUB_OUTPUT"
 
+      - name: Install Linux build deps
+        if: contains(matrix.target, 'linux')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config
+
       - name: Build release binary
         shell: bash
         run: cargo build --release --target ${{ matrix.target }}
