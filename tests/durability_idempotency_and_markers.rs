@@ -43,6 +43,8 @@ fn runtime_with_phase(phase_id: &str, idempotency: Idempotency) -> AgentRuntimeC
             manual: None,
             default_tool: None,
             idempotency,
+            evals: None,
+            worktree: None,
         },
     );
     let mut agents = BTreeMap::new();

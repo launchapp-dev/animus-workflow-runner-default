@@ -260,6 +260,8 @@ mod tests {
             manual: None,
             default_tool: None,
             idempotency: Default::default(),
+            evals: None,
+            worktree: None,
         };
         let ctx = make_ctx_with_yaml_override("implementation", override_def);
 
@@ -300,6 +302,8 @@ mod tests {
             manual: None,
             default_tool: None,
             idempotency: Default::default(),
+            evals: None,
+            worktree: None,
         };
         let ctx = make_ctx_with_yaml_override("implementation", override_def);
 
@@ -333,6 +337,8 @@ mod tests {
             manual: None,
             default_tool: None,
             idempotency: Default::default(),
+            evals: None,
+            worktree: None,
         };
         let ctx = make_ctx_with_yaml_override("implementation", sparse);
 

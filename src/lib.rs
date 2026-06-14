@@ -8,7 +8,6 @@
 
 pub mod agent_state;
 pub mod config_context;
-pub mod direct_exec;
 pub mod ensure_execution_cwd;
 pub mod git_provider;
 // `ipc` here is the agent-runner Unix-socket bridge used by `phase_executor`

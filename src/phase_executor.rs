@@ -1,7 +1,7 @@
 use crate::config_context::RuntimeConfigContext;
 use crate::ipc::{
-    build_runtime_contract_with_resume_and_mcp_config, collect_json_payload_lines, connect_runner, event_matches_run,
-    run_dir as ipc_run_dir, runner_config_dir, write_json_line,
+    build_runtime_contract_with_resume_and_mcp_config, collect_json_payload_lines, event_matches_run,
+    run_dir as ipc_run_dir,
 };
 use crate::payload_traversal::{parse_commit_message_from_text, parse_phase_decision_from_text};
 use crate::phase_command::{
@@ -38,12 +38,17 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use protocol::{canonical_model_id, AgentRunEvent, AgentRunRequest, ModelId, RunId, PROTOCOL_VERSION};
+use protocol::{
+    canonical_model_id, AgentRunEvent, AgentRunRequest, ArtifactInfo, ArtifactType, ModelId, OutputStreamType, RunId,
+    Timestamp, TokenUsage, ToolCallInfo, ToolResultInfo, PROTOCOL_VERSION,
+};
+
+use animus_session_backend::session::{SessionEvent, SessionRequest};
+use orchestrator_plugin_host::session::SessionBackendResolver;
 
 #[derive(Debug, Clone, Default)]
 pub struct PhaseExecuteOverrides {
@@ -454,6 +459,142 @@ pub(crate) fn validate_basic_json_schema(instance: &Value, schema: &Value) -> Re
     }
 }
 
+/// Translate the phase-execution [`AgentRunRequest`] into the
+/// [`SessionRequest`] the provider plugin consumes.
+///
+/// The workflow runner already assembles the full launch envelope inside
+/// `request.context` (the `runtime_contract` carries the launch args, system
+/// prompt, MCP servers, and tool policy; sibling keys like `agent_id` and
+/// `prompt_via_stdin` ride alongside). `PluginSessionBackend::build_run_params`
+/// reads `runtime_contract`, `system_prompt`, `mcp_servers`, `tools`,
+/// `response_schema`, and `session_id` from the TOP LEVEL of `extras`, so the
+/// whole `context` object becomes `extras` verbatim. The obvious scalar keys
+/// are ALSO lifted into the typed `SessionRequest` fields the resolver and
+/// transports read directly (`tool`, `model`, `prompt`, `cwd`,
+/// `project_root`, `timeout_secs`, `permission_mode`).
+fn session_request_from_agent_request(project_root: &str, request: &AgentRunRequest) -> SessionRequest {
+    let context = &request.context;
+    let context_str = |key: &str| context.pointer(&format!("/{key}")).and_then(Value::as_str).map(ToOwned::to_owned);
+
+    // Tool precedence mirrors the kernel's `session_request_from_args`:
+    // `runtime_contract.cli.name` wins over a top-level `tool` key.
+    let tool = context
+        .pointer("/runtime_contract/cli/name")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .or_else(|| context_str("tool"))
+        .unwrap_or_else(|| "claude".to_string());
+
+    let prompt = context_str("prompt").unwrap_or_default();
+    let cwd = context_str("cwd")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| context_str("project_root").map_or_else(|| PathBuf::from(project_root), PathBuf::from));
+    let permission_mode = context_str("permission_mode");
+
+    SessionRequest {
+        tool,
+        model: request.model.0.clone(),
+        prompt,
+        cwd,
+        project_root: Some(PathBuf::from(project_root)),
+        mcp_endpoint: None,
+        permission_mode,
+        timeout_secs: request.timeout_secs,
+        env_vars: Vec::new(),
+        // The entire phase context rides `extras`; the plugin host reads the
+        // launch-affecting keys (runtime_contract, system_prompt,
+        // mcp_servers, ...) from the top level. A non-object context (never
+        // produced by the workflow runner) degrades to an empty object so the
+        // plugin still receives a well-formed envelope.
+        extras: if context.is_object() { context.clone() } else { Value::Object(serde_json::Map::new()) },
+    }
+}
+
+/// Translate a backend [`SessionEvent`] into the legacy [`AgentRunEvent`]
+/// shape the phase event consumer (`process_phase_event_stream`) expects.
+///
+/// Mirrors the kernel's `provider_client::to_agent_event` exactly so the
+/// workflow path and the `animus agent run` path normalize provider output
+/// identically:
+///
+/// * Recoverable `Error` frames become stderr output chunks (the run
+///   continues; treating them as `AgentRunEvent::Error` would poison the
+///   terminal outcome).
+/// * Unrecoverable `Error` frames keep the `Error` variant so the consumer
+///   detects the terminal failure.
+/// * `Finished { exit_code }` maps to `AgentRunEvent::Finished` (the consumer
+///   derives success/failure from the exit code).
+fn session_event_to_agent_event(event: SessionEvent, run_id: &RunId) -> AgentRunEvent {
+    match event {
+        SessionEvent::Started { .. } => AgentRunEvent::Started { run_id: run_id.clone(), timestamp: Timestamp::now() },
+        SessionEvent::TextDelta { text } | SessionEvent::FinalText { text } => {
+            AgentRunEvent::OutputChunk { run_id: run_id.clone(), stream_type: OutputStreamType::Stdout, text }
+        }
+        SessionEvent::ToolCall { tool_name, arguments, server: _ } => AgentRunEvent::ToolCall {
+            run_id: run_id.clone(),
+            tool_info: ToolCallInfo { tool_name, parameters: arguments, timestamp: Timestamp::now() },
+        },
+        SessionEvent::ToolResult { tool_name, output, success } => AgentRunEvent::ToolResult {
+            run_id: run_id.clone(),
+            result_info: ToolResultInfo { tool_name, result: output, duration_ms: 0, success },
+        },
+        SessionEvent::Thinking { text } => AgentRunEvent::Thinking { run_id: run_id.clone(), content: text },
+        SessionEvent::Artifact { artifact_id, metadata } => AgentRunEvent::Artifact {
+            run_id: run_id.clone(),
+            artifact_info: ArtifactInfo {
+                artifact_id,
+                artifact_type: ArtifactType::Other,
+                file_path: metadata.get("file_path").and_then(Value::as_str).map(ToOwned::to_owned),
+                size_bytes: metadata.get("size_bytes").and_then(Value::as_u64),
+                mime_type: metadata.get("mime_type").and_then(Value::as_str).map(ToOwned::to_owned),
+            },
+        },
+        SessionEvent::Metadata { metadata } => AgentRunEvent::Metadata {
+            run_id: run_id.clone(),
+            cost: metadata.get("cost").and_then(Value::as_f64),
+            tokens: extract_token_usage(&metadata),
+        },
+        SessionEvent::Error { message, recoverable } => {
+            if recoverable {
+                AgentRunEvent::OutputChunk {
+                    run_id: run_id.clone(),
+                    stream_type: OutputStreamType::Stderr,
+                    text: message,
+                }
+            } else {
+                AgentRunEvent::Error { run_id: run_id.clone(), error: message }
+            }
+        }
+        SessionEvent::Finished { exit_code } => {
+            AgentRunEvent::Finished { run_id: run_id.clone(), exit_code, duration_ms: 0 }
+        }
+    }
+}
+
+/// Map provider-emitted metadata frames into a [`TokenUsage`] when the payload
+/// carries usage counters. Inspects the canonical `token_usage` / `tokens`
+/// keys first, then the per-provider variants the deleted sidecar's metadata
+/// parser produced. Mirrors the kernel's `provider_client::extract_token_usage`.
+fn extract_token_usage(metadata: &Value) -> Option<TokenUsage> {
+    if metadata.is_null() {
+        return None;
+    }
+    const KEYS: &[&str] = &["token_usage", "tokens", "usage", "claude_usage", "codex_usage", "gemini_stats"];
+    let payload = KEYS.iter().find_map(|key| metadata.get(*key)).unwrap_or(metadata);
+
+    let read_u32 = |keys: &[&str]| -> Option<u32> {
+        keys.iter().find_map(|key| payload.get(*key)).and_then(Value::as_u64).map(|n| n as u32)
+    };
+
+    let input = read_u32(&["input", "input_tokens", "prompt_tokens"])?;
+    let output = read_u32(&["output", "output_tokens", "completion_tokens"])?;
+    let reasoning = read_u32(&["reasoning", "reasoning_tokens"]);
+    let cache_read = read_u32(&["cache_read", "cache_read_input_tokens", "cache_read_tokens"]);
+    let cache_write = read_u32(&["cache_write", "cache_creation_input_tokens", "cache_write_tokens"]);
+
+    Some(TokenUsage { input, output, reasoning, cache_read, cache_write })
+}
+
 pub async fn run_workflow_phase_attempt(
     project_root: &str,
     workflow_id: &str,
@@ -462,7 +603,6 @@ pub async fn run_workflow_phase_attempt(
 ) -> Result<PhaseExecutionOutcome> {
     let ctx = RuntimeConfigContext::load(project_root);
     let parse_commit_message = phase_requires_commit_message_with_ctx(&ctx, phase_id);
-    let config_dir = runner_config_dir(Path::new(project_root));
 
     let scoped_state_root =
         protocol::scoped_state_root(Path::new(project_root)).unwrap_or_else(|| Path::new(project_root).join(".animus"));
@@ -550,23 +690,87 @@ pub async fn run_workflow_phase_attempt(
         run_id = %request.run_id.0,
         request_mcp_stdio_command = ?request_mcp_stdio_command,
         request_mcp_stdio_args = ?request_mcp_stdio_args,
-        "Dispatching workflow phase request to agent runner"
+        "Dispatching workflow phase request to provider plugin"
     );
-    let stream = connect_runner(&config_dir)
-        .await
-        .with_context(|| format!("failed to connect runner for workflow {} phase {}", workflow_id, phase_id))?;
-    let (read_half, mut write_half) = tokio::io::split(stream);
-    write_json_line(&mut write_half, request).await?;
 
-    // FATAL: the request has already been written to the runner, so the
-    // agent may be doing side-effecting work right now. If we can't flip
-    // the checkpoint to Running the recovery oracle will not shield this
-    // phase on daemon restart (`list_running_checkpoints` only returns
-    // Running entries). We MUST tag the failure with
-    // `TerminalCheckpointError` so the agent retry/failover loop refuses
-    // to re-dispatch — re-dispatching while the first runner is still
-    // executing would duplicate the side-effecting work, which is exactly
-    // the crash-replay hazard we are fixing.
+    // v0.5.3 fold-in: the standalone `agent-runner` sidecar (and its
+    // `~/.animus/<scope>/runner/agent-runner.sock` Unix socket) was deleted
+    // from the kernel. Provider plugins now handle CLI invocation end to end,
+    // so dispatch goes DIRECTLY through `SessionBackendResolver` — exactly the
+    // path the kernel's `animus agent run` uses. We translate this
+    // `AgentRunRequest` into a `SessionRequest`, start the session, and drive
+    // the backend's `SessionEvent` stream into the same `AgentRunEvent`
+    // consumer (`process_phase_event_stream`) the socket path used.
+    let session_request = session_request_from_agent_request(project_root, request);
+    let mut session_run = match SessionBackendResolver::with_plugin_discovery(Path::new(project_root))
+        .start_session(session_request)
+        .await
+    {
+        Ok(run) => run,
+        Err(err) => {
+            // The provider plugin failed to start BEFORE any side-effecting
+            // work — no request bytes reached a running agent. Mark the
+            // pending checkpoint failed and surface a retryable dispatch
+            // error so the scheduler re-dispatches on the next tick rather
+            // than terminally failing the workflow (mirrors the pre-fix
+            // connect-failure semantics).
+            let reason = format!("failed to start provider session: {err}");
+            if let Err(checkpoint_err) =
+                crate::phase_session::update_session_failed(&scoped_state_root, workflow_id, phase_id, &reason)
+            {
+                warn!(
+                    workflow_id = %workflow_id,
+                    phase_id = %phase_id,
+                    %checkpoint_err,
+                    "failed to mark session checkpoint failed after provider start failure"
+                );
+            }
+            return Err(anyhow::Error::new(DispatchRetryableError {
+                message: format!(
+                    "failed to start provider session for workflow {} phase {}: {}; dispatch will be retried on the next scheduler tick",
+                    workflow_id, phase_id, err
+                ),
+            }));
+        }
+    };
+
+    // Translate the backend `SessionEvent` stream into the legacy
+    // `AgentRunEvent` shape the downstream consumer expects, forwarding over
+    // a channel so `process_phase_event_stream` keeps its async select! +
+    // sidecar-poll structure unchanged.
+    let (event_tx, event_rx) = tokio::sync::mpsc::channel::<AgentRunEvent>(256);
+    let translator_run_id = request.run_id.clone();
+    let mut session_events = std::mem::replace(&mut session_run.events, tokio::sync::mpsc::channel(1).1);
+    // Crash-recovery note: the `SessionEvent::Started { session_id }` emitted by
+    // `PluginSessionBackend` carries the host-minted `control_session_id`
+    // (a fresh UUID per dispatch), NOT the provider's resumable external
+    // session id. Persisting it would store an id the provider cannot resume
+    // from, actively breaking daemon-restart auto-resume — so we deliberately
+    // do NOT copy it into the checkpoint. The provider's resumable id is not
+    // surfaced through the `SessionBackend` event stream today (the deleted
+    // agent-runner sidecar was the only mechanism that exposed it); the
+    // checkpoint therefore stays `provider_session_id = None`, exactly as the
+    // kernel's own `animus agent run` path leaves it. `auto_resume` then
+    // re-runs the phase from scratch rather than resuming with a bogus id,
+    // which is the safe degradation. Restoring true mid-phase resume requires
+    // a provider-side resumable-id event on the wire (future protocol work).
+    let translator = tokio::spawn(async move {
+        while let Some(session_event) = session_events.recv().await {
+            let agent_event = session_event_to_agent_event(session_event, &translator_run_id);
+            if event_tx.send(agent_event).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // FATAL: the provider session has started, so the agent may be doing
+    // side-effecting work right now. If we can't flip the checkpoint to
+    // Running the recovery oracle will not shield this phase on daemon
+    // restart (`list_running_checkpoints` only returns Running entries). We
+    // MUST tag the failure with `TerminalCheckpointError` so the agent
+    // retry/failover loop refuses to re-dispatch — re-dispatching while the
+    // first session is still executing would duplicate the side-effecting
+    // work, which is exactly the crash-replay hazard we are fixing.
     if let Err(err) = crate::phase_session::update_session_running(&scoped_state_root, workflow_id, phase_id) {
         warn!(
             workflow_id = %workflow_id,
@@ -601,7 +805,7 @@ pub async fn run_workflow_phase_attempt(
         run_id: request.run_id.0.clone(),
     };
     let outcome = process_phase_event_stream(
-        tokio::io::BufReader::new(read_half).lines(),
+        event_rx,
         &request.run_id,
         workflow_id,
         phase_id,
@@ -614,6 +818,20 @@ pub async fn run_workflow_phase_attempt(
         Some(poll_ctx),
     )
     .await;
+
+    // The translator task ends when the backend `SessionEvent` stream closes
+    // (after `Finished`) or when the consumer drops `event_rx`. Joining it
+    // here guarantees no orphaned task survives the phase and surfaces any
+    // panic in the translator as a warning (it never returns a value).
+    if let Err(join_err) = translator.await {
+        warn!(
+            workflow_id = %workflow_id,
+            phase_id = %phase_id,
+            run_id = %request.run_id.0,
+            %join_err,
+            "session event translator task did not join cleanly"
+        );
+    }
 
     // Final post-stream sidecar sweep is still worthwhile: handles the case
     // where the sidecar was only written immediately before the agent's
@@ -781,8 +999,8 @@ fn maybe_poll_sidecar(
     *captured = true;
 }
 
-async fn process_phase_event_stream<R: AsyncBufRead + Unpin>(
-    mut lines: tokio::io::Lines<R>,
+async fn process_phase_event_stream(
+    mut events: tokio::sync::mpsc::Receiver<AgentRunEvent>,
     run_id: &RunId,
     workflow_id: &str,
     phase_id: &str,
@@ -818,14 +1036,14 @@ async fn process_phase_event_stream<R: AsyncBufRead + Unpin>(
     let mut sidecar_captured = sidecar_poll.is_none();
     let mut last_sidecar_poll = Instant::now().checked_sub(SIDECAR_POLL_INTERVAL).unwrap_or_else(Instant::now);
     loop {
-        // tokio::select! between the next line and a 500ms tick so the
+        // tokio::select! between the next event and a 500ms tick so the
         // sidecar poll fires even when the agent goes quiet between events.
         let next = if sidecar_captured {
-            lines.next_line().await?
+            events.recv().await
         } else {
             tokio::select! {
                 biased;
-                line = lines.next_line() => line?,
+                event = events.recv() => event,
                 _ = tokio::time::sleep(SIDECAR_POLL_INTERVAL) => {
                     maybe_poll_sidecar(
                         sidecar_poll.as_ref(),
@@ -847,16 +1065,8 @@ async fn process_phase_event_stream<R: AsyncBufRead + Unpin>(
                 phase_id,
             );
         }
-        let Some(line) = next else {
+        let Some(event) = next else {
             break;
-        };
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-
-        let Ok(event) = serde_json::from_str::<AgentRunEvent>(line) else {
-            continue;
         };
 
         if let Some(dir) = event_run_dir {
@@ -1217,8 +1427,17 @@ fn phase_session_resume_plan(
     attempt: usize,
 ) -> orchestrator_core::runtime_contract::CliSessionResumePlan {
     let reuses_existing_session = continuation > 0;
-    let effective_session_id =
-        if attempt > 1 { format!("{}-a{}", session_id, attempt) } else { session_id.to_string() };
+    // claude 2.1.x requires `--session-id` to be a valid UUID. Retry attempts
+    // (attempt > 1) must derive a fresh, VALID-UUID session id from the base.
+    // A UUIDv5 over (base session_id, attempt) is both a valid UUID and
+    // deterministic, so continuation-resume (reused: continuation > 0) resolves
+    // to the SAME session id when resuming the same attempt. Attempt 1 keeps the
+    // base v4 id for back-compat.
+    let effective_session_id = if attempt > 1 {
+        Uuid::new_v5(&Uuid::NAMESPACE_OID, format!("{session_id}-a{attempt}").as_bytes()).to_string()
+    } else {
+        session_id.to_string()
+    };
     orchestrator_core::runtime_contract::CliSessionResumePlan {
         mode: orchestrator_core::runtime_contract::CliSessionResumeMode::NativeId,
         session_key: format!("wf:{workflow_id}:{phase_id}"),
@@ -1818,7 +2037,7 @@ fn write_manual_phase_markers(path: &Path, markers: &BTreeMap<String, bool>) -> 
         file.write_all(payload.as_bytes())?;
         file.sync_all()?;
     }
-    orchestrator_store::fsync_rename(&tmp_path, path)?;
+    orchestrator_core::store::fsync_rename(&tmp_path, path)?;
     Ok(())
 }
 
@@ -1895,8 +2114,23 @@ async fn run_workflow_phase_inner(params: &PhaseRunParams<'_>) -> Result<PhaseRu
     )?;
 
     let mut merged_runtime = runtime_loaded.config.clone();
-    for (id, profile) in &workflow_config.config.agent_profiles {
-        merged_runtime.agents.insert(id.clone(), profile.clone());
+    // `workflow_config.agent_profiles` are presence-aware
+    // `AgentProfileOverlay`s as of the current kernel; `merged_runtime.agents`
+    // holds resolved `AgentProfile`s. Apply each overlay onto the existing
+    // base profile when present (so unset overlay fields keep the base
+    // value), otherwise materialize the overlay into a full profile.
+    for (id, overlay) in &workflow_config.config.agent_profiles {
+        match merged_runtime.agents.get_mut(id) {
+            Some(base) => {
+                let mut base_overlay =
+                    orchestrator_config::agent_runtime_config::AgentProfileOverlay::from(base.clone());
+                base_overlay.merge_from(overlay);
+                *base = base_overlay.to_profile();
+            }
+            None => {
+                merged_runtime.agents.insert(id.clone(), overlay.to_profile());
+            }
+        }
     }
     if !workflow_config.config.tools_allowlist.is_empty() {
         let mut combined: std::collections::HashSet<String> = merged_runtime.tools_allowlist.iter().cloned().collect();
@@ -2273,10 +2507,31 @@ mod tests {
 
     #[test]
     fn retry_attempt_gets_fresh_session_id() {
-        let plan = phase_session_resume_plan("wf-1", "requirements", "session-123", 0, 2);
+        let base = Uuid::new_v4().to_string();
+        let plan = phase_session_resume_plan("wf-1", "requirements", &base, 0, 2);
 
         assert!(!plan.reused);
-        assert_eq!(plan.session_id.as_deref(), Some("session-123-a2"));
+        let sid = plan.session_id.expect("retry plan carries a session id");
+
+        // (a) The retry session id must be a valid UUID (claude 2.1.x rejects
+        // non-UUID `--session-id` values).
+        assert!(Uuid::parse_str(&sid).is_ok(), "retry session id must be a valid UUID, got {sid}");
+        // (b) It must differ from the base session id.
+        assert_ne!(sid, base);
+
+        // (c) It must be STABLE across two calls with the same (session_id,
+        // attempt) so continuation-resume resolves to the same session.
+        let plan_again = phase_session_resume_plan("wf-1", "requirements", &base, 0, 2);
+        assert_eq!(plan_again.session_id.as_deref(), Some(sid.as_str()));
+    }
+
+    #[test]
+    fn attempt_one_returns_base_session_unchanged() {
+        let base = Uuid::new_v4().to_string();
+        let plan = phase_session_resume_plan("wf-1", "requirements", &base, 0, 1);
+
+        assert_eq!(plan.session_id.as_deref(), Some(base.as_str()));
+        assert!(Uuid::parse_str(&base).is_ok());
     }
 
     #[test]
@@ -2320,11 +2575,17 @@ mod tests {
     }
 
     use protocol::{OutputStreamType, RunId, Timestamp};
-    use tokio::io::AsyncBufReadExt;
     use uuid::Uuid;
 
-    fn make_event_stream(events: &[protocol::AgentRunEvent]) -> Vec<u8> {
-        events.iter().map(|e| serde_json::to_string(e).unwrap() + "\n").collect::<String>().into_bytes()
+    /// Feed a fixed slice of events into an `mpsc::Receiver<AgentRunEvent>`,
+    /// the same channel shape `process_phase_event_stream` consumes from the
+    /// session-event translator in production.
+    fn channel_from_events(events: &[protocol::AgentRunEvent]) -> tokio::sync::mpsc::Receiver<protocol::AgentRunEvent> {
+        let (tx, rx) = tokio::sync::mpsc::channel(events.len().max(1));
+        for event in events {
+            tx.try_send(event.clone()).expect("test event channel has capacity");
+        }
+        rx
     }
 
     fn temp_run_dir() -> std::path::PathBuf {
@@ -2351,10 +2612,8 @@ mod tests {
         run_id: &RunId,
         run_dir: Option<&std::path::Path>,
     ) -> anyhow::Result<PhaseExecutionOutcome> {
-        let bytes = make_event_stream(events);
-        let reader = tokio::io::BufReader::new(bytes.as_slice());
         process_phase_event_stream(
-            reader.lines(),
+            channel_from_events(events),
             run_id,
             "wf-test",
             "impl",
@@ -2566,34 +2825,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&run_dir);
     }
 
-    #[tokio::test]
-    async fn event_stream_malformed_lines_are_skipped() {
-        let run_id = RunId("run-malformed-001".to_string());
-        let mut bytes = b"not json at all\n{\"garbage\": true}\n".to_vec();
-        let finished_event =
-            protocol::AgentRunEvent::Finished { run_id: run_id.clone(), exit_code: Some(0), duration_ms: 10 };
-        bytes.extend(serde_json::to_string(&finished_event).unwrap().as_bytes());
-        bytes.push(b'\n');
-
-        let reader = tokio::io::BufReader::new(bytes.as_slice());
-        let outcome = process_phase_event_stream(
-            reader.lines(),
-            &run_id,
-            "wf-test",
-            "impl",
-            false,
-            false,
-            "",
-            None::<&std::path::Path>,
-            None,
-            None,
-            None,
-        )
-        .await
-        .expect("malformed lines should be skipped, not cause failure");
-        assert!(matches!(outcome, PhaseExecutionOutcome::Completed { .. }));
-    }
-
     /// Repro for the daemon-crash window before the fix: when the agent
     /// writes its sidecar mid-run but `process_phase_event_stream` only
     /// copied the provider session id into the checkpoint AFTER the loop
@@ -2610,7 +2841,6 @@ mod tests {
     async fn provider_session_id_persisted_within_500ms_of_arrival() {
         use crate::phase_session::{read_checkpoint, write_session_pending, SessionCheckpointStatus};
         use std::time::{Duration, Instant};
-        use tokio::io::{duplex, AsyncWriteExt};
 
         // Serialize ANIMUS_RUNNER_SESSION_DIR mutation with the other
         // sidecar tests in this crate (they tweak the same env var).
@@ -2628,11 +2858,11 @@ mod tests {
         write_session_pending(scoped.path(), workflow_id, phase_id, "claude", run_id.0.as_str(), None)
             .expect("seed pending checkpoint");
 
-        // Feed events through a pipe so we can interleave "agent ran for a
-        // while, wrote the sidecar, kept streaming". 8 KiB buffer is plenty
-        // for the JSON we emit.
-        let (reader, mut writer) = duplex(8192);
-        let lines = tokio::io::BufReader::new(reader).lines();
+        // Feed events through a channel so we can interleave "agent ran for a
+        // while, wrote the sidecar, kept streaming" — the same channel shape
+        // the production session-event translator forwards into
+        // `process_phase_event_stream`.
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel::<protocol::AgentRunEvent>(8);
 
         // First event: the run begins. Sleep > 500 ms so the poller has at
         // least one tick to observe an empty sidecar. Then write the
@@ -2642,13 +2872,10 @@ mod tests {
         let sidecar_run_id = run_id.0.clone();
         let writer_run_id = run_id.clone();
         let _writer_task = tokio::spawn(async move {
-            let started = serde_json::to_string(&protocol::AgentRunEvent::Started {
-                run_id: writer_run_id.clone(),
-                timestamp: Timestamp::now(),
-            })
-            .unwrap();
-            writer.write_all(started.as_bytes()).await.unwrap();
-            writer.write_all(b"\n").await.unwrap();
+            event_tx
+                .send(protocol::AgentRunEvent::Started { run_id: writer_run_id.clone(), timestamp: Timestamp::now() })
+                .await
+                .unwrap();
 
             tokio::time::sleep(Duration::from_millis(800)).await;
             let payload = serde_json::json!({
@@ -2663,25 +2890,21 @@ mod tests {
             .expect("write sidecar mid-stream");
 
             tokio::time::sleep(Duration::from_millis(1200)).await;
-            let chunk = serde_json::to_string(&protocol::AgentRunEvent::OutputChunk {
-                run_id: writer_run_id.clone(),
-                stream_type: OutputStreamType::Stdout,
-                text: "still working\n".to_string(),
-            })
-            .unwrap();
-            writer.write_all(chunk.as_bytes()).await.unwrap();
-            writer.write_all(b"\n").await.unwrap();
+            event_tx
+                .send(protocol::AgentRunEvent::OutputChunk {
+                    run_id: writer_run_id.clone(),
+                    stream_type: OutputStreamType::Stdout,
+                    text: "still working\n".to_string(),
+                })
+                .await
+                .unwrap();
 
             tokio::time::sleep(Duration::from_millis(500)).await;
-            let finished = serde_json::to_string(&protocol::AgentRunEvent::Finished {
-                run_id: writer_run_id,
-                exit_code: Some(0),
-                duration_ms: 100,
-            })
-            .unwrap();
-            writer.write_all(finished.as_bytes()).await.unwrap();
-            writer.write_all(b"\n").await.unwrap();
-            // Drop writer so reader EOFs cleanly after Finished is consumed.
+            event_tx
+                .send(protocol::AgentRunEvent::Finished { run_id: writer_run_id, exit_code: Some(0), duration_ms: 100 })
+                .await
+                .unwrap();
+            // Drop event_tx so the receiver closes cleanly after Finished.
         });
 
         // Watcher task: poll the checkpoint at the same cadence the
@@ -2717,7 +2940,7 @@ mod tests {
             run_id: run_id.0.clone(),
         };
         let outcome = process_phase_event_stream(
-            lines,
+            event_rx,
             &run_id,
             workflow_id,
             phase_id,
@@ -3138,7 +3361,7 @@ mod tests {
         }
 
         // Pending checkpoint write fault: dispatch must abort BEFORE
-        // attempting to connect to the runner AND surface the
+        // starting the provider session AND surface the
         // [`DispatchRetryableError`] sentinel so the scheduler re-dispatches
         // on the next tick rather than terminally failing the workflow.
         #[tokio::test]
@@ -3156,13 +3379,13 @@ mod tests {
                 msg.contains("pending session checkpoint") && msg.contains("dispatch aborted"),
                 "error must surface the pending-checkpoint failure and the aborted-dispatch reason, got: {msg}"
             );
-            // And: no runner connection was attempted, because connect_runner
+            // And: no provider session was started, because session dispatch
             // happens AFTER the pending write. We assert this indirectly by
-            // looking at the error's primary cause — if connect_runner had
-            // run, the message would mention "failed to connect runner".
+            // looking at the error's primary cause — if the provider start had
+            // run, the message would mention "failed to start provider session".
             assert!(
-                !msg.contains("failed to connect runner"),
-                "dispatch must abort before runner connect; got connect error in message: {msg}"
+                !msg.contains("failed to start provider session"),
+                "dispatch must abort before provider session start; got start error in message: {msg}"
             );
             // CRITICAL: the error MUST be tagged with the retryable
             // sentinel so the workflow scheduler re-dispatches on the next

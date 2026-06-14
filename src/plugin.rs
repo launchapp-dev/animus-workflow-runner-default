@@ -12,19 +12,16 @@
 //! All public types here are wire-shaped (no `Arc<dyn ServiceHub>`, no
 //! closures); the heavy in-process types live in `crate::workflow_execute`.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use animus_plugin_protocol::{
-    InitializeParams, InitializeResult, KindCapability, PluginCapabilities, PluginInfo, PluginManifest,
-    PROTOCOL_VERSION as PLUGIN_PROTOCOL_VERSION,
+    InitializeResult, PluginCapabilities, PluginInfo, PluginManifest, PROTOCOL_VERSION as PLUGIN_PROTOCOL_VERSION,
 };
 use animus_workflow_runner_protocol::{
     error_codes, phase_status, workflow_status, PhaseResultSnapshot, WorkflowExecuteRequest, WorkflowExecuteResult,
-    WorkflowPhaseRunRequest, WorkflowPhaseRunResult, WorkflowRunnerCapabilities, KIND as WORKFLOW_RUNNER_KIND,
-    PROTOCOL_VERSION as WORKFLOW_RUNNER_PROTOCOL_VERSION,
+    WorkflowPhaseRunRequest, WorkflowPhaseRunResult, KIND as WORKFLOW_RUNNER_KIND,
 };
 use anyhow::{anyhow, Result};
 use orchestrator_core::{services::ServiceHub, FileServiceHub, WorkflowStatus};
@@ -156,13 +153,19 @@ pub fn plugin_manifest() -> PluginManifest {
 /// Build the `initialize` response, side-effect: install plugin state from
 /// the `project_binding` extension. Idempotent for repeated `initialize`
 /// calls against the same project root.
-pub fn plugin_initialize_result(params: &InitializeParams) -> Result<InitializeResult> {
-    if !params.protocol_version.starts_with("1.") {
-        return Err(anyhow!("incompatible host protocol version '{}'; plugin requires 1.x", params.protocol_version));
+pub fn plugin_initialize_result(params: &Value) -> Result<InitializeResult> {
+    let protocol_version = params.get("protocol_version").and_then(Value::as_str).unwrap_or_default();
+    if !protocol_version.starts_with("1.") {
+        return Err(anyhow!("incompatible host protocol version '{}'; plugin requires 1.x", protocol_version));
     }
 
-    let binding_value = params
-        .init_extensions
+    // `init_extensions` is sent by the kernel in the raw `initialize` params
+    // JSON (the typed `InitializeParams` struct no longer carries it as of the
+    // current animus-cli protocol). Parse it directly from the params Value.
+    let empty = serde_json::Map::new();
+    let init_extensions = params.get("init_extensions").and_then(Value::as_object).unwrap_or(&empty);
+
+    let binding_value = init_extensions
         .get(PROJECT_BINDING_EXTENSION)
         .ok_or_else(|| anyhow!("missing project_binding init extension"))?;
     let project_root = binding_value
@@ -181,8 +184,7 @@ pub fn plugin_initialize_result(params: &InitializeParams) -> Result<InitializeR
     // daemon supply an explicit memory MCP binary path so the plugin does not
     // need to discover a sibling `animus` binary. Accepts either a bare
     // string or an object with `command` / `path`.
-    let memory_mcp_stdio_command = params
-        .init_extensions
+    let memory_mcp_stdio_command = init_extensions
         .get(MEMORY_MCP_STDIO_COMMAND_EXTENSION)
         .and_then(|value| {
             value
@@ -195,22 +197,6 @@ pub fn plugin_initialize_result(params: &InitializeParams) -> Result<InitializeR
         .filter(|s| !s.is_empty());
 
     install_plugin_state(PluginState { project_root: project_root_path, repo_scope, hub, memory_mcp_stdio_command });
-
-    let mut kind_capabilities = HashMap::new();
-    kind_capabilities.insert(
-        WORKFLOW_RUNNER_KIND.to_string(),
-        KindCapability {
-            crate_version: WORKFLOW_RUNNER_PROTOCOL_VERSION.to_string(),
-            extra: serde_json::to_value(WorkflowRunnerCapabilities {
-                phase_decision_parsing: true,
-                rework_context_support: true,
-                post_success_actions: true,
-                crash_recovery: true,
-                manual_pause_support: true,
-            })
-            .unwrap_or(Value::Null),
-        },
-    );
 
     Ok(InitializeResult {
         protocol_version: PLUGIN_PROTOCOL_VERSION.to_string(),
@@ -232,7 +218,6 @@ pub fn plugin_initialize_result(params: &InitializeParams) -> Result<InitializeR
             subject_kinds: Vec::new(),
             mcp_tools: Vec::new(),
         },
-        kind_capabilities,
     })
 }
 
@@ -524,20 +509,21 @@ pub fn classify_error(error: &anyhow::Error) -> (i32, String) {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::collections::HashMap;
 
-    fn make_init(project_root: &str) -> InitializeParams {
-        let mut ext = HashMap::new();
-        ext.insert(PROJECT_BINDING_EXTENSION.to_string(), json!({ "project_root": project_root }));
-        InitializeParams {
-            protocol_version: PLUGIN_PROTOCOL_VERSION.to_string(),
-            host_info: animus_plugin_protocol::HostInfo { name: "test-host".to_string(), version: "0.0.0".to_string() },
-            capabilities: animus_plugin_protocol::HostCapabilities {
-                progress: false,
-                cancellation: false,
-                streaming: false,
+    /// Build the raw `initialize` params Value the kernel sends, carrying
+    /// `init_extensions.project_binding` (the typed `InitializeParams` no
+    /// longer carries `init_extensions`, so the plugin reads it from the raw
+    /// params — see [`plugin_initialize_result`]).
+    fn make_init(project_root: &str) -> Value {
+        json!({
+            "protocol_version": PLUGIN_PROTOCOL_VERSION,
+            "host_info": { "name": "test-host", "version": "0.0.0" },
+            "capabilities": { "progress": false, "cancellation": false, "streaming": false },
+            "init_extensions": {
+                PROJECT_BINDING_EXTENSION: { "project_root": project_root },
             },
-            init_extensions: ext,
-        }
+        })
     }
 
     #[test]
@@ -556,7 +542,7 @@ mod tests {
     #[test]
     fn initialize_requires_project_binding() {
         let mut params = make_init("/tmp/whatever");
-        params.init_extensions.clear();
+        params.as_object_mut().unwrap().remove("init_extensions");
         let result = plugin_initialize_result(&params);
         assert!(result.is_err(), "initialize without project_binding must error");
     }

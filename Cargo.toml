@@ -15,27 +15,27 @@ name = "animus-workflow-runner-default"
 path = "src/main.rs"
 
 [dependencies]
-# --- v0.5 protocol crates (tagged at animus-protocol v0.5.0) ----------------
-animus-plugin-protocol      = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.5.1" }
-animus-subject-protocol     = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.5.1" }
+# --- protocol crates — pinned to the SAME animus-protocol tags the current
+# animus-cli kernel (HEAD 329044dc) resolves to, so the runner speaks the
+# byte-identical session wire protocol as the kernel and the installed
+# provider plugins (built against v0.1.13.x). ---------------------------------
+animus-session-backend      = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.1.13" }
+animus-subject-protocol     = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.5.7" }
 animus-workflow-runner-protocol = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.5.1" }
-# animus-plugin-runtime is currently provider-specific (run_provider/ProviderBackend);
-# this plugin implements its own JSON-RPC stdio loop using the protocol types above.
-# Re-pin once the runtime exposes a generic register_method! shell.
-animus-plugin-runtime       = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.5.1" }
 
-# --- ao-cli helper crates (pinned to main; switch to branch = "v0.5" after Wave 3) -
-# TODO(v0.5-wave3): repin all of these to `branch = "v0.5"` once that branch
-# exists on origin. Today there is no v0.5 branch on launchapp-dev/animus-cli.
-agent-runner               = { git = "https://github.com/launchapp-dev/animus-cli", rev = "e02ae75b79558029cf1dfb92b787d8fd8d54c641" }
-protocol                   = { git = "https://github.com/launchapp-dev/animus-cli", rev = "e02ae75b79558029cf1dfb92b787d8fd8d54c641", package = "protocol" }
-orchestrator-core          = { git = "https://github.com/launchapp-dev/animus-cli", rev = "e02ae75b79558029cf1dfb92b787d8fd8d54c641" }
-orchestrator-config        = { git = "https://github.com/launchapp-dev/animus-cli", rev = "e02ae75b79558029cf1dfb92b787d8fd8d54c641" }
-orchestrator-store         = { git = "https://github.com/launchapp-dev/animus-cli", rev = "e02ae75b79558029cf1dfb92b787d8fd8d54c641" }
-orchestrator-providers     = { git = "https://github.com/launchapp-dev/animus-cli", rev = "e02ae75b79558029cf1dfb92b787d8fd8d54c641" }
-orchestrator-git-ops       = { git = "https://github.com/launchapp-dev/animus-cli", rev = "e02ae75b79558029cf1dfb92b787d8fd8d54c641" }
-orchestrator-notifications = { git = "https://github.com/launchapp-dev/animus-cli", rev = "e02ae75b79558029cf1dfb92b787d8fd8d54c641" }
-orchestrator-logging       = { git = "https://github.com/launchapp-dev/animus-cli", rev = "e02ae75b79558029cf1dfb92b787d8fd8d54c641" }
+# --- ao-cli kernel crates — pinned to the current HEAD rev. The session
+# dispatch types (`SessionBackendResolver`, `PluginSessionBackend`,
+# `SessionEvent`) must be byte-identical to the kernel's `animus agent run`
+# path, which is the proven-working reference. `animus-plugin-protocol`,
+# `protocol`, `orchestrator-core`, and `orchestrator-plugin-host` are in-tree
+# path deps inside the kernel workspace, so they have no standalone published
+# tag — pin them to the kernel git rev instead. -------------------------------
+animus-plugin-protocol      = { git = "https://github.com/launchapp-dev/animus-cli", rev = "329044dc1cdebf825e7ffbe6c2fb6499db8b542b" }
+protocol                    = { git = "https://github.com/launchapp-dev/animus-cli", rev = "329044dc1cdebf825e7ffbe6c2fb6499db8b542b", package = "protocol" }
+orchestrator-core          = { git = "https://github.com/launchapp-dev/animus-cli", rev = "329044dc1cdebf825e7ffbe6c2fb6499db8b542b" }
+orchestrator-config        = { git = "https://github.com/launchapp-dev/animus-cli", rev = "329044dc1cdebf825e7ffbe6c2fb6499db8b542b" }
+orchestrator-plugin-host   = { git = "https://github.com/launchapp-dev/animus-cli", rev = "329044dc1cdebf825e7ffbe6c2fb6499db8b542b" }
+orchestrator-logging       = { git = "https://github.com/launchapp-dev/animus-cli", rev = "329044dc1cdebf825e7ffbe6c2fb6499db8b542b" }
 
 # --- stdlib-ish deps (move with the crate) ----------------------------------
 anyhow = "1.0"
@@ -51,7 +51,7 @@ sha2 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "process", "time", "net", "sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
 
 [dev-dependencies]
 assert_cmd = "2.0"

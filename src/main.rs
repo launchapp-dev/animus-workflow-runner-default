@@ -19,8 +19,7 @@ use std::io::{self, IsTerminal, Write};
 use std::sync::Arc;
 
 use animus_plugin_protocol::{
-    error_codes as core_error_codes, HealthCheckResult, HealthStatus, InitializeParams, RpcError, RpcRequest,
-    RpcResponse,
+    error_codes as core_error_codes, HealthCheckResult, HealthStatus, RpcError, RpcRequest, RpcResponse,
 };
 use animus_workflow_runner_default::plugin::{
     classify_error, handle_workflow_execute, handle_workflow_run_phase, plugin_initialize_result, plugin_manifest,
@@ -177,9 +176,10 @@ async fn handle_request(request: RpcRequest, stdout: Arc<Mutex<tokio::io::Stdout
     }
 }
 
-fn parse_init_params(params: Option<Value>) -> Result<InitializeParams, String> {
-    let params = params.ok_or_else(|| "missing initialize params".to_string())?;
-    serde_json::from_value(params).map_err(|e| format!("invalid initialize params: {e}"))
+fn parse_init_params(params: Option<Value>) -> Result<Value, String> {
+    // Return the raw params Value so `plugin_initialize_result` can read
+    // `init_extensions` (no longer carried by the typed `InitializeParams`).
+    params.ok_or_else(|| "missing initialize params".to_string())
 }
 
 async fn dispatch_workflow_execute(id: Option<Value>, params: Option<Value>) -> RpcResponse {
