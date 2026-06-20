@@ -32,8 +32,8 @@ use crate::workflow_execute::{execute_workflow_with_hub, WorkflowExecuteInternal
 
 /// Plugin and binary name.
 pub const PLUGIN_NAME: &str = "animus-workflow-runner-default";
-/// Plugin semver (matches `Cargo.toml`).
-pub const PLUGIN_VERSION: &str = "0.3.0";
+/// Plugin semver (sourced from `Cargo.toml` so it can never drift).
+pub const PLUGIN_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Plugin description.
 pub const PLUGIN_DESCRIPTION: &str =
     "Reference workflow_runner plugin for Animus v0.5 (stdio JSON-RPC + direct-execute CLI; replaces in-tree workflow-runner-v2)";
