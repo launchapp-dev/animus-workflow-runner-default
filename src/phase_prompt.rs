@@ -34,6 +34,15 @@ pub struct PhaseRenderParams<'a> {
 pub(crate) const WORKFLOW_PHASE_PROMPT_TEMPLATE: &str =
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/prompts/runtime/workflow_phase.prompt"));
 
+/// CHANGE P-C: unconditional instruction (appended to EVERY assembled phase
+/// prompt, regardless of approvals) telling the agent how to reach the human.
+/// Research showed gemini / opencode / codex have no native question channel,
+/// so the `animus.agent.ask` MCP tool is the only universal path. Kept to a
+/// few concise lines.
+pub(crate) const UNIVERSAL_ASK_INSTRUCTION: &str = "Human-in-the-loop:\n\
+- To ask the human a question, call the `animus.agent.ask` MCP tool. Do not guess when a real decision is needed.\n\
+- When approvals are enabled, destructive or sensitive actions are intercepted by the approval gate automatically — proceed normally and respond to any prompt it raises.";
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct PhasePromptInputs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -298,6 +307,8 @@ pub(crate) fn render_phase_prompt_with_ctx_overrides(
         }
     }
     prompt_sections.push(phase_prompt);
+    // CHANGE P-C: unconditional ask-channel instruction on every phase.
+    prompt_sections.push(UNIVERSAL_ASK_INSTRUCTION.to_string());
     if let Some(skill_result) = skill_result {
         for suffix in &skill_result.prompt_suffixes {
             if let Some(expanded) = expand_prompt_fragment(suffix, &inputs.pipeline_vars) {
@@ -695,7 +706,49 @@ pub(crate) fn phase_result_kind_for_ctx(ctx: &RuntimeConfigContext, phase_id: &s
 
 #[cfg(test)]
 mod tests {
-    use super::phase_action_rule;
+    use super::{phase_action_rule, UNIVERSAL_ASK_INSTRUCTION};
+    use crate::config_context::RuntimeConfigContext;
+    use orchestrator_core::{
+        builtin_agent_runtime_config, builtin_workflow_config, workflow_config_hash, LoadedWorkflowConfig,
+        WorkflowConfigMetadata, WorkflowConfigSource,
+    };
+    use std::path::PathBuf;
+
+    #[test]
+    fn assembled_phase_prompt_includes_universal_ask_instruction() {
+        let workflow_config = builtin_workflow_config();
+        let ctx = RuntimeConfigContext {
+            agent_runtime_config: builtin_agent_runtime_config(),
+            workflow_config: LoadedWorkflowConfig {
+                metadata: WorkflowConfigMetadata {
+                    schema: workflow_config.schema.clone(),
+                    version: workflow_config.version,
+                    hash: workflow_config_hash(&workflow_config),
+                    source: WorkflowConfigSource::Builtin,
+                },
+                config: workflow_config,
+                path: PathBuf::from("builtin"),
+            },
+        };
+        let params = super::PhaseRenderParams {
+            project_root: "/tmp/project",
+            execution_cwd: "/tmp/project",
+            workflow_id: "wf-1",
+            subject_id: "TASK-1",
+            subject_title: "Title",
+            subject_description: "Description",
+            phase_id: "implementation",
+        };
+        let rendered = super::render_phase_prompt_with_ctx(&ctx, &params, super::PhasePromptInputs::default());
+        assert!(
+            rendered.final_prompt.contains("animus.agent.ask"),
+            "every assembled phase prompt must mention the animus.agent.ask channel"
+        );
+        assert!(
+            rendered.final_prompt.contains(UNIVERSAL_ASK_INSTRUCTION),
+            "the unconditional ask instruction block must be present in the assembled prompt"
+        );
+    }
 
     #[test]
     fn mutating_state_phases_are_not_rendered_as_strictly_read_only() {

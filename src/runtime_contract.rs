@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use anyhow::{anyhow, Result};
 use serde_json::Value;
 use tracing::warn;
@@ -279,6 +281,32 @@ pub fn inject_default_stdio_mcp_with_config(
     project_root: &str,
     mcp_config: &protocol::McpRuntimeConfig,
 ) {
+    inject_default_stdio_mcp_for_agent(runtime_contract, project_root, mcp_config, None);
+}
+
+/// Variant of [`inject_default_stdio_mcp_with_config`] that pins the spawned
+/// `animus mcp serve` to a known agent profile via `--agent-id`. The server
+/// then ignores the payload `agent_id` on the blocking `animus.agent.ask` /
+/// `animus.agent.request_approval` tools, so an agent cannot route an
+/// escalation through a sibling profile whose `approval_policy` is more
+/// permissive — and the phase profile's own policy is the one evaluated.
+/// Mirrors the kernel's `agent_mcp::inject_default_stdio_mcp_for_agent`. The
+/// flag is only appended to the DEFAULT serve args — host-supplied
+/// `stdio_args_json` is passed through untouched.
+///
+/// After a stdio command is injected (and no HTTP endpoint is in play), this
+/// also flips `mcp.enforce_only` and seeds `mcp.allowed_tool_prefixes`:
+/// providers that consume the runtime contract's `mcp` block skip native MCP
+/// setup unless those are set, so without them the injected `animus` server
+/// (request_approval + animus.agent.ask) would be silently ignored when the
+/// binary was resolved from `ANIMUS_BIN` / `PATH` / the sibling fallback
+/// rather than a host-supplied `stdio_command`.
+pub fn inject_default_stdio_mcp_for_agent(
+    runtime_contract: &mut Value,
+    project_root: &str,
+    mcp_config: &protocol::McpRuntimeConfig,
+    agent_profile_id: Option<&str>,
+) {
     if runtime_contract.pointer("/mcp/stdio/command").and_then(Value::as_str).is_some_and(|v| !v.trim().is_empty()) {
         return;
     }
@@ -300,40 +328,57 @@ pub fn inject_default_stdio_mcp_with_config(
         return;
     }
 
+    // NOTE: the `supports_mcp` gate is intentional. All Animus provider
+    // plugins (claude / codex / gemini / opencode / oai / acp / codex-mcp)
+    // advertise `supports_mcp: true` in their CLI capabilities, so this gate
+    // does not exclude any production provider — it only skips genuinely
+    // non-MCP tools. The animus stdio server is where `request_approval` and
+    // `animus.agent.ask` live, so every MCP-capable agent must receive it.
     let supports_mcp =
         runtime_contract.pointer("/cli/capabilities/supports_mcp").and_then(Value::as_bool).unwrap_or(false);
     if !supports_mcp {
         return;
     }
 
-    // TODO(codex-p2): in the standalone plugin, `current_exe()` is
-    // `animus-workflow-runner-default`, not the Animus CLI. If a sibling
-    // `animus` binary is not found and `mcp_config.stdio_command` is
-    // empty, this would fall back to launching THIS plugin with `mcp serve`
-    // args, which it doesn't understand — startup would hang. v0.5 mitigation:
-    // refuse the fallback and require the daemon to supply
-    // `mcp_config.stdio_command`. Track in v0.6 by extending
-    // `mcp_config` with a "host CLI path" field provided by the host on
-    // every workflow_runner call.
-    let command = mcp_config.stdio_command.clone().filter(|v| !v.trim().is_empty()).or_else(|| {
-        let exe = std::env::current_exe().ok()?;
-        let exe_dir = exe.parent()?;
-        let ao_binary = exe_dir.join("animus");
-        if ao_binary.exists() {
-            Some(ao_binary.to_string_lossy().to_string())
-        } else {
-            // Refuse to recursively launch ourselves (codex P2 round 2).
-            None
-        }
-    });
+    // CHANGE P-A: robust `animus` binary resolution. Resolution order:
+    //   1. host-supplied `mcp_config.stdio_command` (daemon override)
+    //   2. `ANIMUS_BIN` env var (explicit operator override)
+    //   3. an `animus` on `PATH`
+    //   4. a sibling `animus` next to this plugin binary
+    // If none resolve, LOG A LOUD WARNING and skip — the approvals/questions
+    // gate would otherwise be SILENTLY absent (agents run with no
+    // request_approval / animus.agent.ask channel). We never recursively
+    // launch THIS plugin (it speaks JSON-RPC, not `mcp serve`).
+    let command = resolve_animus_mcp_binary(mcp_config);
     let Some(command) = command else {
+        warn!(
+            "could not resolve an `animus` binary for the stdio MCP server (checked mcp_config.stdio_command, \
+             $ANIMUS_BIN, PATH, and the sibling binary): the spawned agent will run WITHOUT the animus MCP \
+             server, so request_approval and animus.agent.ask will be unavailable. Set ANIMUS_BIN or have the \
+             daemon supply mcp_config.stdio_command."
+        );
         return;
     };
 
-    let args =
-        mcp_config.stdio_args_json.as_deref().and_then(|v| serde_json::from_str::<Vec<String>>(v).ok()).unwrap_or_else(
-            || vec!["--project-root".to_string(), project_root.to_string(), "mcp".to_string(), "serve".to_string()],
-        );
+    let args = mcp_config
+        .stdio_args_json
+        .as_deref()
+        .and_then(|v| serde_json::from_str::<Vec<String>>(v).ok())
+        .unwrap_or_else(|| {
+            let mut args =
+                vec!["--project-root".to_string(), project_root.to_string(), "mcp".to_string(), "serve".to_string()];
+            // CHANGE P-B follow-up (codex P1): pin the spawned MCP server
+            // to the phase agent profile so blocking approval/question
+            // tools evaluate THIS profile's approval_policy, and native
+            // permission-hook calls (which carry no agent_id) are
+            // attributed to the right profile instead of the generic
+            // `agent` fallback.
+            if let Some(agent_id) = agent_profile_id.map(str::trim).filter(|value| !value.is_empty()) {
+                args.push("--agent-id".to_string());
+                args.push(agent_id.to_string());
+            }
+            args
+        });
 
     if let Some(mcp) = runtime_contract.get_mut("mcp").and_then(Value::as_object_mut) {
         mcp.insert("stdio".to_string(), serde_json::json!({ "command": command, "args": args }));
@@ -342,6 +387,211 @@ pub fn inject_default_stdio_mcp_with_config(
             mcp.insert("agent_id".to_string(), serde_json::json!("animus"));
         }
     }
+
+    // codex P2 follow-up: mirror the kernel's agent_mcp path. When a stdio
+    // command was injected (no HTTP endpoint), flip `enforce_only` and seed
+    // `allowed_tool_prefixes` so providers actually perform native MCP setup.
+    // `build_runtime_contract_with_resume_and_mcp_config` only flips this for a
+    // HOST-supplied stdio command; binaries resolved from ANIMUS_BIN / PATH /
+    // the sibling fallback would otherwise leave the flag off and the server
+    // silently unused.
+    let stdio_injected =
+        runtime_contract.pointer("/mcp/stdio/command").and_then(Value::as_str).is_some_and(|c| !c.trim().is_empty());
+    if stdio_injected {
+        let prefix_agent_id = runtime_contract
+            .pointer("/mcp/agent_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .unwrap_or("animus")
+            .to_string();
+        if let Some(mcp) = runtime_contract.get_mut("mcp").and_then(Value::as_object_mut) {
+            mcp.insert("enforce_only".to_string(), Value::Bool(true));
+            let prefixes = protocol::default_allowed_tool_prefixes(&prefix_agent_id);
+            mcp.insert("allowed_tool_prefixes".to_string(), serde_json::json!(prefixes));
+        }
+    }
+}
+
+/// When `mcp.enforce_only` is set, the agent runner rejects any tool call
+/// whose name does not match an entry in `mcp.allowed_tool_prefixes`. The
+/// default seeding only covers the primary `animus` server, so any
+/// project / workflow / skill / memory MCP server injected into
+/// `mcp.additional_servers` would be rejected under MCP-only policy even
+/// though it was deliberately configured.
+///
+/// Call this AFTER all `additional_servers` have been injected: it appends the
+/// `<server>.` / `mcp__<server>__` / `mcp.<server>.` prefix variants for every
+/// additional server so configured servers remain callable. No-op when
+/// `enforce_only` is not set (additional servers are unrestricted then).
+pub fn expand_allowed_tool_prefixes_for_additional_servers(runtime_contract: &mut Value) {
+    let enforce_only = runtime_contract.pointer("/mcp/enforce_only").and_then(Value::as_bool).unwrap_or(false);
+    if !enforce_only {
+        return;
+    }
+    let server_names: Vec<String> = runtime_contract
+        .pointer("/mcp/additional_servers")
+        .and_then(Value::as_object)
+        .map(|servers| servers.keys().cloned().collect())
+        .unwrap_or_default();
+    if server_names.is_empty() {
+        return;
+    }
+
+    let mut extra_prefixes: Vec<String> = Vec::new();
+    for raw in &server_names {
+        let normalized = raw.trim().to_ascii_lowercase();
+        if normalized.is_empty() {
+            continue;
+        }
+        let snake = normalized.replace('-', "_");
+        for variant in [&normalized, &snake] {
+            extra_prefixes.push(format!("{variant}."));
+            extra_prefixes.push(format!("mcp__{variant}__"));
+            extra_prefixes.push(format!("mcp.{variant}."));
+        }
+    }
+
+    if let Some(mcp) = runtime_contract.get_mut("mcp").and_then(Value::as_object_mut) {
+        let prefixes = mcp.entry("allowed_tool_prefixes").or_insert_with(|| Value::Array(Vec::new()));
+        if let Some(array) = prefixes.as_array_mut() {
+            for prefix in extra_prefixes {
+                let value = Value::String(prefix);
+                if !array.contains(&value) {
+                    array.push(value);
+                }
+            }
+        }
+    }
+}
+
+/// Return `true` when the phase's effective agent profile carries an
+/// `approval_policy` (checking the workflow YAML overlay profile first, then
+/// the agent_runtime_config profile). Mirrors the profile-resolution order of
+/// [`inject_agent_tool_policy`].
+///
+/// IMPORTANT: this is gated on `approval_policy.is_some()` ALONE — NOT on the
+/// presence of an `agent_id` pin. The pin is always present for agent phases,
+/// so gating on it would flip the approvals signal on for every autonomous
+/// phase, escalating/denying everything. The signal must be the precise
+/// `approval_policy` presence.
+pub fn phase_agent_has_approval_policy(ctx: &RuntimeConfigContext, phase_id: &str) -> bool {
+    let agent_id = ctx.phase_agent_id(phase_id);
+
+    let wf_has = agent_id
+        .as_deref()
+        .and_then(|id| ctx.workflow_config.config.agent_profiles.get(id))
+        .map(|p| p.approval_policy.is_some())
+        .unwrap_or(false);
+
+    let rt_has = agent_id
+        .as_deref()
+        .and_then(|id| ctx.agent_runtime_config.agent_profile(id))
+        .map(|p| p.approval_policy.is_some())
+        .unwrap_or(false);
+
+    wf_has || rt_has
+}
+
+/// Set the kernel-mediated approvals signal as a TOP-LEVEL agent/run param
+/// (`run_params.approvals = true`) IFF the phase's agent profile carries an
+/// `approval_policy`. This mirrors the kernel's `animus agent run` path
+/// (`provider_client.rs`: `extras.insert("approvals", true)` when
+/// `profile_has_approval_policy`), so autonomous workflow phases get the same
+/// human-in-the-loop gate.
+///
+/// `run_params` here is the workflow runner's `context` object — it becomes
+/// `SessionRequest.extras` verbatim, and the kernel's plugin-runtime forwards
+/// top-level extras keys to the provider session, where the transports read
+/// `extras.approvals` (claude wires `--permission-prompt-tool`, others inject a
+/// system-prompt instruction block).
+///
+/// Only set when a policy exists — setting it unconditionally would make every
+/// autonomous phase escalate/deny.
+pub fn inject_approvals_signal(run_params: &mut Value, ctx: &RuntimeConfigContext, phase_id: &str) {
+    if !phase_agent_has_approval_policy(ctx, phase_id) {
+        return;
+    }
+    if let Some(object) = run_params.as_object_mut() {
+        object.insert("approvals".to_string(), Value::Bool(true));
+    }
+}
+
+/// Belt-and-braces companion to [`inject_approvals_signal`]: stamp
+/// `approvals = true` onto the `runtime_contract` object itself (IFF the phase
+/// agent profile carries an `approval_policy`).
+///
+/// WHY a second channel: the top-level `extras.approvals` key only reaches the
+/// provider if the daemon's installed kernel forwards top-level extras across
+/// `PluginSessionBackend::build_run_params` (kernel fix f6ce11f). Older kernel
+/// revs forward only a fixed whitelist — but `runtime_contract` is ALWAYS in
+/// that whitelist, so a flag stamped here survives every kernel rev and reaches
+/// the provider as `extras.runtime_contract.approvals`. This makes the
+/// approvals signal robust against the build-time pin lagging the runtime
+/// kernel, without bumping the pin (which only fixes session wire types).
+///
+/// Gated identically to `inject_approvals_signal` — only set when a policy
+/// exists, so non-policy autonomous phases never escalate.
+pub fn stamp_approvals_on_runtime_contract(runtime_contract: &mut Value, ctx: &RuntimeConfigContext, phase_id: &str) {
+    if !phase_agent_has_approval_policy(ctx, phase_id) {
+        return;
+    }
+    if let Some(object) = runtime_contract.as_object_mut() {
+        object.insert("approvals".to_string(), Value::Bool(true));
+    }
+}
+
+/// Resolve the `animus` binary used to launch the default stdio MCP server.
+///
+/// Resolution order (first hit wins):
+///   1. host-supplied `mcp_config.stdio_command`
+///   2. the `ANIMUS_BIN` environment variable
+///   3. an `animus` executable found on `PATH`
+///   4. a sibling `animus` next to the current executable
+///
+/// Returns `None` when none resolve. The caller logs a loud warning in that
+/// case — the approvals / questions gate is silently absent otherwise. This
+/// never returns the path to THIS plugin (it does not understand `mcp serve`).
+fn resolve_animus_mcp_binary(mcp_config: &protocol::McpRuntimeConfig) -> Option<String> {
+    if let Some(command) = mcp_config.stdio_command.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+        return Some(command.to_string());
+    }
+
+    if let Some(env_bin) = std::env::var("ANIMUS_BIN").ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) {
+        if Path::new(&env_bin).exists() {
+            return Some(env_bin);
+        }
+        warn!(animus_bin = %env_bin, "ANIMUS_BIN is set but the path does not exist; ignoring");
+    }
+
+    if let Some(path_bin) = find_animus_on_path() {
+        return Some(path_bin);
+    }
+
+    let exe = std::env::current_exe().ok()?;
+    let exe_dir = exe.parent()?;
+    let sibling = exe_dir.join("animus");
+    if sibling.exists() {
+        return Some(sibling.to_string_lossy().to_string());
+    }
+
+    None
+}
+
+/// Look up an `animus` executable on `PATH`. Mirrors a minimal `which`:
+/// splits `$PATH`, joins `animus`, and returns the first existing entry.
+fn find_animus_on_path() -> Option<String> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        let candidate = dir.join("animus");
+        if candidate.is_file() {
+            return Some(candidate.to_string_lossy().to_string());
+        }
+    }
+    None
 }
 
 pub fn inject_agent_tool_policy(runtime_contract: &mut Value, ctx: &RuntimeConfigContext, phase_id: &str) {
@@ -684,6 +934,96 @@ mod tests {
     };
 
     use super::*;
+
+    fn agent_runtime_config_with_approval_policy(
+        agent_id: &str,
+        with_policy: bool,
+    ) -> orchestrator_core::AgentRuntimeConfig {
+        let mut config = builtin_agent_runtime_config();
+        let mut profile = config.agents.get(agent_id).cloned().unwrap_or_default();
+        profile.approval_policy = with_policy.then(orchestrator_config::agent_runtime_config::ApprovalPolicy::default);
+        config.agents.insert(agent_id.to_string(), profile);
+        config
+    }
+
+    #[test]
+    fn inject_approvals_signal_set_when_profile_has_approval_policy() {
+        let workflow_config = workflow_config_with_phase_agent("implementation", "default");
+        let agent_runtime_config = agent_runtime_config_with_approval_policy("default", true);
+        let ctx = RuntimeConfigContext { agent_runtime_config, workflow_config };
+
+        let mut run_params = serde_json::json!({ "tool": "claude", "agent_id": "default" });
+        inject_approvals_signal(&mut run_params, &ctx, "implementation");
+
+        assert_eq!(
+            run_params.pointer("/approvals").and_then(Value::as_bool),
+            Some(true),
+            "approvals must be set when the phase agent profile carries an approval_policy"
+        );
+    }
+
+    #[test]
+    fn inject_approvals_signal_absent_when_profile_has_no_approval_policy() {
+        let workflow_config = workflow_config_with_phase_agent("implementation", "default");
+        let agent_runtime_config = agent_runtime_config_with_approval_policy("default", false);
+        let ctx = RuntimeConfigContext { agent_runtime_config, workflow_config };
+
+        let mut run_params = serde_json::json!({ "tool": "claude", "agent_id": "default" });
+        inject_approvals_signal(&mut run_params, &ctx, "implementation");
+
+        assert!(
+            run_params.pointer("/approvals").is_none(),
+            "approvals must NOT be set when no approval_policy is present (the agent_id pin alone must not trigger it)"
+        );
+    }
+
+    #[test]
+    fn stamp_approvals_on_runtime_contract_set_when_policy_present_else_absent() {
+        let workflow_config = workflow_config_with_phase_agent("implementation", "default");
+        let ctx = RuntimeConfigContext {
+            agent_runtime_config: agent_runtime_config_with_approval_policy("default", true),
+            workflow_config,
+        };
+        let mut runtime_contract = serde_json::json!({ "cli": {}, "mcp": {} });
+        stamp_approvals_on_runtime_contract(&mut runtime_contract, &ctx, "implementation");
+        assert_eq!(
+            runtime_contract.pointer("/approvals").and_then(Value::as_bool),
+            Some(true),
+            "runtime_contract.approvals must be stamped when the profile has an approval_policy (always-forwarded channel)"
+        );
+
+        let workflow_config_no = workflow_config_with_phase_agent("implementation", "default");
+        let ctx_no = RuntimeConfigContext {
+            agent_runtime_config: agent_runtime_config_with_approval_policy("default", false),
+            workflow_config: workflow_config_no,
+        };
+        let mut runtime_contract_no = serde_json::json!({ "cli": {}, "mcp": {} });
+        stamp_approvals_on_runtime_contract(&mut runtime_contract_no, &ctx_no, "implementation");
+        assert!(
+            runtime_contract_no.pointer("/approvals").is_none(),
+            "runtime_contract.approvals must NOT be stamped when no approval_policy is present"
+        );
+    }
+
+    #[test]
+    fn inject_approvals_signal_set_from_workflow_overlay_profile() {
+        let mut workflow_config = workflow_config_with_phase_agent("implementation", "wf-agent");
+        let overlay = orchestrator_config::agent_runtime_config::AgentProfileOverlay {
+            approval_policy: Some(orchestrator_config::agent_runtime_config::ApprovalPolicy::default()),
+            ..Default::default()
+        };
+        workflow_config.config.agent_profiles.insert("wf-agent".to_string(), overlay);
+        let ctx = RuntimeConfigContext { agent_runtime_config: builtin_agent_runtime_config(), workflow_config };
+
+        let mut run_params = serde_json::json!({ "tool": "claude", "agent_id": "wf-agent" });
+        inject_approvals_signal(&mut run_params, &ctx, "implementation");
+
+        assert_eq!(
+            run_params.pointer("/approvals").and_then(Value::as_bool),
+            Some(true),
+            "approvals must be set when the workflow-overlay agent profile carries an approval_policy"
+        );
+    }
 
     #[test]
     fn inject_workflow_mcp_servers_includes_phase_bound_pack_servers() {
@@ -1264,6 +1604,140 @@ mod tests {
             arg_strings,
             vec!["--from-host", "--json"],
             "host-supplied stdio_args_json must override the project-root fallback"
+        );
+    }
+
+    /// CHANGE P-A: the default animus stdio MCP server must be injected for a
+    /// `supports_mcp` runtime contract so every MCP-capable agent receives the
+    /// `request_approval` / `animus.agent.ask` channel. Uses a host-supplied
+    /// `stdio_command` so resolution is deterministic regardless of the test
+    /// environment's PATH / sibling binary.
+    #[test]
+    fn inject_default_stdio_mcp_injected_for_supports_mcp_contract() {
+        let mut runtime_contract = serde_json::json!({
+            "cli": { "capabilities": { "supports_mcp": true } },
+            "mcp": {}
+        });
+        let mcp_config = protocol::McpRuntimeConfig {
+            stdio_command: Some("/opt/host/bin/animus".to_string()),
+            ..Default::default()
+        };
+        inject_default_stdio_mcp_with_config(&mut runtime_contract, "/tmp/project", &mcp_config);
+
+        assert_eq!(
+            runtime_contract.pointer("/mcp/stdio/command").and_then(Value::as_str),
+            Some("/opt/host/bin/animus"),
+            "the animus stdio MCP server must be injected for a supports_mcp contract"
+        );
+        assert_eq!(
+            runtime_contract.pointer("/mcp/agent_id").and_then(Value::as_str),
+            Some("animus"),
+            "the injected stdio server must be bound to the primary `animus` agent id"
+        );
+    }
+
+    /// codex P1 follow-up: when an agent profile id is supplied, the default
+    /// `mcp serve` args must pin `--agent-id <id>` so the blocking approval /
+    /// question tools evaluate that profile's policy (not the generic `agent`
+    /// fallback). codex P2 follow-up: a resolved stdio command must also flip
+    /// `enforce_only` and seed `allowed_tool_prefixes` so providers perform
+    /// native MCP setup even when the binary came from ANIMUS_BIN / PATH /
+    /// sibling rather than a host-supplied stdio_command.
+    #[test]
+    fn expand_allowed_tool_prefixes_covers_additional_servers_under_enforce_only() {
+        let mut runtime_contract = serde_json::json!({
+            "mcp": {
+                "enforce_only": true,
+                "allowed_tool_prefixes": ["animus.", "mcp__animus__"],
+                "additional_servers": {
+                    "linear": { "command": "node" },
+                    "my-tool": { "command": "node" }
+                }
+            }
+        });
+        expand_allowed_tool_prefixes_for_additional_servers(&mut runtime_contract);
+        let prefixes: Vec<&str> = runtime_contract
+            .pointer("/mcp/allowed_tool_prefixes")
+            .and_then(Value::as_array)
+            .expect("prefixes")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(prefixes.contains(&"animus."), "primary animus prefix must be preserved");
+        assert!(prefixes.contains(&"linear."), "additional server prefix must be added");
+        assert!(prefixes.contains(&"mcp__linear__"), "mcp__ variant must be added");
+        assert!(prefixes.contains(&"my-tool."), "hyphenated server prefix must be added");
+        assert!(prefixes.contains(&"my_tool."), "snake_case variant of hyphenated server must be added");
+    }
+
+    #[test]
+    fn expand_allowed_tool_prefixes_is_noop_without_enforce_only() {
+        let mut runtime_contract = serde_json::json!({
+            "mcp": {
+                "additional_servers": { "linear": { "command": "node" } }
+            }
+        });
+        expand_allowed_tool_prefixes_for_additional_servers(&mut runtime_contract);
+        assert!(
+            runtime_contract.pointer("/mcp/allowed_tool_prefixes").is_none(),
+            "no prefixes should be seeded when enforce_only is not set (additional servers are unrestricted)"
+        );
+    }
+
+    #[test]
+    fn inject_default_stdio_mcp_for_agent_pins_agent_id_and_enforces() {
+        let mut runtime_contract = serde_json::json!({
+            "cli": { "capabilities": { "supports_mcp": true } },
+            "mcp": {}
+        });
+        // No host stdio_command: resolution falls to ANIMUS_BIN. Point it at a
+        // real existing path so the resolver returns it deterministically.
+        std::env::set_var("ANIMUS_BIN", "/bin/sh");
+        let mcp_config = protocol::McpRuntimeConfig::default();
+        inject_default_stdio_mcp_for_agent(&mut runtime_contract, "/tmp/project", &mcp_config, Some("swe"));
+        std::env::remove_var("ANIMUS_BIN");
+
+        assert_eq!(
+            runtime_contract.pointer("/mcp/stdio/command").and_then(Value::as_str),
+            Some("/bin/sh"),
+            "ANIMUS_BIN must resolve the stdio MCP binary when no host stdio_command is supplied"
+        );
+        let args = runtime_contract
+            .pointer("/mcp/stdio/args")
+            .and_then(Value::as_array)
+            .expect("stdio args")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        let agent_id_pos = args.iter().position(|a| *a == "--agent-id").expect("--agent-id must be pinned");
+        assert_eq!(args.get(agent_id_pos + 1), Some(&"swe"), "the phase agent profile id must follow --agent-id");
+        assert_eq!(
+            runtime_contract.pointer("/mcp/enforce_only").and_then(Value::as_bool),
+            Some(true),
+            "a resolved stdio command must enable mcp.enforce_only so providers do native MCP setup"
+        );
+        let prefixes =
+            runtime_contract.pointer("/mcp/allowed_tool_prefixes").and_then(Value::as_array).expect("prefixes");
+        assert!(!prefixes.is_empty(), "allowed_tool_prefixes must be seeded alongside enforce_only");
+    }
+
+    /// CHANGE P-A: a contract that does NOT advertise `supports_mcp` must not
+    /// receive the stdio injection (the gate is intentional — see the inline
+    /// note in `inject_default_stdio_mcp_with_config`).
+    #[test]
+    fn inject_default_stdio_mcp_skipped_when_supports_mcp_false() {
+        let mut runtime_contract = serde_json::json!({
+            "cli": { "capabilities": { "supports_mcp": false } },
+            "mcp": {}
+        });
+        let mcp_config = protocol::McpRuntimeConfig {
+            stdio_command: Some("/opt/host/bin/animus".to_string()),
+            ..Default::default()
+        };
+        inject_default_stdio_mcp_with_config(&mut runtime_contract, "/tmp/project", &mcp_config);
+        assert!(
+            runtime_contract.pointer("/mcp/stdio").is_none(),
+            "stdio injection must be skipped when the CLI does not advertise supports_mcp"
         );
     }
 

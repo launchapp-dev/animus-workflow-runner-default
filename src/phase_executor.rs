@@ -17,10 +17,11 @@ use crate::phase_prompt::{
 };
 use crate::phase_targets::PhaseTargetPlanner;
 use crate::runtime_contract::{
-    apply_phase_capability_launch_flags, inject_agent_tool_policy, inject_default_stdio_mcp_with_config,
-    inject_memory_mcp_for_capable_agent, inject_named_mcp_servers, inject_project_mcp_servers,
-    inject_response_schema_into_launch_args, inject_workflow_mcp_servers, phase_output_json_schema_for,
-    phase_response_json_schema_for, set_mcp_tool_policy,
+    apply_phase_capability_launch_flags, expand_allowed_tool_prefixes_for_additional_servers, inject_agent_tool_policy,
+    inject_approvals_signal, inject_default_stdio_mcp_for_agent, inject_memory_mcp_for_capable_agent,
+    inject_named_mcp_servers, inject_project_mcp_servers, inject_response_schema_into_launch_args,
+    inject_workflow_mcp_servers, phase_output_json_schema_for, phase_response_json_schema_for, set_mcp_tool_policy,
+    stamp_approvals_on_runtime_contract,
 };
 use crate::runtime_support::{
     inject_cli_launch_env, inject_cli_launch_overrides, phase_max_continuations, phase_runner_attempts,
@@ -1772,6 +1773,28 @@ async fn run_workflow_phase_with_agent(params: PhaseAgentParams<'_>) -> Result<A
                         .expect("json object")
                         .insert("agent_id".to_string(), serde_json::json!(agent_id));
                 }
+                // CHANGE P-B: set the top-level `approvals` run param IFF the
+                // phase's agent profile carries an `approval_policy`. Mirrors
+                // the kernel's `animus agent run` path
+                // (`provider_client.rs`: `extras.insert("approvals", true)`
+                // when the profile has an `approval_policy`). `context` becomes
+                // `SessionRequest.extras`, where the provider transports read
+                // `extras.approvals` (acp: `approvals_enabled`).
+                //
+                // BRIDGE DEPENDENCY (codex P2): the daemon's installed kernel
+                // must carry top-level `extras` keys across
+                // `PluginSessionBackend::build_run_params` for this flag to
+                // reach the provider. That forwarding is kernel fix f6ce11f;
+                // kernel revs WITHOUT it forward only a fixed whitelist
+                // (`runtime_contract`, `system_prompt`, ...) and DROP
+                // `approvals`. We set the flag on the canonical channel the
+                // kernel reference uses and rely on the installed kernel
+                // (>= f6ce11f) to forward it — we do not bump the build-time
+                // pin (it only fixes the byte-identical session wire types).
+                // The agent-id pin on the injected MCP server (below) is the
+                // independent, always-forwarded signal that providers also key
+                // approvals on via `runtime_contract.mcp.agent_id`.
+                inject_approvals_signal(&mut context, ctx, phase_id);
                 // codex P2 #1 follow-up: resolve the effective MCP runtime
                 // config once at the top of the attempt loop so we can pass
                 // host-supplied `endpoint` / `agent_id` into the runtime
@@ -1817,10 +1840,11 @@ async fn run_workflow_phase_with_agent(params: PhaseAgentParams<'_>) -> Result<A
                     // endpoint/agent_id threaded above). When no host override
                     // is supplied (CLI path, tests), fall back to the default
                     // config — matching pre-fix behavior.
-                    inject_default_stdio_mcp_with_config(
+                    inject_default_stdio_mcp_for_agent(
                         &mut runtime_contract,
                         project_root,
                         effective_mcp_runtime_config,
+                        ctx.phase_agent_id(phase_id).as_deref(),
                     );
                     inject_agent_tool_policy(&mut runtime_contract, ctx, phase_id);
                     inject_project_mcp_servers(&mut runtime_contract, project_root, ctx, phase_id);
@@ -1836,11 +1860,24 @@ async fn run_workflow_phase_with_agent(params: PhaseAgentParams<'_>) -> Result<A
                         &applied_skills.application.mcp_servers,
                     )?;
                     inject_memory_mcp_for_capable_agent(&mut runtime_contract, project_root, ctx, phase_id);
+                    // CHANGE P-B (durable channel): also stamp `approvals` onto
+                    // the runtime_contract, which `build_run_params` ALWAYS
+                    // forwards (unlike the top-level extras key, which needs
+                    // kernel f6ce11f). Reaches the provider as
+                    // `extras.runtime_contract.approvals`.
+                    stamp_approvals_on_runtime_contract(&mut runtime_contract, ctx, phase_id);
                     skill_dispatch::inject_skill_overrides(
                         &mut runtime_contract,
                         &effective_tool_id,
                         &applied_skills.application,
                     );
+                    // codex P2 follow-up: now that ALL additional MCP servers
+                    // are injected, expand `allowed_tool_prefixes` to cover
+                    // them. The default stdio injection seeds prefixes only for
+                    // the primary `animus` server; under `enforce_only` the
+                    // agent runner would otherwise reject tool calls to the
+                    // configured project/workflow/skill/memory servers.
+                    expand_allowed_tool_prefixes_for_additional_servers(&mut runtime_contract);
                     let claude_profile_env =
                         resolve_claude_profile_env(&effective_tool_id, phase_runtime_settings, global_config.as_ref())?;
                     inject_cli_launch_env(&mut runtime_contract, &claude_profile_env);
