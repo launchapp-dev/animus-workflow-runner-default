@@ -1178,6 +1178,77 @@ mod tests {
         }
     }
 
+    /// Build a `LoadedWorkflowConfig` whose `phase_id` phase defines an explicit
+    /// agent-mode phase carrying the supplied `decision_contract`. v0.6 ships
+    /// zero built-in phase content, so the decision-schema tests can no longer
+    /// lean on `builtin_workflow_config()` for an "implementation" phase — they
+    /// construct the phase (and its decision contract) here instead.
+    fn workflow_config_with_decision_contract(
+        phase_id: &str,
+        decision_contract: orchestrator_config::agent_runtime_config::PhaseDecisionContract,
+    ) -> LoadedWorkflowConfig {
+        use orchestrator_config::agent_runtime_config::{Idempotency, PhaseExecutionDefinition, PhaseExecutionMode};
+        let mut workflow_config = builtin_workflow_config();
+        let phase_definition = PhaseExecutionDefinition {
+            mode: PhaseExecutionMode::Agent,
+            agent_id: Some("default".to_string()),
+            directive: None,
+            system_prompt: None,
+            runtime: None,
+            capabilities: None,
+            output_contract: None,
+            output_json_schema: None,
+            decision_contract: Some(decision_contract),
+            retry: None,
+            skills: Vec::new(),
+            command: None,
+            manual: None,
+            default_tool: None,
+            idempotency: Idempotency::Unknown,
+            evals: None,
+            worktree: None,
+        };
+        workflow_config.phase_definitions.insert(phase_id.to_string(), phase_definition);
+        LoadedWorkflowConfig {
+            metadata: WorkflowConfigMetadata {
+                schema: workflow_config.schema.clone(),
+                version: workflow_config.version,
+                hash: workflow_config_hash(&workflow_config),
+                source: WorkflowConfigSource::Builtin,
+            },
+            config: workflow_config,
+            path: PathBuf::from("builtin"),
+        }
+    }
+
+    /// A decision contract that requires at least one evidence entry (so the
+    /// generated schema lists `evidence` as required), mirroring the old
+    /// built-in "implementation" phase the evidence-kind tests exercised.
+    fn decision_contract_with_required_evidence() -> orchestrator_config::agent_runtime_config::PhaseDecisionContract {
+        orchestrator_config::agent_runtime_config::PhaseDecisionContract {
+            required_evidence: vec![protocol::orchestrator::PhaseEvidenceKind::FilesModified],
+            min_confidence: 0.6,
+            max_risk: orchestrator_core::WorkflowDecisionRisk::Medium,
+            allow_missing_decision: false,
+            extra_json_schema: None,
+            fields: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// A decision contract with no required evidence (so `evidence` is optional
+    /// in the generated schema).
+    fn decision_contract_without_required_evidence() -> orchestrator_config::agent_runtime_config::PhaseDecisionContract
+    {
+        orchestrator_config::agent_runtime_config::PhaseDecisionContract {
+            required_evidence: Vec::new(),
+            min_confidence: 0.6,
+            max_risk: orchestrator_core::WorkflowDecisionRisk::Medium,
+            allow_missing_decision: true,
+            extra_json_schema: None,
+            fields: std::collections::BTreeMap::new(),
+        }
+    }
+
     fn agent_runtime_config_with_memory(agent_id: &str, memory_enabled: bool) -> orchestrator_core::AgentRuntimeConfig {
         let mut config = builtin_agent_runtime_config();
         let mut profile = config.agents.get(agent_id).cloned().unwrap_or_default();
@@ -1284,21 +1355,14 @@ mod tests {
 
     #[test]
     fn phase_decision_json_schema_accepts_any_evidence_kind() {
-        let workflow_config = builtin_workflow_config();
-
-        let loaded_workflow_config = LoadedWorkflowConfig {
-            metadata: WorkflowConfigMetadata {
-                schema: workflow_config.schema.clone(),
-                version: workflow_config.version,
-                hash: workflow_config_hash(&workflow_config),
-                source: WorkflowConfigSource::Builtin,
-            },
-            config: workflow_config,
-            path: PathBuf::from("builtin"),
-        };
+        // v0.6 ships zero built-in phase content, so define an "implementation"
+        // phase with a decision contract that has required_evidence set.
         let ctx = RuntimeConfigContext {
             agent_runtime_config: builtin_agent_runtime_config(),
-            workflow_config: loaded_workflow_config,
+            workflow_config: workflow_config_with_decision_contract(
+                "implementation",
+                decision_contract_with_required_evidence(),
+            ),
         };
 
         // Test with implementation phase which has required_evidence set
@@ -1328,21 +1392,14 @@ mod tests {
     fn phase_decision_validates_custom_evidence_kinds_like_bug_confirmed() {
         use crate::phase_executor::validate_basic_json_schema;
 
-        let workflow_config = builtin_workflow_config();
-
-        let loaded_workflow_config = LoadedWorkflowConfig {
-            metadata: WorkflowConfigMetadata {
-                schema: workflow_config.schema.clone(),
-                version: workflow_config.version,
-                hash: workflow_config_hash(&workflow_config),
-                source: WorkflowConfigSource::Builtin,
-            },
-            config: workflow_config,
-            path: PathBuf::from("builtin"),
-        };
+        // v0.6 ships zero built-in phase content; define an "implementation"
+        // phase whose decision contract requires evidence.
         let ctx = RuntimeConfigContext {
             agent_runtime_config: builtin_agent_runtime_config(),
-            workflow_config: loaded_workflow_config,
+            workflow_config: workflow_config_with_decision_contract(
+                "implementation",
+                decision_contract_with_required_evidence(),
+            ),
         };
 
         let schema = phase_decision_json_schema_for(&ctx, "implementation")
@@ -1379,21 +1436,14 @@ mod tests {
     fn phase_decision_evidence_field_optional_when_no_required_evidence() {
         use crate::phase_executor::validate_basic_json_schema;
 
-        let workflow_config = builtin_workflow_config();
-
-        let loaded_workflow_config = LoadedWorkflowConfig {
-            metadata: WorkflowConfigMetadata {
-                schema: workflow_config.schema.clone(),
-                version: workflow_config.version,
-                hash: workflow_config_hash(&workflow_config),
-                source: WorkflowConfigSource::Builtin,
-            },
-            config: workflow_config,
-            path: PathBuf::from("builtin"),
-        };
+        // v0.6 ships zero built-in phase content; define an "implementation"
+        // phase whose decision contract has no required evidence.
         let ctx = RuntimeConfigContext {
             agent_runtime_config: builtin_agent_runtime_config(),
-            workflow_config: loaded_workflow_config,
+            workflow_config: workflow_config_with_decision_contract(
+                "implementation",
+                decision_contract_without_required_evidence(),
+            ),
         };
 
         let schema = phase_decision_json_schema_for(&ctx, "implementation")

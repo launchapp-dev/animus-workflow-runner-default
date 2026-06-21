@@ -376,10 +376,35 @@ mod tests {
 
     #[test]
     fn resolve_phase_skills_reports_missing_skill_in_runtime_path() {
+        use orchestrator_config::agent_runtime_config::{Idempotency, PhaseExecutionDefinition, PhaseExecutionMode};
+
         let temp = tempfile::tempdir().expect("tempdir");
+        // v0.6 ships zero built-in phase content, so define the "implementation"
+        // phase explicitly on the agent-runtime config to exercise the runtime
+        // skill-resolution path with a missing skill.
         let mut runtime = builtin_agent_runtime_config();
-        runtime.phases.get_mut("implementation").expect("implementation phase").skills =
-            vec!["missing-runtime-skill".to_string()];
+        runtime.phases.insert(
+            "implementation".to_string(),
+            PhaseExecutionDefinition {
+                mode: PhaseExecutionMode::Agent,
+                agent_id: Some("default".to_string()),
+                directive: None,
+                system_prompt: None,
+                runtime: None,
+                capabilities: None,
+                output_contract: None,
+                output_json_schema: None,
+                decision_contract: None,
+                retry: None,
+                skills: vec!["missing-runtime-skill".to_string()],
+                command: None,
+                manual: None,
+                default_tool: None,
+                idempotency: Idempotency::Unknown,
+                evals: None,
+                worktree: None,
+            },
+        );
         let workflow = builtin_workflow_config();
         let ctx = RuntimeConfigContext {
             agent_runtime_config: runtime,
