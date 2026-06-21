@@ -30,12 +30,12 @@ animus-workflow-runner-protocol = { git = "https://github.com/launchapp-dev/anim
 # `protocol`, `orchestrator-core`, and `orchestrator-plugin-host` are in-tree
 # path deps inside the kernel workspace, so they have no standalone published
 # tag — pin them to the kernel git rev instead. -------------------------------
-animus-plugin-protocol      = { git = "https://github.com/launchapp-dev/animus-cli", rev = "329044dc1cdebf825e7ffbe6c2fb6499db8b542b" }
-protocol                    = { git = "https://github.com/launchapp-dev/animus-cli", rev = "329044dc1cdebf825e7ffbe6c2fb6499db8b542b", package = "protocol" }
-orchestrator-core          = { git = "https://github.com/launchapp-dev/animus-cli", rev = "329044dc1cdebf825e7ffbe6c2fb6499db8b542b" }
-orchestrator-config        = { git = "https://github.com/launchapp-dev/animus-cli", rev = "329044dc1cdebf825e7ffbe6c2fb6499db8b542b" }
-orchestrator-plugin-host   = { git = "https://github.com/launchapp-dev/animus-cli", rev = "329044dc1cdebf825e7ffbe6c2fb6499db8b542b" }
-orchestrator-logging       = { git = "https://github.com/launchapp-dev/animus-cli", rev = "329044dc1cdebf825e7ffbe6c2fb6499db8b542b" }
+animus-plugin-protocol      = { git = "https://github.com/launchapp-dev/animus-cli", rev = "f089a3908cd431b8791d0676e52af8db4898e01b" }
+protocol                    = { git = "https://github.com/launchapp-dev/animus-cli", rev = "f089a3908cd431b8791d0676e52af8db4898e01b", package = "protocol" }
+orchestrator-core          = { git = "https://github.com/launchapp-dev/animus-cli", rev = "f089a3908cd431b8791d0676e52af8db4898e01b" }
+orchestrator-config        = { git = "https://github.com/launchapp-dev/animus-cli", rev = "f089a3908cd431b8791d0676e52af8db4898e01b" }
+orchestrator-plugin-host   = { git = "https://github.com/launchapp-dev/animus-cli", rev = "f089a3908cd431b8791d0676e52af8db4898e01b" }
+orchestrator-logging       = { git = "https://github.com/launchapp-dev/animus-cli", rev = "f089a3908cd431b8791d0676e52af8db4898e01b" }
 
 # --- stdlib-ish deps (move with the crate) ----------------------------------
 anyhow = "1.0"
