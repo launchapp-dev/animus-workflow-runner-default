@@ -1029,6 +1029,11 @@ async fn process_phase_event_stream(
     let mut pending_commit_message: Option<String> = None;
     let mut pending_phase_decision: Option<orchestrator_core::PhaseDecision> = None;
     let mut pending_result_payload: Option<Value> = None;
+    // Full assistant output, accumulated across chunks. Reasoning + tool-calling
+    // models stream the result object across multiple chunks, often after a long
+    // prose-and-reasoning preamble, so capture must scan the WHOLE output (not a
+    // single chunk) and keep the latest valid object (not the first match).
+    let mut accumulated_output = String::new();
     let mut provider_exhaustion_reason: Option<String> = None;
     let mut diagnostics = VecDeque::new();
     // Once the sidecar has yielded a session id (or the caller didn't ask
@@ -1199,11 +1204,12 @@ async fn process_phase_event_stream(
                         pending_phase_decision = Some(decision);
                     }
                 }
-                if pending_result_payload.is_none() {
-                    pending_result_payload = parse_result_payload_from_text(&text, expected_result_kind);
-                }
-                if pending_result_payload.is_none() && parse_phase_decision {
-                    pending_result_payload = parse_decision_payload_from_text(&text, phase_id);
+                accumulated_output.push_str(&text);
+                accumulated_output.push('\n');
+                if let Some(result) = parse_result_payload_from_text(&accumulated_output, expected_result_kind) {
+                    pending_result_payload = Some(result);
+                } else if pending_result_payload.is_none() && parse_phase_decision {
+                    pending_result_payload = parse_decision_payload_from_text(&accumulated_output, phase_id);
                 }
             }
             AgentRunEvent::Thinking { content, .. } => {
@@ -1224,11 +1230,12 @@ async fn process_phase_event_stream(
                         pending_phase_decision = Some(decision);
                     }
                 }
-                if pending_result_payload.is_none() {
-                    pending_result_payload = parse_result_payload_from_text(&content, expected_result_kind);
-                }
-                if pending_result_payload.is_none() && parse_phase_decision {
-                    pending_result_payload = parse_decision_payload_from_text(&content, phase_id);
+                accumulated_output.push_str(&content);
+                accumulated_output.push('\n');
+                if let Some(result) = parse_result_payload_from_text(&accumulated_output, expected_result_kind) {
+                    pending_result_payload = Some(result);
+                } else if pending_result_payload.is_none() && parse_phase_decision {
+                    pending_result_payload = parse_decision_payload_from_text(&accumulated_output, phase_id);
                 }
             }
             AgentRunEvent::Error { error, .. } => {
@@ -1290,9 +1297,82 @@ async fn process_phase_event_stream(
 }
 
 fn parse_result_payload_from_text(text: &str, expected_kind: &str) -> Option<Value> {
+    // Reasoning + tool-calling models emit prose, reasoning, and tool-call noise
+    // before the real answer, often with the result object pretty-printed across
+    // many lines. Scan every balanced `{...}` span (not just whole JSON lines)
+    // and keep the LAST one matching the expected kind — the authoritative result
+    // is emitted last.
+    let mut last = None;
+    for payload in collect_balanced_json_objects(text) {
+        if let Some(result) = parse_result_payload_from_payload(&payload, expected_kind) {
+            last = Some(result);
+        }
+    }
+    if last.is_some() {
+        return last;
+    }
+    // Fallback: the legacy whole-line scan also covers top-level arrays / JSONL.
     for (_raw, payload) in collect_json_payload_lines(text) {
         if let Some(result) = parse_result_payload_from_payload(&payload, expected_kind) {
             return Some(result);
+        }
+    }
+    None
+}
+
+/// Scan `text` for every balanced `{...}` span that parses as a JSON object, in
+/// document order. Unlike a whole-line scan this tolerates prose around the
+/// JSON, pretty-printed / multi-line objects, and objects embedded mid-line.
+/// Brace counting respects JSON string literals so `{` / `}` inside string
+/// values (e.g. song lyrics) don't throw off the span.
+fn collect_balanced_json_objects(text: &str) -> Vec<Value> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            if let Some(end) = balanced_object_end(bytes, i) {
+                if let Ok(value) = serde_json::from_str::<Value>(&text[i..=end]) {
+                    if value.is_object() {
+                        out.push(value);
+                    }
+                }
+                i = end + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Index of the `}` closing the object opened at `start` (`bytes[start] == b'{'`),
+/// or `None` if unbalanced. Skips braces inside JSON string literals.
+fn balanced_object_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, &c) in bytes.iter().enumerate().skip(start) {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if c == b'\\' {
+                escaped = true;
+            } else if c == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(offset);
+                }
+            }
+            _ => {}
         }
     }
     None
@@ -2495,6 +2575,31 @@ mod tests {
     use crate::runtime_support::{inject_cli_launch_env, WorkflowPhaseRuntimeSettings};
 
     use std::collections::BTreeMap;
+
+    #[test]
+    fn parse_result_payload_recovers_from_prose_and_multiline_json() {
+        // A reasoning model: prose preamble, then a pretty-printed object whose
+        // string values contain braces. The legacy whole-line scan missed all of
+        // these; the balanced-brace scan recovers the result.
+        let text = "I'll write the song now.\n{\n  \"kind\": \"lyrics_result\",\n  \"lyrics\": \"la {la} la\\nsecond line\",\n  \"title\": \"Mia\"\n}\nDone!";
+        let got = super::parse_result_payload_from_text(text, "lyrics_result").expect("result captured");
+        assert_eq!(got.get("title").and_then(serde_json::Value::as_str), Some("Mia"));
+    }
+
+    #[test]
+    fn parse_result_payload_prefers_the_last_object_over_an_earlier_stub() {
+        // Planning stub first, authoritative object last — the last match wins.
+        let text = "Plan: {\"kind\":\"lyrics_result\"}\n...thinking...\n{\"kind\":\"lyrics_result\",\"lyrics\":\"real lyrics\",\"title\":\"Real\"}";
+        let got = super::parse_result_payload_from_text(text, "lyrics_result").expect("result captured");
+        assert_eq!(got.get("lyrics").and_then(serde_json::Value::as_str), Some("real lyrics"));
+    }
+
+    #[test]
+    fn parse_result_payload_ignores_tool_call_noise_before_the_result() {
+        let text = "<|tool_call|>functions.shell {\"command\":\"find /app\"}<|end|>\n{\"kind\":\"lyrics_result\",\"lyrics\":\"abc\",\"title\":\"T\"}";
+        let got = super::parse_result_payload_from_text(text, "lyrics_result").expect("result captured");
+        assert_eq!(got.get("title").and_then(serde_json::Value::as_str), Some("T"));
+    }
 
     #[test]
     fn initial_attempt_starts_a_fresh_native_session() {
