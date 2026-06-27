@@ -8,7 +8,7 @@ use crate::phase_command::{
     build_command_phase_decision, build_command_result_payload, run_workflow_phase_with_command,
     CommandExecutionContext,
 };
-use crate::phase_failover::PhaseFailureClassifier;
+use crate::phase_failover::{failure_token, retry_decision_for_token, PhaseFailureClassifier};
 use crate::phase_git::commit_implementation_changes;
 use crate::phase_output::persist_phase_output;
 use crate::phase_prompt::{
@@ -499,6 +499,10 @@ fn session_request_from_agent_request(project_root: &str, request: &AgentRunRequ
         cwd,
         project_root: Some(PathBuf::from(project_root)),
         mcp_endpoint: None,
+        // Mirror the kernel's `session_request_from_args`: lift the
+        // `mcp_servers` payload to the top level so the plugin host reads it
+        // from the typed field, not just `extras`.
+        mcp_servers: context.get("mcp_servers").cloned(),
         permission_mode,
         timeout_secs: request.timeout_secs,
         env_vars: Vec::new(),
@@ -569,6 +573,21 @@ fn session_event_to_agent_event(event: SessionEvent, run_id: &RunId) -> AgentRun
         SessionEvent::Finished { exit_code } => {
             AgentRunEvent::Finished { run_id: run_id.clone(), exit_code, duration_ms: 0 }
         }
+        // HITL interaction frames (added in v0.1.13.5) are informational on the
+        // legacy event stream — the actual approval/question decision flows
+        // through the MCP keystone, not here. Surface them as stderr output so
+        // they're auditable without affecting run status. Mirrors the kernel's
+        // `provider_client::to_agent_event`.
+        SessionEvent::InteractionRequested { id, kind } => AgentRunEvent::OutputChunk {
+            run_id: run_id.clone(),
+            stream_type: OutputStreamType::Stderr,
+            text: format!("[interaction requested] id={id} kind={kind}"),
+        },
+        SessionEvent::InteractionResolved { id, decision } => AgentRunEvent::OutputChunk {
+            run_id: run_id.clone(),
+            stream_type: OutputStreamType::Stderr,
+            text: format!("[interaction resolved] id={id} decision={decision}"),
+        },
     }
 }
 
@@ -2005,17 +2024,48 @@ async fn run_workflow_phase_with_agent(params: PhaseAgentParams<'_>) -> Result<A
                         // the I/O condition and retry the workflow.
                         let is_checkpoint_io_failure = error.downcast_ref::<DispatchRetryableError>().is_some()
                             || error.downcast_ref::<TerminalCheckpointError>().is_some();
-                        let should_retry = attempt < max_attempts
-                            && !is_checkpoint_io_failure
-                            && PhaseFailureClassifier::is_transient_runner_error_message(&message);
+
+                        // Author-configurable retry classification. The two
+                        // outer hard guards (`attempt < max_attempts` and the
+                        // checkpoint-IO block) are NON-overridable — config
+                        // `no_retry_on` / `retry_on` cannot force a retry of a
+                        // checkpoint-IO failure or exceed the attempt cap.
+                        // Within those guards, `retry_decision_for_token`
+                        // applies: no_retry_on > retry_on allowlist > default
+                        // transient classifier.
+                        let token = failure_token(&message);
+                        let is_transient = PhaseFailureClassifier::is_transient_runner_error_message(&message);
+                        let retry_on = phase_runtime_settings.map(|s| s.retry_on.as_slice()).unwrap_or(&[]);
+                        let no_retry_on = phase_runtime_settings.map(|s| s.no_retry_on.as_slice()).unwrap_or(&[]);
+                        let config_decision = retry_decision_for_token(token, retry_on, no_retry_on, is_transient);
+                        // Log only when config flips the default decision.
+                        if config_decision != is_transient {
+                            if config_decision {
+                                info!(
+                                    workflow_id = %workflow_id,
+                                    phase_id = %phase_id,
+                                    failure_token = token,
+                                    "retry allowed by retry_on (non-default)"
+                                );
+                            } else {
+                                info!(
+                                    workflow_id = %workflow_id,
+                                    phase_id = %phase_id,
+                                    failure_token = token,
+                                    "retry suppressed by no_retry_on/retry_on (non-default)"
+                                );
+                            }
+                        }
+                        let should_retry = attempt < max_attempts && !is_checkpoint_io_failure && config_decision;
                         if should_retry {
                             warn!(
                                 workflow_id = %workflow_id,
                                 phase_id = %phase_id,
                                 attempt,
                                 max_attempts,
+                                failure_token = token,
                                 error = %message,
-                                "Transient runner error on phase attempt; retrying"
+                                "Retryable phase failure; retrying"
                             );
                             sleep(backoff).await;
                             backoff = std::cmp::min(backoff.saturating_mul(2), Duration::from_secs(3));
@@ -2332,6 +2382,15 @@ async fn run_workflow_phase_inner(params: &PhaseRunParams<'_>) -> Result<PhaseRu
                 extra_args: merged_runtime.phase_extra_args(phase_id),
                 codex_config_overrides: merged_runtime.phase_codex_config_overrides(phase_id),
                 max_continuations: merged_runtime.phase_max_continuations(phase_id),
+                // Sourced through `merged_runtime` to match the sibling
+                // `max_attempts` / `web_search` / `timeout_secs` accessors.
+                // TODO(codex-p2): like those siblings, these do not yet honor
+                // workflow-YAML `runtime.{retry_on,no_retry_on}` overlays
+                // (only tool/model/fallbacks read through `ctx`); add
+                // `RuntimeConfigContext::phase_{retry,no_retry}_on` accessors
+                // in a follow-up to plumb YAML phase-local retry policy.
+                no_retry_on: merged_runtime.phase_no_retry_on(phase_id),
+                retry_on: merged_runtime.phase_retry_on(phase_id),
             });
             let agent_result = run_workflow_phase_with_agent(PhaseAgentParams {
                 ctx: &ctx,

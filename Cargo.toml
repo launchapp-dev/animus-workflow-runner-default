@@ -15,27 +15,30 @@ name = "animus-workflow-runner-default"
 path = "src/main.rs"
 
 [dependencies]
-# --- protocol crates — pinned to the SAME animus-protocol tags the current
-# animus-cli kernel (HEAD 329044dc) resolves to, so the runner speaks the
-# byte-identical session wire protocol as the kernel and the installed
-# provider plugins (built against v0.1.13.x). ---------------------------------
-animus-session-backend      = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.1.13" }
-animus-subject-protocol     = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.5.7" }
-animus-workflow-runner-protocol = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.5.1" }
+# --- protocol crates — pinned to animus-protocol tag v0.1.24, the SAME tag
+# ao-cli@42c28643 resolves ALL its protocol/wire crates to. As of v0.6.1 the
+# `protocol` and `animus-plugin-protocol` crates moved OUT of the ao-cli repo
+# into launchapp-dev/animus-protocol, so they are pinned by tag here too (not
+# by ao-cli rev). Keeping every protocol crate on the single v0.1.24 tag
+# avoids duplicate-crate / type-mismatch errors with orchestrator-core's
+# transitive deps (the tag-unification hazard). ------------------------------
+animus-session-backend      = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.1.24" }
+animus-subject-protocol     = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.1.24" }
+animus-workflow-runner-protocol = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.1.24" }
+animus-plugin-protocol      = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.1.24" }
+protocol                    = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.1.24", package = "protocol" }
 
 # --- ao-cli kernel crates — pinned to the current HEAD rev. The session
 # dispatch types (`SessionBackendResolver`, `PluginSessionBackend`,
 # `SessionEvent`) must be byte-identical to the kernel's `animus agent run`
-# path, which is the proven-working reference. `animus-plugin-protocol`,
-# `protocol`, `orchestrator-core`, and `orchestrator-plugin-host` are in-tree
-# path deps inside the kernel workspace, so they have no standalone published
-# tag — pin them to the kernel git rev instead. -------------------------------
-animus-plugin-protocol      = { git = "https://github.com/launchapp-dev/animus-cli", rev = "f089a3908cd431b8791d0676e52af8db4898e01b" }
-protocol                    = { git = "https://github.com/launchapp-dev/animus-cli", rev = "f089a3908cd431b8791d0676e52af8db4898e01b", package = "protocol" }
-orchestrator-core          = { git = "https://github.com/launchapp-dev/animus-cli", rev = "f089a3908cd431b8791d0676e52af8db4898e01b" }
-orchestrator-config        = { git = "https://github.com/launchapp-dev/animus-cli", rev = "f089a3908cd431b8791d0676e52af8db4898e01b" }
-orchestrator-plugin-host   = { git = "https://github.com/launchapp-dev/animus-cli", rev = "f089a3908cd431b8791d0676e52af8db4898e01b" }
-orchestrator-logging       = { git = "https://github.com/launchapp-dev/animus-cli", rev = "f089a3908cd431b8791d0676e52af8db4898e01b" }
+# path, which is the proven-working reference. `orchestrator-core`,
+# `orchestrator-config`, `orchestrator-plugin-host`, and `orchestrator-logging`
+# are in-tree path deps inside the kernel workspace, so they have no standalone
+# published tag — pin them to the kernel git rev instead. ---------------------
+orchestrator-core          = { git = "https://github.com/launchapp-dev/animus-cli", rev = "42c28643bb0393321ffa943f6c1b55ac85303368" }
+orchestrator-config        = { git = "https://github.com/launchapp-dev/animus-cli", rev = "42c28643bb0393321ffa943f6c1b55ac85303368" }
+orchestrator-plugin-host   = { git = "https://github.com/launchapp-dev/animus-cli", rev = "42c28643bb0393321ffa943f6c1b55ac85303368" }
+orchestrator-logging       = { git = "https://github.com/launchapp-dev/animus-cli", rev = "42c28643bb0393321ffa943f6c1b55ac85303368" }
 
 # --- stdlib-ish deps (move with the crate) ----------------------------------
 anyhow = "1.0"
