@@ -9,8 +9,8 @@
 use std::path::Path;
 
 use orchestrator_config::agent_runtime_config::{
-    AgentRuntimeOverrides, PhaseCommandDefinition, PhaseDecisionContract, PhaseExecutionDefinition, PhaseExecutionMode,
-    PhaseOutputContract,
+    AgentRuntimeOverrides, EvalsConfig, PhaseCommandDefinition, PhaseDecisionContract, PhaseExecutionDefinition,
+    PhaseExecutionMode, PhaseOutputContract,
 };
 use orchestrator_core::AgentRuntimeConfig;
 use protocol::PhaseCapabilities;
@@ -203,6 +203,52 @@ impl RuntimeConfigContext {
 
     pub fn phase_command(&self, phase_id: &str) -> Option<&PhaseCommandDefinition> {
         self.phase_execution(phase_id).and_then(|def| def.command.as_ref())
+    }
+
+    /// Returns the phase's eval gate. Workflow YAML wins, but a sparse YAML
+    /// phase definition that restates only fields like `agent_id`/`directive`
+    /// and omits `evals` must NOT mask a runtime-config eval gate — so this
+    /// falls back to `agent_runtime_config.phase_evals()` per-field (mirroring
+    /// the precedence pattern of the other accessors above). The enforcement
+    /// hook in `workflow_execute` reads this after a phase produces an
+    /// advancing decision.
+    pub fn phase_evals(&self, phase_id: &str) -> Option<&EvalsConfig> {
+        self.workflow_config
+            .config
+            .phase_definitions
+            .get(phase_id)
+            .and_then(|def| def.evals.as_ref())
+            .or_else(|| self.agent_runtime_config.phase_evals(phase_id))
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use super::RuntimeConfigContext;
+    use orchestrator_core::{
+        builtin_agent_runtime_config, builtin_workflow_config, workflow_config_hash, LoadedWorkflowConfig,
+        WorkflowConfigMetadata, WorkflowConfigSource,
+    };
+    use std::path::PathBuf;
+
+    /// Build a minimal `RuntimeConfigContext` whose agent runtime config
+    /// carries the supplied `tools_allowlist`. Used by the eval-gate command
+    /// check tests so they can run real `true`/`false` processes through the
+    /// allowlist guard without standing up a full project on disk.
+    pub fn ctx_with_allowlist(tools: &[&str]) -> RuntimeConfigContext {
+        let mut agent_runtime_config = builtin_agent_runtime_config();
+        agent_runtime_config.tools_allowlist = tools.iter().map(|t| t.to_string()).collect();
+        let workflow = builtin_workflow_config();
+        let metadata = WorkflowConfigMetadata {
+            schema: workflow.schema.clone(),
+            version: workflow.version,
+            hash: workflow_config_hash(&workflow),
+            source: WorkflowConfigSource::Builtin,
+        };
+        RuntimeConfigContext {
+            agent_runtime_config,
+            workflow_config: LoadedWorkflowConfig { metadata, config: workflow, path: PathBuf::from("builtin") },
+        }
     }
 }
 
