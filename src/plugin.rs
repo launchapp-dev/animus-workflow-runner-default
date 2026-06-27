@@ -218,6 +218,10 @@ pub fn plugin_initialize_result(params: &Value) -> Result<InitializeResult> {
             subject_kinds: Vec::new(),
             mcp_tools: Vec::new(),
         },
+        // Typed per-kind capability map (protocol v1.1.0+). Empty here keeps
+        // the v1.0.0 back-compat posture; the legacy `capabilities.methods`
+        // allowlist above remains authoritative for this runner.
+        kind_capabilities: std::collections::HashMap::new(),
     })
 }
 

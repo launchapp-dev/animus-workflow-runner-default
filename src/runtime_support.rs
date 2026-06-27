@@ -32,6 +32,19 @@ pub struct WorkflowPhaseRuntimeSettings {
     pub codex_config_overrides: Vec<String>,
     #[serde(default)]
     pub max_continuations: Option<usize>,
+    /// Author-configured failure tokens that should force a fail-fast (no
+    /// retry) even when the failure looks transient. Sourced from
+    /// `AgentRuntimeConfig::phase_no_retry_on`. Takes precedence over
+    /// `retry_on`. Cannot override the checkpoint-IO hard guard.
+    #[serde(default)]
+    pub no_retry_on: Vec<String>,
+    /// Author-configured failure-token allowlist. When non-empty, a phase is
+    /// retried IFF its failure token is in this list (lets authors opt classes
+    /// in beyond the default transient set, or restrict to a subset). When
+    /// empty, the default transient classifier decides. Sourced from
+    /// `AgentRuntimeConfig::phase_retry_on`.
+    #[serde(default)]
+    pub retry_on: Vec<String>,
 }
 
 fn parse_env_usize(key: &str) -> Option<usize> {

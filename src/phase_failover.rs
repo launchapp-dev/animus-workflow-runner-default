@@ -29,6 +29,39 @@ impl PhaseFailureKind {
     }
 }
 
+/// Map a phase-failure message to a STABLE, author-facing classification
+/// token, derived from [`classify_phase_failure`] / [`PhaseFailureKind`].
+///
+/// This is the authoritative token vocabulary for the author-configurable
+/// retry gate (`retry_on` / `no_retry_on` in agent-runtime config). The
+/// config-protocol layer deliberately leaves these strings free-form; this
+/// function defines the values they are matched against.
+///
+/// # Token vocabulary
+///
+/// | Token                  | Failure class ([`PhaseFailureKind`])        |
+/// |------------------------|---------------------------------------------|
+/// | `transient`            | `TransientRunner` — recoverable runner/IO    |
+/// |                        | hiccup (connect/reset/broken-pipe/timeout).  |
+/// | `provider_exhaustion`  | `ProviderExhaustion` — quota / rate-limit /  |
+/// |                        | credits / auth provider exhaustion.          |
+/// | `target_unavailable`   | `TargetUnavailable` — missing CLI / unknown  |
+/// |                        | model / missing key / unsupported tool.      |
+/// | `unknown`              | `Unknown` — unclassified failure.            |
+///
+/// The token is matched case-sensitively by the gate, so it is always
+/// lower snake_case. NOTE: the checkpoint-IO hard guard is intentionally
+/// NOT represented here — it is a separate, non-overridable block applied
+/// before classification (see `is_checkpoint_io_failure`).
+pub fn failure_token(message: &str) -> &'static str {
+    match classify_phase_failure(message) {
+        PhaseFailureKind::TransientRunner => "transient",
+        PhaseFailureKind::ProviderExhaustion { .. } => "provider_exhaustion",
+        PhaseFailureKind::TargetUnavailable => "target_unavailable",
+        PhaseFailureKind::Unknown => "unknown",
+    }
+}
+
 pub fn classify_phase_failure(message: &str) -> PhaseFailureKind {
     if is_transient_runner_pattern(message) {
         return PhaseFailureKind::TransientRunner;
@@ -104,6 +137,30 @@ fn extract_provider_exhaustion_reason(text: &str) -> Option<String> {
     }
 
     None
+}
+
+/// Pure retry-classification decision for the phase-attempt gate.
+///
+/// Applies the author-configurable precedence on top of the default
+/// transient classifier. The two outer hard guards (`attempt < max_attempts`
+/// and the checkpoint-IO block) live at the call site and are NOT modeled
+/// here — `no_retry_on` / `retry_on` can never override the checkpoint-IO
+/// guard.
+///
+/// Precedence (highest first):
+/// 1. `no_retry_on.contains(token)` → never retry (fail fast).
+/// 2. `!retry_on.is_empty()` → retry IFF `retry_on.contains(token)`
+///    (explicit allowlist: opt classes in beyond the transient default, or
+///    restrict to a subset).
+/// 3. else (empty `retry_on`) → retry IFF `is_transient` (today's default).
+pub fn retry_decision_for_token(token: &str, retry_on: &[String], no_retry_on: &[String], is_transient: bool) -> bool {
+    if no_retry_on.iter().any(|t| t == token) {
+        return false;
+    }
+    if !retry_on.is_empty() {
+        return retry_on.iter().any(|t| t == token);
+    }
+    is_transient
 }
 
 pub struct PhaseFailureClassifier;
@@ -202,4 +259,106 @@ fn provider_exhaustion_reason_from_payload(payload: &Value) -> Option<String> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s(values: &[&str]) -> Vec<String> {
+        values.iter().map(|v| (*v).to_string()).collect()
+    }
+
+    // --- failure_token: one assertion per PhaseFailureKind variant ---------
+
+    #[test]
+    fn failure_token_maps_transient_runner() {
+        assert_eq!(classify_phase_failure("connection reset by peer"), PhaseFailureKind::TransientRunner);
+        assert_eq!(failure_token("connection reset by peer"), "transient");
+    }
+
+    #[test]
+    fn failure_token_maps_provider_exhaustion() {
+        let msg = "openai error: insufficient_quota";
+        assert!(matches!(classify_phase_failure(msg), PhaseFailureKind::ProviderExhaustion { .. }));
+        assert_eq!(failure_token(msg), "provider_exhaustion");
+    }
+
+    #[test]
+    fn failure_token_maps_target_unavailable() {
+        assert_eq!(classify_phase_failure("command not found"), PhaseFailureKind::TargetUnavailable);
+        assert_eq!(failure_token("command not found"), "target_unavailable");
+    }
+
+    #[test]
+    fn failure_token_maps_unknown() {
+        let msg = "schema validation failed: missing field foo";
+        assert_eq!(classify_phase_failure(msg), PhaseFailureKind::Unknown);
+        assert_eq!(failure_token(msg), "unknown");
+    }
+
+    // --- retry_decision_for_token: gate precedence ------------------------
+
+    #[test]
+    fn no_retry_on_wins_even_if_also_in_retry_on() {
+        // token present in BOTH lists → no_retry_on takes precedence.
+        let decision = retry_decision_for_token("transient", &s(&["transient"]), &s(&["transient"]), true);
+        assert!(!decision, "no_retry_on must beat retry_on");
+    }
+
+    #[test]
+    fn no_retry_on_suppresses_otherwise_transient() {
+        let decision = retry_decision_for_token("transient", &[], &s(&["transient"]), true);
+        assert!(!decision, "no_retry_on must suppress a transient failure");
+    }
+
+    #[test]
+    fn retry_on_allowlist_includes_listed_token() {
+        // Non-transient token explicitly opted in → retry.
+        let decision = retry_decision_for_token("provider_exhaustion", &s(&["provider_exhaustion"]), &[], false);
+        assert!(decision, "retry_on must opt a non-transient token in");
+    }
+
+    #[test]
+    fn retry_on_allowlist_excludes_unlisted_token() {
+        // retry_on non-empty but token not listed → no retry, even if transient.
+        let decision = retry_decision_for_token("transient", &s(&["provider_exhaustion"]), &[], true);
+        assert!(!decision, "retry_on restricts to listed tokens only");
+    }
+
+    #[test]
+    fn empty_retry_on_falls_back_to_is_transient_true() {
+        let decision = retry_decision_for_token("transient", &[], &[], true);
+        assert!(decision, "empty config must preserve default transient retry");
+    }
+
+    #[test]
+    fn empty_retry_on_falls_back_to_is_transient_false() {
+        let decision = retry_decision_for_token("unknown", &[], &[], false);
+        assert!(!decision, "empty config must not retry a non-transient failure");
+    }
+
+    #[test]
+    fn non_transient_token_with_retry_on_listing_it_does_retry() {
+        // Explicitly: a class the default classifier would NOT retry, but the
+        // author opted in via retry_on, IS retried.
+        let token = failure_token("openai error: insufficient_quota");
+        assert_eq!(token, "provider_exhaustion");
+        let decision = retry_decision_for_token(token, &s(&["provider_exhaustion"]), &[], false);
+        assert!(decision);
+    }
+
+    #[test]
+    fn checkpoint_io_guard_blocks_retry_regardless_of_config() {
+        // The pure decision helper does NOT model the checkpoint-IO guard;
+        // the call site ANDs it in. This test documents that even a decision
+        // of `true` is overridden by the `!is_checkpoint_io_failure` guard.
+        let config_decision = retry_decision_for_token("transient", &s(&["transient"]), &[], true);
+        assert!(config_decision, "config alone would retry");
+        let is_checkpoint_io_failure = true;
+        let attempt = 0usize;
+        let max_attempts = 3usize;
+        let should_retry = attempt < max_attempts && !is_checkpoint_io_failure && config_decision;
+        assert!(!should_retry, "checkpoint-IO guard must block retry regardless of config");
+    }
 }

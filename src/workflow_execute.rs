@@ -17,7 +17,9 @@ use orchestrator_core::{
     PhaseDecisionVerdict, SubjectRef, WorkflowEvent, WorkflowRunInput, WorkflowStatus, SUBJECT_KIND_CUSTOM,
 };
 
+use crate::config_context::RuntimeConfigContext;
 use crate::ensure_execution_cwd::ensure_execution_cwd;
+use crate::phase_evals::{decide_eval_gate, force_rework, run_phase_evals, EvalGateDecision};
 use crate::phase_executor::{run_workflow_phase, PhaseExecuteOverrides, PhaseExecutionOutcome, PhaseRunParams};
 use crate::phase_output::{
     is_phase_completed, persist_phase_output, phase_output_dir, read_persisted_decision, PersistedPhaseOutput,
@@ -451,6 +453,22 @@ pub async fn execute_workflow_with_hub(
         return Err(anyhow!("workflow has no phases to execute"));
     }
 
+    // Per-phase eval gate state. `config_ctx` exposes the compiled
+    // `phases.<id>.evals` block (workflow YAML wins over agent_runtime_config);
+    // `eval_rework_counts` tracks eval-driven reworks per phase, distinct from
+    // the workflow state machine's own rework budget — once a phase's
+    // `max_reworks` eval budget is spent, the gate falls through to Block.
+    //
+    // TODO(codex-p2): this counter is in-memory for the duration of a single
+    // `execute_workflow_with_hub` call. A runner restart/resume mid-pipeline
+    // resets it to zero, so a phase with `on_fail = rework` can re-consume its
+    // `max_reworks` eval budget after each restart instead of falling through
+    // to Block. Durable tracking needs a scoped-state sidecar (alongside the
+    // phase completion markers) keyed by workflow+phase; deferred as a
+    // follow-up since it touches the crash-recovery durability model.
+    let config_ctx = RuntimeConfigContext::load(&params.project_root);
+    let mut eval_rework_counts: HashMap<String, u32> = HashMap::new();
+
     let mut phase_idx: usize = workflow.current_phase_index;
     let mut reported_workflow_status = workflow.status;
     while phase_idx < phases_to_run.len() && !is_terminal_workflow_status(workflow.status) {
@@ -545,7 +563,71 @@ pub async fn execute_workflow_with_hub(
         let phase_elapsed = phase_start.elapsed();
 
         match run_result {
-            Ok(result) => {
+            Ok(mut result) => {
+                // Eval gate. Runs only when the phase produced a Completed
+                // outcome with an advancing verdict (Advance/Unknown) and the
+                // phase declares `evals.checks`. The gate may rewrite the
+                // outcome BEFORE persistence/advance below so the normal
+                // rework (re-run current phase) and manual-pause (Block ->
+                // ManualPending) machinery carries it through unchanged.
+                let mut eval_summary: Option<Value> = None;
+                let eval_advancing = matches!(
+                    &result.outcome,
+                    PhaseExecutionOutcome::Completed { phase_decision, .. }
+                        if phase_decision
+                            .as_ref()
+                            .map(|d| matches!(
+                                d.verdict,
+                                PhaseDecisionVerdict::Advance | PhaseDecisionVerdict::Unknown
+                            ))
+                            .unwrap_or(true)
+                );
+                if eval_advancing {
+                    if let Some(evals) = config_ctx.phase_evals(&phase_id).filter(|e| !e.checks.is_empty()).cloned() {
+                        let phase_context = phase_eval_context(&result.outcome);
+                        let report =
+                            run_phase_evals(&params.project_root, &execution_cwd, &config_ctx, &evals, &phase_context)
+                                .await;
+                        let used = eval_rework_counts.get(&phase_id).copied().unwrap_or(0);
+                        let gate = decide_eval_gate(&evals, &report, used);
+                        eprintln!(
+                            "[ao][evals] phase={} pass_rate={:.2} threshold={:.2} ({}/{} passed) gate={}",
+                            phase_id,
+                            report.pass_rate,
+                            evals.pass_threshold,
+                            report.passed,
+                            report.total,
+                            match &gate {
+                                EvalGateDecision::Pass => "pass",
+                                EvalGateDecision::Rework { .. } => "rework",
+                                EvalGateDecision::Block { .. } => "block",
+                            }
+                        );
+                        let mut summary = report.to_json();
+                        match gate {
+                            EvalGateDecision::Pass => {
+                                summary["gate"] = serde_json::json!("pass");
+                            }
+                            EvalGateDecision::Rework { reason } => {
+                                eval_rework_counts.insert(phase_id.clone(), used + 1);
+                                summary["gate"] = serde_json::json!("rework");
+                                summary["reason"] = serde_json::json!(reason);
+                                summary["eval_reworks_used"] = serde_json::json!(used + 1);
+                                force_rework(&mut result.outcome, &phase_id, format!("eval gate rework: {reason}"));
+                            }
+                            EvalGateDecision::Block { reason } => {
+                                summary["gate"] = serde_json::json!("block");
+                                summary["reason"] = serde_json::json!(reason.clone());
+                                result.outcome = PhaseExecutionOutcome::ManualPending {
+                                    instructions: format!("eval gate blocked phase '{phase_id}': {reason}"),
+                                    approval_note_required: true,
+                                };
+                            }
+                        }
+                        eval_summary = Some(summary);
+                    }
+                }
+
                 if let PhaseExecutionOutcome::Completed { phase_decision: Some(ref decision), .. } = &result.outcome {
                     emit(PhaseEvent::Decision { phase_id: &phase_id, decision });
                     // codex P2 round 2: also forward the verdict through the
@@ -692,6 +774,9 @@ pub async fn execute_workflow_with_hub(
                                 .map(|value| value.reason.clone())
                                 .unwrap_or_default());
                         }
+                        if let Some(summary) = eval_summary.take() {
+                            result_value["evals"] = summary;
+                        }
                         results.push(result_value);
 
                         if matches!(
@@ -731,14 +816,18 @@ pub async fn execute_workflow_with_hub(
                                 "phase_status": "manual_pending",
                             }),
                         );
-                        results.push(serde_json::json!({
+                        let mut manual_result = serde_json::json!({
                             "phase_id": phase_id,
                             "status": "manual_pending",
                             "duration_secs": phase_elapsed.as_secs(),
                             "workflow_status": format!("{:?}", workflow.status).to_ascii_lowercase(),
                             "outcome": result.outcome,
                             "metadata": result.metadata,
-                        }));
+                        });
+                        if let Some(summary) = eval_summary.take() {
+                            manual_result["evals"] = summary;
+                        }
+                        results.push(manual_result);
                         break;
                     }
                 }
@@ -975,6 +1064,26 @@ async fn project_requirement_success_status(
     };
 
     project_requirement_workflow_status(hub, id, workflow_ref).await
+}
+
+/// Build the phase-output context string handed to an `llm_judge` eval
+/// check. Prefers the structured `result_payload`, falling back to the
+/// decision reason; bounded so a large payload does not blow up the judge
+/// prompt.
+fn phase_eval_context(outcome: &PhaseExecutionOutcome) -> String {
+    const MAX_CONTEXT_CHARS: usize = 8_000;
+    let raw = match outcome {
+        PhaseExecutionOutcome::Completed { result_payload: Some(payload), .. } => {
+            serde_json::to_string_pretty(payload).unwrap_or_else(|_| payload.to_string())
+        }
+        PhaseExecutionOutcome::Completed { phase_decision: Some(decision), .. } => decision.reason.clone(),
+        _ => String::new(),
+    };
+    if raw.chars().count() > MAX_CONTEXT_CHARS {
+        raw.chars().take(MAX_CONTEXT_CHARS).collect::<String>() + "\n... [truncated]"
+    } else {
+        raw
+    }
 }
 
 fn phase_rework_context(outcome: &PhaseExecutionOutcome) -> Option<String> {
