@@ -2549,12 +2549,46 @@ async fn run_workflow_phase_inner(params: &PhaseRunParams<'_>) -> Result<PhaseRu
                 }
                 b.meta(serde_json::json!({"program": command_result.program, "args": command_result.args})).emit();
             }
+            // Mint a run id for this command phase and persist the FULL
+            // stdout/stderr as per-run `OutputChunk` events under the SAME
+            // scoped runs root that agent phases write to (`crate::ipc::run_dir`
+            // -> `~/.animus/<scope>/runs/<run_id>/events.jsonl`). This makes the
+            // command output visible via `animus output read --run-id <run_id>`
+            // and lets the log_storage plugin ship it to S3, mirroring the
+            // agent-phase transcript path. Command phases otherwise discard
+            // their output (only an 800-char excerpt was retained).
+            //
+            // TODO(codex-p2): this block runs only after `run_workflow_phase_with_command`
+            // returns `Ok`. The dominant failure mode (non-zero exit) returns
+            // `Ok` with `failure_summary` and IS captured here, but the `?`-error
+            // sub-cases — a timeout, or an exit-0 command whose stdout fails
+            // `parse_json_output`/schema validation — return `Err` and bypass this
+            // persistence. Capturing those needs `run_workflow_phase_with_command`
+            // to hand stdout/stderr back on error (e.g. return `Ok` + `failure_summary`
+            // instead of `Err`), which changes failure/retry semantics and is out of
+            // scope here.
+            //
+            // TODO(codex-p2): the minted run_id is surfaced in `PhaseRunResult.signals`
+            // (the `workflow-phase-command-executed` payload below) and is therefore
+            // directly usable from the `workflow/run_phase` plugin path, but the
+            // `workflow/execute` path in `workflow_execute.rs` drops `result.signals`
+            // when building returned phase results/events — so for full-workflow runs
+            // the command run_id is not handed back to the daemon/journal. The events
+            // are still persisted to the scoped runs root (so the log_storage plugin
+            // ships them to S3 by scanning run dirs), but discoverability via
+            // `animus output read --run-id` on the execute path needs the run_id
+            // threaded into the phase result/runtime events (and recorded like agent
+            // run_ids are via session checkpoints).
+            let command_run_id = RunId(format!("wf-{workflow_id}-{phase_id}-cmd-{}", Uuid::new_v4().simple()));
+            let command_event_run_dir = crate::ipc::run_dir(project_root, &command_run_id, None);
+
             signals.push(PhaseExecutionSignal {
                 event_type: "workflow-phase-command-executed".to_string(),
                 payload: serde_json::json!({
                     "workflow_id": workflow_id,
                     "subject_id": subject_id,
                     "phase_id": phase_id,
+                    "run_id": command_run_id.0.clone(),
                     "program": command_result.program,
                     "args": command_result.args.clone(),
                     "cwd": command_result.cwd.clone(),
@@ -2566,6 +2600,31 @@ async fn run_workflow_phase_inner(params: &PhaseRunParams<'_>) -> Result<PhaseRu
                     "phase_decision": command_result.phase_decision.clone(),
                 }),
             });
+
+            // Best-effort persistence of the full command output. Mirrors the
+            // agent-phase guard: only persist a stream when its text is
+            // non-empty, and on persist error `warn!` + continue — NEVER fail
+            // the phase. Placed BEFORE the `failure_summary` early-return so
+            // failed command phases also capture their logs.
+            for (stream_type, text) in
+                [(OutputStreamType::Stdout, &command_result.stdout), (OutputStreamType::Stderr, &command_result.stderr)]
+            {
+                if text.is_empty() {
+                    continue;
+                }
+                let event =
+                    AgentRunEvent::OutputChunk { run_id: command_run_id.clone(), stream_type, text: text.clone() };
+                if let Err(error) = crate::ipc::persist_run_event(&command_event_run_dir, &event) {
+                    tracing::warn!(
+                        run_id = %command_run_id.0,
+                        phase_id,
+                        workflow_id,
+                        run_dir = %command_event_run_dir.display(),
+                        %error,
+                        "failed to persist command run event"
+                    );
+                }
+            }
 
             if let Some(ref failure_summary) = command_result.failure_summary {
                 let decision = command_result.phase_decision.clone().unwrap_or_else(|| {
