@@ -261,6 +261,9 @@ pub async fn handle_workflow_execute(request: WorkflowExecuteRequest) -> Result<
         // When absent (CLI path), the phase falls back to
         // `McpRuntimeConfig::default()`.
         mcp_config: request.mcp_config.clone().and_then(|value| serde_json::from_value(value).ok()),
+        // Relay the transport-asserted actor verbatim from the inbound
+        // execute request. The runner never synthesizes or interprets it.
+        actor: request.actor.clone(),
     };
 
     let recorder_dyn: crate::workflow_event_emitter::SharedWorkflowEventEmitter = recorder.clone();
@@ -446,6 +449,9 @@ pub async fn handle_workflow_run_phase(request: WorkflowPhaseRunRequest) -> Resu
         routing: &routing,
         phase_timeout_secs: request.phase_timeout_secs,
         mcp_config: mcp_config.as_ref(),
+        // Relay the transport-asserted actor verbatim from the inbound
+        // phase-run request. The runner never synthesizes or interprets it.
+        actor: request.actor.as_ref(),
     })
     .await;
     let elapsed: Duration = started.elapsed();
@@ -599,6 +605,7 @@ mod tests {
             schedule_input: None,
             phase_routing: None,
             mcp_config,
+            actor: None,
         }
     }
 

@@ -21,6 +21,7 @@ use serde_json::{json, Value};
 use tokio::process::Command as TokioCommand;
 use tokio::time::timeout;
 
+use animus_actor::Actor;
 use animus_session_backend::session::{SessionEvent, SessionRequest};
 use orchestrator_config::agent_runtime_config::{EvalCheck, EvalKind, EvalOnFail, EvalsConfig};
 use orchestrator_plugin_host::session::SessionBackendResolver;
@@ -194,12 +195,15 @@ pub async fn run_phase_evals(
     ctx: &RuntimeConfigContext,
     evals: &EvalsConfig,
     phase_context: &str,
+    actor: Option<&Actor>,
 ) -> EvalRunReport {
     let mut results = Vec::with_capacity(evals.checks.len());
     for check in &evals.checks {
         let result = match check.kind {
             EvalKind::Command => run_command_check(project_root, ctx, execution_cwd, check).await,
-            EvalKind::LlmJudge => run_llm_judge_check(project_root, execution_cwd, ctx, check, phase_context).await,
+            EvalKind::LlmJudge => {
+                run_llm_judge_check(project_root, execution_cwd, ctx, check, phase_context, actor).await
+            }
         };
         results.push(result);
     }
@@ -364,6 +368,7 @@ async fn run_llm_judge_check(
     ctx: &RuntimeConfigContext,
     check: &EvalCheck,
     phase_context: &str,
+    actor: Option<&Actor>,
 ) -> EvalCheckResult {
     let id = check.id.clone();
     let agent_id = check.agent.as_deref().map(str::trim).filter(|value| !value.is_empty());
@@ -409,6 +414,10 @@ async fn run_llm_judge_check(
         prompt,
         cwd: PathBuf::from(execution_cwd),
         project_root: Some(PathBuf::from(project_root)),
+        // Relay the transport-asserted actor verbatim so the judge session
+        // runs as the same user as the phase under review. The runner never
+        // interprets it.
+        actor: actor.cloned(),
         mcp_endpoint: None,
         // llm_judge runs a self-contained PASS/FAIL review with no tool access.
         mcp_servers: None,
@@ -561,6 +570,7 @@ mod tests {
             &ctx,
             &evals(EvalOnFail::Block, 0, 1.0, vec![command_check("ok", "true", &[], 0)]),
             "",
+            None,
         )
         .await;
         assert_eq!(report.passed, 1);
@@ -576,6 +586,7 @@ mod tests {
             &ctx,
             &evals(EvalOnFail::Rework, 1, 1.0, vec![command_check("bad", "false", &[], 0)]),
             "",
+            None,
         )
         .await;
         assert_eq!(report.passed, 0);
@@ -630,6 +641,7 @@ mod tests {
             &ctx,
             &evals(EvalOnFail::Block, 0, 1.0, vec![command_check("x", "true", &[], 0)]),
             "",
+            None,
         )
         .await;
         assert_eq!(report.passed, 0);

@@ -1820,6 +1820,7 @@ mod tests {
                 "stdio_args_json": "[\"--host\"]",
                 "agent_id": "host-agent"
             })),
+            actor: None,
         };
 
         let parsed_mcp_config: Option<protocol::McpRuntimeConfig> =

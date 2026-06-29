@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
+use animus_actor::Actor;
 use serde_json::Value;
 
 use orchestrator_config::{
@@ -64,6 +65,11 @@ pub struct WorkflowExecuteInternalParams {
     pub phase_filter: Option<String>,
     pub phase_routing: Option<protocol::PhaseRoutingConfig>,
     pub mcp_config: Option<protocol::McpRuntimeConfig>,
+    /// Transport-asserted caller identity relayed verbatim from the inbound
+    /// `WorkflowExecuteRequest`. Threaded into every phase's `SessionRequest`
+    /// so the provider/agent runs as the user. `None` for system-initiated
+    /// runs (e.g. the CLI direct-execute path). The runner never interprets it.
+    pub actor: Option<Actor>,
 }
 
 // Back-compat alias for the lifted in-tree call sites + tests that still
@@ -338,6 +344,7 @@ pub async fn execute_workflow_with_hub(
 
             phase_timeout_secs,
             mcp_config: mcp_config.as_ref(),
+            actor: params.actor.as_ref(),
         })
         .await;
 
@@ -557,6 +564,7 @@ pub async fn execute_workflow_with_hub(
 
             phase_timeout_secs,
             mcp_config: mcp_config.as_ref(),
+            actor: params.actor.as_ref(),
         })
         .await;
 
@@ -585,9 +593,15 @@ pub async fn execute_workflow_with_hub(
                 if eval_advancing {
                     if let Some(evals) = config_ctx.phase_evals(&phase_id).filter(|e| !e.checks.is_empty()).cloned() {
                         let phase_context = phase_eval_context(&result.outcome);
-                        let report =
-                            run_phase_evals(&params.project_root, &execution_cwd, &config_ctx, &evals, &phase_context)
-                                .await;
+                        let report = run_phase_evals(
+                            &params.project_root,
+                            &execution_cwd,
+                            &config_ctx,
+                            &evals,
+                            &phase_context,
+                            params.actor.as_ref(),
+                        )
+                        .await;
                         let used = eval_rework_counts.get(&phase_id).copied().unwrap_or(0);
                         let gate = decide_eval_gate(&evals, &report, used);
                         eprintln!(
