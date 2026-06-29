@@ -1,6 +1,6 @@
 [package]
 name = "animus-workflow-runner-default"
-version = "0.4.10"
+version = "0.4.12"
 edition = "2021"
 description = "Reference workflow_runner plugin for Animus v0.5 (stdio JSON-RPC + direct-execute CLI; replaces in-tree workflow-runner-v2)"
 license = "Elastic-2.0"
@@ -15,18 +15,21 @@ name = "animus-workflow-runner-default"
 path = "src/main.rs"
 
 [dependencies]
-# --- protocol crates — pinned to animus-protocol tag v0.1.24, the SAME tag
+# --- protocol crates — pinned to animus-protocol tag v0.1.25, the SAME tag
 # ao-cli@42c28643 resolves ALL its protocol/wire crates to. As of v0.6.1 the
 # `protocol` and `animus-plugin-protocol` crates moved OUT of the ao-cli repo
 # into launchapp-dev/animus-protocol, so they are pinned by tag here too (not
-# by ao-cli rev). Keeping every protocol crate on the single v0.1.24 tag
-# avoids duplicate-crate / type-mismatch errors with orchestrator-core's
-# transitive deps (the tag-unification hazard). ------------------------------
-animus-session-backend      = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.1.24" }
-animus-subject-protocol     = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.1.24" }
-animus-workflow-runner-protocol = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.1.24" }
-animus-plugin-protocol      = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.1.24" }
-protocol                    = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.1.24", package = "protocol" }
+# by ao-cli rev). v0.1.25 adds the `animus-actor` crate (per-user Actor) and
+# threads `actor: Option<Actor>` onto WorkflowExecuteRequest /
+# WorkflowPhaseRunRequest / SessionRequest. Keeping every protocol crate on
+# the single v0.1.25 tag avoids duplicate-crate / type-mismatch errors with
+# orchestrator-core's transitive deps (the tag-unification hazard). ----------
+animus-session-backend      = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.1.25" }
+animus-subject-protocol     = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.1.25" }
+animus-workflow-runner-protocol = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.1.25" }
+animus-plugin-protocol      = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.1.25" }
+animus-actor                = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.1.25" }
+protocol                    = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.1.25", package = "protocol" }
 
 # --- ao-cli kernel crates — pinned to the current HEAD rev. The session
 # dispatch types (`SessionBackendResolver`, `PluginSessionBackend`,
@@ -35,10 +38,10 @@ protocol                    = { git = "https://github.com/launchapp-dev/animus-p
 # `orchestrator-config`, `orchestrator-plugin-host`, and `orchestrator-logging`
 # are in-tree path deps inside the kernel workspace, so they have no standalone
 # published tag — pin them to the kernel git rev instead. ---------------------
-orchestrator-core          = { git = "https://github.com/launchapp-dev/animus-cli", rev = "42c28643bb0393321ffa943f6c1b55ac85303368" }
-orchestrator-config        = { git = "https://github.com/launchapp-dev/animus-cli", rev = "42c28643bb0393321ffa943f6c1b55ac85303368" }
-orchestrator-plugin-host   = { git = "https://github.com/launchapp-dev/animus-cli", rev = "42c28643bb0393321ffa943f6c1b55ac85303368" }
-orchestrator-logging       = { git = "https://github.com/launchapp-dev/animus-cli", rev = "42c28643bb0393321ffa943f6c1b55ac85303368" }
+orchestrator-core          = { git = "https://github.com/launchapp-dev/animus-cli", rev = "78f44f28cf366af02b1e59405e23fe5b6dba383d" }
+orchestrator-config        = { git = "https://github.com/launchapp-dev/animus-cli", rev = "78f44f28cf366af02b1e59405e23fe5b6dba383d" }
+orchestrator-plugin-host   = { git = "https://github.com/launchapp-dev/animus-cli", rev = "78f44f28cf366af02b1e59405e23fe5b6dba383d" }
+orchestrator-logging       = { git = "https://github.com/launchapp-dev/animus-cli", rev = "78f44f28cf366af02b1e59405e23fe5b6dba383d" }
 
 # --- stdlib-ish deps (move with the crate) ----------------------------------
 anyhow = "1.0"

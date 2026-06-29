@@ -208,6 +208,9 @@ async fn run_execute_inner(args: ExecuteArgs) -> anyhow::Result<u8> {
         phase_filter: None,
         phase_routing,
         mcp_config,
+        // CLI direct-execute is system-initiated; there is no transport-asserted
+        // actor in scope.
+        actor: None,
     };
 
     let hub: Arc<dyn orchestrator_core::services::ServiceHub> = Arc::new(

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
+use animus_actor::Actor;
 use serde_json::Value;
 
 use orchestrator_config::{
@@ -64,6 +65,11 @@ pub struct WorkflowExecuteInternalParams {
     pub phase_filter: Option<String>,
     pub phase_routing: Option<protocol::PhaseRoutingConfig>,
     pub mcp_config: Option<protocol::McpRuntimeConfig>,
+    /// Transport-asserted caller identity relayed verbatim from the inbound
+    /// `WorkflowExecuteRequest`. Threaded into every phase's `SessionRequest`
+    /// so the provider/agent runs as the user. `None` for system-initiated
+    /// runs (e.g. the CLI direct-execute path). The runner never interprets it.
+    pub actor: Option<Actor>,
 }
 
 // Back-compat alias for the lifted in-tree call sites + tests that still
@@ -205,7 +211,7 @@ pub async fn execute_workflow_with_hub(
             let input = resolve_input(&params)?;
             let subject = input.subject().clone();
             let subject_id = subject.id().to_string();
-            hub.workflows().run(input).await.or_else(|run_err| {
+            hub.workflows().run(input, params.actor.as_ref()).await.or_else(|run_err| {
                 if subject.kind().eq_ignore_ascii_case(SUBJECT_KIND_CUSTOM) {
                     return Err(run_err);
                 }
@@ -266,7 +272,7 @@ pub async fn execute_workflow_with_hub(
     let task_complexity = task.as_ref().map(|t| t.complexity);
 
     ensure_workflow_config_compiled(Path::new(&params.project_root))?;
-    let workflow_config = load_workflow_config(Path::new(&params.project_root))?;
+    let workflow_config = load_workflow_config(Path::new(&params.project_root), params.actor.as_ref())?;
     let workflow_ref = workflow.workflow_ref.clone().unwrap_or_else(|| workflow_config.default_workflow_ref.clone());
     let pack_registry = resolve_pack_registry(Path::new(&params.project_root))?;
     ensure_workflow_pack_execution_requirements(&pack_registry, &workflow_config, &workflow_ref)?;
@@ -338,6 +344,7 @@ pub async fn execute_workflow_with_hub(
 
             phase_timeout_secs,
             mcp_config: mcp_config.as_ref(),
+            actor: params.actor.as_ref(),
         })
         .await;
 
@@ -557,6 +564,7 @@ pub async fn execute_workflow_with_hub(
 
             phase_timeout_secs,
             mcp_config: mcp_config.as_ref(),
+            actor: params.actor.as_ref(),
         })
         .await;
 
@@ -585,9 +593,15 @@ pub async fn execute_workflow_with_hub(
                 if eval_advancing {
                     if let Some(evals) = config_ctx.phase_evals(&phase_id).filter(|e| !e.checks.is_empty()).cloned() {
                         let phase_context = phase_eval_context(&result.outcome);
-                        let report =
-                            run_phase_evals(&params.project_root, &execution_cwd, &config_ctx, &evals, &phase_context)
-                                .await;
+                        let report = run_phase_evals(
+                            &params.project_root,
+                            &execution_cwd,
+                            &config_ctx,
+                            &evals,
+                            &phase_context,
+                            params.actor.as_ref(),
+                        )
+                        .await;
                         let used = eval_rework_counts.get(&phase_id).copied().unwrap_or(0);
                         let gate = decide_eval_gate(&evals, &report, used);
                         eprintln!(

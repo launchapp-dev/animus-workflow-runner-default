@@ -48,6 +48,7 @@ use protocol::{
     Timestamp, TokenUsage, ToolCallInfo, ToolResultInfo, PROTOCOL_VERSION,
 };
 
+use animus_actor::Actor;
 use animus_session_backend::session::{SessionEvent, SessionRequest};
 use orchestrator_plugin_host::session::SessionBackendResolver;
 
@@ -118,6 +119,9 @@ impl orchestrator_core::PhaseExecutor for CliPhaseExecutor {
             routing: &routing,
             phase_timeout_secs,
             mcp_config: None,
+            // The `orchestrator_core::PhaseExecutor` trait carries no actor;
+            // this entrypoint is system-initiated.
+            actor: None,
         })
         .await;
 
@@ -262,8 +266,8 @@ fn load_agent_runtime_config_strict(project_root: &str) -> Result<orchestrator_c
     orchestrator_core::agent_runtime_config::load_agent_runtime_config_with_metadata(Path::new(project_root))
 }
 
-fn load_workflow_config_strict(project_root: &str) -> Result<orchestrator_core::LoadedWorkflowConfig> {
-    orchestrator_core::load_workflow_config_with_metadata(Path::new(project_root))
+fn load_workflow_config_strict(project_root: &str, actor: Option<&Actor>) -> Result<orchestrator_core::LoadedWorkflowConfig> {
+    orchestrator_core::load_workflow_config_with_metadata(Path::new(project_root), actor)
 }
 
 fn configured_tool_profile(phase_runtime_settings: Option<&WorkflowPhaseRuntimeSettings>) -> Option<&str> {
@@ -473,7 +477,16 @@ pub(crate) fn validate_basic_json_schema(instance: &Value, schema: &Value) -> Re
 /// are ALSO lifted into the typed `SessionRequest` fields the resolver and
 /// transports read directly (`tool`, `model`, `prompt`, `cwd`,
 /// `project_root`, `timeout_secs`, `permission_mode`).
-fn session_request_from_agent_request(project_root: &str, request: &AgentRunRequest) -> SessionRequest {
+///
+/// `actor` is the transport-asserted caller identity relayed verbatim from the
+/// inbound `WorkflowExecuteRequest` / `WorkflowPhaseRunRequest`. The runner
+/// never interprets or synthesizes it — it is copied through so the provider
+/// plugin runs the session as the user (their integrations resolve from it).
+fn session_request_from_agent_request(
+    project_root: &str,
+    request: &AgentRunRequest,
+    actor: Option<&Actor>,
+) -> SessionRequest {
     let context = &request.context;
     let context_str = |key: &str| context.pointer(&format!("/{key}")).and_then(Value::as_str).map(ToOwned::to_owned);
 
@@ -498,6 +511,9 @@ fn session_request_from_agent_request(project_root: &str, request: &AgentRunRequ
         prompt,
         cwd,
         project_root: Some(PathBuf::from(project_root)),
+        // Relay the transport-asserted actor verbatim (or `None` for
+        // system-initiated runs). The runner never interprets it.
+        actor: actor.cloned(),
         mcp_endpoint: None,
         // Mirror the kernel's `session_request_from_args`: lift the
         // `mcp_servers` payload to the top level so the plugin host reads it
@@ -620,6 +636,7 @@ pub async fn run_workflow_phase_attempt(
     workflow_id: &str,
     phase_id: &str,
     request: &AgentRunRequest,
+    actor: Option<&Actor>,
 ) -> Result<PhaseExecutionOutcome> {
     let ctx = RuntimeConfigContext::load(project_root);
     let parse_commit_message = phase_requires_commit_message_with_ctx(&ctx, phase_id);
@@ -721,7 +738,7 @@ pub async fn run_workflow_phase_attempt(
     // `AgentRunRequest` into a `SessionRequest`, start the session, and drive
     // the backend's `SessionEvent` stream into the same `AgentRunEvent`
     // consumer (`process_phase_event_stream`) the socket path used.
-    let session_request = session_request_from_agent_request(project_root, request);
+    let session_request = session_request_from_agent_request(project_root, request, actor);
     let mut session_run = match SessionBackendResolver::with_plugin_discovery(Path::new(project_root))
         .start_session(session_request)
         .await
@@ -1509,6 +1526,9 @@ struct PhaseAgentParams<'a> {
     resolved_phase_skills: &'a skill_dispatch::ResolvedPhaseSkillSet,
     phase_timeout_secs: Option<u64>,
     mcp_config: Option<&'a protocol::McpRuntimeConfig>,
+    /// Transport-asserted caller identity relayed verbatim into the phase's
+    /// `SessionRequest`. `None` for system-initiated runs.
+    actor: Option<&'a Actor>,
 }
 
 struct AgentPhaseRunOutcome {
@@ -1664,6 +1684,7 @@ async fn run_workflow_phase_with_agent(params: PhaseAgentParams<'_>) -> Result<A
     let phase_runtime_settings = params.phase_runtime_settings;
     let overrides = params.overrides;
     let pipeline_vars = params.pipeline_vars;
+    let actor = params.actor;
     let base_caps = ctx.phase_capabilities(phase_id);
     let planning_caps = skill_dispatch::preview_phase_capabilities(&base_caps, params.resolved_phase_skills);
     let routing_complexity = routing_complexity(params.task_complexity);
@@ -1992,7 +2013,7 @@ async fn run_workflow_phase_with_agent(params: PhaseAgentParams<'_>) -> Result<A
                     "Dispatching workflow phase attempt to agent runner"
                 );
 
-                match run_workflow_phase_attempt(project_root, workflow_id, phase_id, &request).await {
+                match run_workflow_phase_attempt(project_root, workflow_id, phase_id, &request, actor).await {
                     Ok(mut outcome) => {
                         if phase_requires_commit_message_with_ctx(ctx, phase_id) {
                             if let PhaseExecutionOutcome::Completed { commit_message, .. } = &mut outcome {
@@ -2242,6 +2263,12 @@ pub struct PhaseRunParams<'a> {
     pub schedule_input: Option<&'a str>,
     pub routing: &'a protocol::PhaseRoutingConfig,
     pub phase_timeout_secs: Option<u64>,
+    /// Transport-asserted caller identity, relayed verbatim from the inbound
+    /// `WorkflowExecuteRequest` / `WorkflowPhaseRunRequest`. Threaded into the
+    /// phase's `SessionRequest` so the provider/agent runs as the user. `None`
+    /// for system-initiated runs (CLI direct-execute path). The runner never
+    /// interprets it.
+    pub actor: Option<&'a Actor>,
     /// Optional host-supplied MCP runtime config. Threaded into
     /// [`inject_default_stdio_mcp_with_config`] so the daemon can override
     /// the stdio command / endpoint / transport per call. When `None`,
@@ -2272,7 +2299,7 @@ async fn run_workflow_phase_inner(params: &PhaseRunParams<'_>) -> Result<PhaseRu
     let pipeline_vars = params.pipeline_vars;
     let dispatch_input = params.dispatch_input;
     let schedule_input = params.schedule_input;
-    let workflow_config = load_workflow_config_strict(project_root)?;
+    let workflow_config = load_workflow_config_strict(project_root, params.actor)?;
     let runtime_loaded = load_agent_runtime_config_strict(project_root)?;
     orchestrator_core::validate_workflow_and_runtime_configs_with_project_root(
         &workflow_config.config,
@@ -2411,6 +2438,7 @@ async fn run_workflow_phase_inner(params: &PhaseRunParams<'_>) -> Result<PhaseRu
                 resolved_phase_skills: &resolved_phase_skills,
                 phase_timeout_secs: params.phase_timeout_secs,
                 mcp_config: params.mcp_config,
+                actor: params.actor,
             })
             .await?;
             metadata.selected_tool = agent_result.selected_tool.clone();
@@ -3632,7 +3660,7 @@ mod tests {
             let request = make_request();
             let _guard = FaultGuard::arm(FaultOp::Pending);
 
-            let result = run_workflow_phase_attempt(&project_root, "wf-fault-pending", "impl", &request).await;
+            let result = run_workflow_phase_attempt(&project_root, "wf-fault-pending", "impl", &request, None).await;
             let err = result.expect_err("pending checkpoint failure must propagate");
             let msg = format!("{err:#}");
             assert!(
