@@ -3,8 +3,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context, Result};
 use animus_actor::Actor;
+use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 
 use orchestrator_config::{

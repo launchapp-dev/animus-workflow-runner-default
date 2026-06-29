@@ -1,6 +1,6 @@
 [package]
 name = "animus-workflow-runner-default"
-version = "0.4.12"
+version = "0.4.13"
 edition = "2021"
 description = "Reference workflow_runner plugin for Animus v0.5 (stdio JSON-RPC + direct-execute CLI; replaces in-tree workflow-runner-v2)"
 license = "Elastic-2.0"
@@ -15,33 +15,39 @@ name = "animus-workflow-runner-default"
 path = "src/main.rs"
 
 [dependencies]
-# --- protocol crates — pinned to animus-protocol tag v0.1.25, the SAME tag
-# ao-cli@42c28643 resolves ALL its protocol/wire crates to. As of v0.6.1 the
+# --- protocol crates — pinned to animus-protocol tag v0.1.26, the SAME tag
+# ao-cli@74cffc5e resolves ALL its protocol/wire crates to. As of v0.6.1 the
 # `protocol` and `animus-plugin-protocol` crates moved OUT of the ao-cli repo
 # into launchapp-dev/animus-protocol, so they are pinned by tag here too (not
-# by ao-cli rev). v0.1.25 adds the `animus-actor` crate (per-user Actor) and
-# threads `actor: Option<Actor>` onto WorkflowExecuteRequest /
-# WorkflowPhaseRunRequest / SessionRequest. Keeping every protocol crate on
-# the single v0.1.25 tag avoids duplicate-crate / type-mismatch errors with
-# orchestrator-core's transitive deps (the tag-unification hazard). ----------
-animus-session-backend      = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.1.25" }
-animus-subject-protocol     = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.1.25" }
-animus-workflow-runner-protocol = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.1.25" }
-animus-plugin-protocol      = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.1.25" }
-animus-actor                = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.1.25" }
-protocol                    = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.1.25", package = "protocol" }
+# by ao-cli rev). v0.1.26 adds the additive `SubjectDispatch.actor` and
+# `WorkflowSchedule.owner_id/claims` fields (the WU-F owner-scoped schedule
+# foundation) on top of the v0.1.25 per-user `Actor` work. Keeping every
+# protocol crate on the single v0.1.26 tag avoids duplicate-crate /
+# type-mismatch errors with orchestrator-core's transitive deps (the
+# tag-unification hazard). --------------------------------------------------
+animus-session-backend      = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.1.26" }
+animus-subject-protocol     = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.1.26" }
+animus-workflow-runner-protocol = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.1.26" }
+animus-plugin-protocol      = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.1.26" }
+animus-actor                = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.1.26" }
+protocol                    = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.1.26", package = "protocol" }
 
-# --- ao-cli kernel crates — pinned to the current HEAD rev. The session
-# dispatch types (`SessionBackendResolver`, `PluginSessionBackend`,
+# --- ao-cli kernel crates — pinned to the current HEAD rev (v0.6.22). The
+# session dispatch types (`SessionBackendResolver`, `PluginSessionBackend`,
 # `SessionEvent`) must be byte-identical to the kernel's `animus agent run`
 # path, which is the proven-working reference. `orchestrator-core`,
-# `orchestrator-config`, `orchestrator-plugin-host`, and `orchestrator-logging`
-# are in-tree path deps inside the kernel workspace, so they have no standalone
-# published tag — pin them to the kernel git rev instead. ---------------------
-orchestrator-core          = { git = "https://github.com/launchapp-dev/animus-cli", rev = "78f44f28cf366af02b1e59405e23fe5b6dba383d" }
-orchestrator-config        = { git = "https://github.com/launchapp-dev/animus-cli", rev = "78f44f28cf366af02b1e59405e23fe5b6dba383d" }
-orchestrator-plugin-host   = { git = "https://github.com/launchapp-dev/animus-cli", rev = "78f44f28cf366af02b1e59405e23fe5b6dba383d" }
-orchestrator-logging       = { git = "https://github.com/launchapp-dev/animus-cli", rev = "78f44f28cf366af02b1e59405e23fe5b6dba383d" }
+# `orchestrator-config`, `orchestrator-plugin-host`, `orchestrator-logging`,
+# and `animus-runtime-shared` are in-tree path deps inside the kernel
+# workspace, so they have no standalone published tag — pin them all to the
+# same kernel git rev. `animus-runtime-shared` carries the `actor_env` module
+# (the daemon→runner `ANIMUS_ACTOR_JSON` channel — encode on the daemon side,
+# decode here) and is already pulled transitively via orchestrator-core, so
+# pinning it directly at the same rev adds no new version surface. -----------
+orchestrator-core          = { git = "https://github.com/launchapp-dev/animus-cli", rev = "74cffc5e75b4d1664345063d4ef7b7c1a13dc236" }
+orchestrator-config        = { git = "https://github.com/launchapp-dev/animus-cli", rev = "74cffc5e75b4d1664345063d4ef7b7c1a13dc236" }
+orchestrator-plugin-host   = { git = "https://github.com/launchapp-dev/animus-cli", rev = "74cffc5e75b4d1664345063d4ef7b7c1a13dc236" }
+orchestrator-logging       = { git = "https://github.com/launchapp-dev/animus-cli", rev = "74cffc5e75b4d1664345063d4ef7b7c1a13dc236" }
+animus-runtime-shared      = { git = "https://github.com/launchapp-dev/animus-cli", rev = "74cffc5e75b4d1664345063d4ef7b7c1a13dc236" }
 
 # --- stdlib-ish deps (move with the crate) ----------------------------------
 anyhow = "1.0"

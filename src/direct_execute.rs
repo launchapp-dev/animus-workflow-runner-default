@@ -155,6 +155,19 @@ fn compose_event_emitter() -> Option<SharedWorkflowEventEmitter> {
     }
 }
 
+/// Decode the daemon-relayed [`Actor`](animus_actor::Actor) from the
+/// `ANIMUS_ACTOR_JSON` env channel, if present. Returns `None` when the env
+/// var is unset / empty / malformed, leaving the run globally scoped (the
+/// unchanged, back-compat default). The constant name and decode semantics are
+/// shared with the daemon's encode side via
+/// [`animus_runtime_shared::actor_env`] so the contract has a single source of
+/// truth.
+fn actor_from_env() -> Option<animus_actor::Actor> {
+    use animus_runtime_shared::actor_env;
+    let raw = std::env::var(actor_env::ANIMUS_ACTOR_JSON_ENV).ok();
+    actor_env::decode_actor_env(raw.as_deref())
+}
+
 pub async fn run_execute(args: ExecuteArgs) -> u8 {
     match run_execute_inner(args).await {
         Ok(code) => code,
@@ -208,9 +221,17 @@ async fn run_execute_inner(args: ExecuteArgs) -> anyhow::Result<u8> {
         phase_filter: None,
         phase_routing,
         mcp_config,
-        // CLI direct-execute is system-initiated; there is no transport-asserted
-        // actor in scope.
-        actor: None,
+        // CLI direct-execute carries no transport-asserted actor of its own.
+        // For owner-scoped schedules the daemon scheduler mints a trusted
+        // system `Actor` and relays it on the `ANIMUS_ACTOR_JSON` env var (see
+        // `animus_runtime_shared::actor_env`): an older runner ignores the env
+        // (no arg-parse error); this runner decodes it and scopes the run — and
+        // its downstream phase/MCP channels — to the owner. Absent / empty /
+        // malformed payloads decode to `None`, leaving the run global
+        // (unchanged behavior). TRUST BOUNDARY: the daemon asserts this
+        // identity at config-authoring time (the schedule's `owner_id`); the
+        // runner only relays it and never derives it from runtime content.
+        actor: actor_from_env(),
     };
 
     let hub: Arc<dyn orchestrator_core::services::ServiceHub> = Arc::new(
@@ -423,6 +444,34 @@ mod tests {
         let argv = vec!["--bogus".to_string()];
         let result = ExecuteArgs::parse(argv.into_iter());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn actor_from_env_round_trips_and_defaults_to_none() {
+        use animus_runtime_shared::actor_env::ANIMUS_ACTOR_JSON_ENV;
+        let prev = std::env::var(ANIMUS_ACTOR_JSON_ENV).ok();
+
+        std::env::remove_var(ANIMUS_ACTOR_JSON_ENV);
+        assert!(actor_from_env().is_none(), "unset env must yield global scope");
+
+        std::env::set_var(ANIMUS_ACTOR_JSON_ENV, "   ");
+        assert!(actor_from_env().is_none(), "blank env must yield global scope");
+
+        std::env::set_var(ANIMUS_ACTOR_JSON_ENV, "not json");
+        assert!(actor_from_env().is_none(), "malformed env must yield global scope");
+
+        let actor = animus_actor::Actor {
+            user_id: "alice".into(),
+            claims: vec!["admin".into()],
+            tenant_id: Some("team-7".into()),
+        };
+        std::env::set_var(ANIMUS_ACTOR_JSON_ENV, serde_json::to_string(&actor).unwrap());
+        assert_eq!(actor_from_env(), Some(actor));
+
+        match prev {
+            Some(v) => std::env::set_var(ANIMUS_ACTOR_JSON_ENV, v),
+            None => std::env::remove_var(ANIMUS_ACTOR_JSON_ENV),
+        }
     }
 
     #[test]

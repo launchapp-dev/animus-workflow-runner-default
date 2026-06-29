@@ -266,7 +266,10 @@ fn load_agent_runtime_config_strict(project_root: &str) -> Result<orchestrator_c
     orchestrator_core::agent_runtime_config::load_agent_runtime_config_with_metadata(Path::new(project_root))
 }
 
-fn load_workflow_config_strict(project_root: &str, actor: Option<&Actor>) -> Result<orchestrator_core::LoadedWorkflowConfig> {
+fn load_workflow_config_strict(
+    project_root: &str,
+    actor: Option<&Actor>,
+) -> Result<orchestrator_core::LoadedWorkflowConfig> {
     orchestrator_core::load_workflow_config_with_metadata(Path::new(project_root), actor)
 }
 
