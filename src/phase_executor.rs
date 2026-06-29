@@ -266,8 +266,8 @@ fn load_agent_runtime_config_strict(project_root: &str) -> Result<orchestrator_c
     orchestrator_core::agent_runtime_config::load_agent_runtime_config_with_metadata(Path::new(project_root))
 }
 
-fn load_workflow_config_strict(project_root: &str) -> Result<orchestrator_core::LoadedWorkflowConfig> {
-    orchestrator_core::load_workflow_config_with_metadata(Path::new(project_root))
+fn load_workflow_config_strict(project_root: &str, actor: Option<&Actor>) -> Result<orchestrator_core::LoadedWorkflowConfig> {
+    orchestrator_core::load_workflow_config_with_metadata(Path::new(project_root), actor)
 }
 
 fn configured_tool_profile(phase_runtime_settings: Option<&WorkflowPhaseRuntimeSettings>) -> Option<&str> {
@@ -2299,7 +2299,7 @@ async fn run_workflow_phase_inner(params: &PhaseRunParams<'_>) -> Result<PhaseRu
     let pipeline_vars = params.pipeline_vars;
     let dispatch_input = params.dispatch_input;
     let schedule_input = params.schedule_input;
-    let workflow_config = load_workflow_config_strict(project_root)?;
+    let workflow_config = load_workflow_config_strict(project_root, params.actor)?;
     let runtime_loaded = load_agent_runtime_config_strict(project_root)?;
     orchestrator_core::validate_workflow_and_runtime_configs_with_project_root(
         &workflow_config.config,

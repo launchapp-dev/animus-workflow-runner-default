@@ -211,7 +211,7 @@ pub async fn execute_workflow_with_hub(
             let input = resolve_input(&params)?;
             let subject = input.subject().clone();
             let subject_id = subject.id().to_string();
-            hub.workflows().run(input).await.or_else(|run_err| {
+            hub.workflows().run(input, params.actor.as_ref()).await.or_else(|run_err| {
                 if subject.kind().eq_ignore_ascii_case(SUBJECT_KIND_CUSTOM) {
                     return Err(run_err);
                 }
@@ -272,7 +272,7 @@ pub async fn execute_workflow_with_hub(
     let task_complexity = task.as_ref().map(|t| t.complexity);
 
     ensure_workflow_config_compiled(Path::new(&params.project_root))?;
-    let workflow_config = load_workflow_config(Path::new(&params.project_root))?;
+    let workflow_config = load_workflow_config(Path::new(&params.project_root), params.actor.as_ref())?;
     let workflow_ref = workflow.workflow_ref.clone().unwrap_or_else(|| workflow_config.default_workflow_ref.clone());
     let pack_registry = resolve_pack_registry(Path::new(&params.project_root))?;
     ensure_workflow_pack_execution_requirements(&pack_registry, &workflow_config, &workflow_ref)?;
