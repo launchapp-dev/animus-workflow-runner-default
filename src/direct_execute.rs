@@ -16,7 +16,7 @@ use animus_workflow_runner_default::workflow_event_emitter::{
     FanoutEmitter, SharedWorkflowEventEmitter, SubprocessPipeEmitter,
 };
 use animus_workflow_runner_default::workflow_execute::{execute_workflow_with_hub, WorkflowExecuteInternalParams};
-use orchestrator_core::{FileServiceHub, WorkflowStatus};
+use orchestrator_core::{FileServiceHub, SubjectRef, WorkflowStatus};
 use orchestrator_logging::Logger;
 use serde::Serialize;
 
@@ -24,6 +24,11 @@ pub struct ExecuteArgs {
     pub workflow_id: Option<String>,
     pub task_id: Option<String>,
     pub requirement_id: Option<String>,
+    /// Generic kind-qualified subject parsed from `--subject-id <kind>:<id>`
+    /// (the daemon's queue-lease -> runner leg for BaaS dynamic kinds, e.g.
+    /// `blog:BLOG-001`). Mutually exclusive with `--task-id`/`--requirement-id`.
+    /// A `task`/`requirement` kind canonicalizes to the dedicated-flag form.
+    pub subject: Option<SubjectRef>,
     pub title: Option<String>,
     pub description: Option<String>,
     pub workflow_ref: Option<String>,
@@ -50,6 +55,7 @@ impl ExecuteArgs {
         let mut workflow_id = None;
         let mut task_id = None;
         let mut requirement_id = None;
+        let mut subject_id: Option<String> = None;
         let mut title = None;
         let mut description = None;
         let mut workflow_ref = None;
@@ -68,6 +74,7 @@ impl ExecuteArgs {
                 "--workflow-id"
                 | "--task-id"
                 | "--requirement-id"
+                | "--subject-id"
                 | "--title"
                 | "--description"
                 | "--workflow-ref"
@@ -80,7 +87,7 @@ impl ExecuteArgs {
                 | "--phase-routing-json"
                 | "--mcp-config-json" => args.next().ok_or_else(|| format!("missing value for {key}"))?,
                 "--help" | "-h" => {
-                    eprintln!("animus-workflow-runner-default execute --project-root <path> [--task-id <id> | --requirement-id <id> | --title <s>] [--workflow-ref <ref>] ...");
+                    eprintln!("animus-workflow-runner-default execute --project-root <path> [--task-id <id> | --requirement-id <id> | --subject-id <kind>:<id> | --title <s>] [--workflow-ref <ref>] ...");
                     std::process::exit(0);
                 }
                 other => return Err(format!("unknown argument: {other}")),
@@ -89,6 +96,7 @@ impl ExecuteArgs {
                 "--workflow-id" => workflow_id = Some(value),
                 "--task-id" => task_id = Some(value),
                 "--requirement-id" => requirement_id = Some(value),
+                "--subject-id" => subject_id = Some(value),
                 "--title" => title = Some(value),
                 "--description" => description = Some(value),
                 "--workflow-ref" => workflow_ref = Some(value),
@@ -107,10 +115,26 @@ impl ExecuteArgs {
         }
 
         let project_root = project_root.ok_or_else(|| "--project-root is required".to_string())?;
+
+        // `--subject-id` is the generic kind-qualified dispatch surface. The
+        // daemon sends exactly one of `--task-id` / `--requirement-id` /
+        // `--subject-id`, so reject the ambiguous combination rather than
+        // silently dropping one.
+        let subject = match subject_id {
+            Some(raw) => {
+                if task_id.is_some() || requirement_id.is_some() {
+                    return Err("--subject-id is mutually exclusive with --task-id and --requirement-id".to_string());
+                }
+                Some(parse_qualified_subject(&raw)?)
+            }
+            None => None,
+        };
+
         Ok(Self {
             workflow_id,
             task_id,
             requirement_id,
+            subject,
             title,
             description,
             workflow_ref,
@@ -171,6 +195,7 @@ async fn run_execute_inner(args: ExecuteArgs) -> anyhow::Result<u8> {
         .as_deref()
         .or(args.task_id.as_deref())
         .or(args.requirement_id.as_deref())
+        .or_else(|| args.subject.as_ref().map(|s| s.id()))
         .or(args.title.as_deref())
         .unwrap_or("unknown")
         .to_string();
@@ -197,6 +222,7 @@ async fn run_execute_inner(args: ExecuteArgs) -> anyhow::Result<u8> {
         workflow_id: args.workflow_id,
         task_id: args.task_id,
         requirement_id: args.requirement_id,
+        subject: args.subject,
         title: args.title,
         description: args.description,
         workflow_ref: args.workflow_ref.clone(),
@@ -310,6 +336,35 @@ fn split_equals(arg: String) -> Vec<String> {
     }
 }
 
+/// Parse a kind-qualified `"kind:id"` subject string (split on the FIRST
+/// `:`) into a [`SubjectRef`]. The part before the colon is the subject kind,
+/// the remainder is the bare id (which may itself contain `:`).
+///
+/// The short aliases `task` / `requirement` canonicalize to the exact
+/// `SubjectRef` the dedicated `--task-id` / `--requirement-id` flags produce
+/// (i.e. the canonical `animus.task` / `animus.requirement` kinds), so
+/// `--subject-id task:X` is equivalent to `--task-id X`. Any other kind
+/// (including already-canonical BaaS dynamic kinds like `blog`) is passed
+/// through verbatim via [`SubjectRef::new`].
+fn parse_qualified_subject(raw: &str) -> Result<SubjectRef, String> {
+    let (kind, id) = raw
+        .split_once(':')
+        .ok_or_else(|| format!("--subject-id must be kind-qualified as <kind>:<id>, got '{raw}'"))?;
+    if kind.is_empty() {
+        return Err(format!("--subject-id is missing a kind before ':', got '{raw}'"));
+    }
+    if id.is_empty() {
+        return Err(format!("--subject-id is missing an id after ':', got '{raw}'"));
+    }
+    if kind.eq_ignore_ascii_case("task") {
+        Ok(SubjectRef::task(id))
+    } else if kind.eq_ignore_ascii_case("requirement") {
+        Ok(SubjectRef::requirement(id))
+    } else {
+        Ok(SubjectRef::new(kind, id))
+    }
+}
+
 fn clamp_exit_code(code: i32) -> u8 {
     match u8::try_from(code) {
         Ok(value) => value,
@@ -416,6 +471,68 @@ mod tests {
         assert_eq!(args.project_root, "/repo");
         assert_eq!(args.task_id.as_deref(), Some("TASK-XYZ"));
         assert_eq!(args.workflow_ref.as_deref(), Some("default"));
+    }
+
+    #[test]
+    fn execute_args_parse_generic_subject_id() {
+        let argv = vec![
+            "--subject-id".to_string(),
+            "blog:BLOG-001".to_string(),
+            "--project-root".to_string(),
+            "/tmp/project".to_string(),
+            "--workflow-ref".to_string(),
+            "publish".to_string(),
+        ];
+        let args = ExecuteArgs::parse(argv.into_iter()).expect("parse");
+        let subject = args.subject.expect("subject");
+        assert_eq!(subject.kind(), "blog");
+        assert_eq!(subject.id(), "BLOG-001");
+        assert!(args.task_id.is_none());
+        assert!(args.requirement_id.is_none());
+    }
+
+    #[test]
+    fn execute_args_subject_id_task_kind_canonicalizes() {
+        // `--subject-id task:X` must produce the same SubjectRef shape as
+        // `--task-id X` (task_id() resolves the bare id).
+        let argv = vec!["--subject-id=task:TASK-9".to_string(), "--project-root=/tmp/p".to_string()];
+        let args = ExecuteArgs::parse(argv.into_iter()).expect("parse");
+        let subject = args.subject.expect("subject");
+        // Canonicalized to the same SubjectRef `--task-id TASK-9` produces.
+        assert_eq!(subject.task_id(), Some("TASK-9"));
+        assert_eq!(subject.id(), "TASK-9");
+        assert_eq!(subject.kind(), SubjectRef::task("TASK-9").kind());
+    }
+
+    #[test]
+    fn execute_args_subject_id_preserves_id_with_extra_colons() {
+        let subject = parse_qualified_subject("blog:org:BLOG-7").expect("parse");
+        assert_eq!(subject.kind(), "blog");
+        assert_eq!(subject.id(), "org:BLOG-7");
+    }
+
+    #[test]
+    fn execute_args_subject_id_mutually_exclusive_with_task_id() {
+        let argv = vec![
+            "--subject-id".to_string(),
+            "blog:BLOG-1".to_string(),
+            "--task-id".to_string(),
+            "TASK-1".to_string(),
+            "--project-root".to_string(),
+            "/tmp/p".to_string(),
+        ];
+        let result = ExecuteArgs::parse(argv.into_iter());
+        assert!(result.is_err());
+        assert!(result.err().unwrap().contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn execute_args_subject_id_malformed_is_error() {
+        for raw in ["blog", ":BLOG-1", "blog:"] {
+            let argv =
+                vec!["--subject-id".to_string(), raw.to_string(), "--project-root".to_string(), "/tmp/p".to_string()];
+            assert!(ExecuteArgs::parse(argv.into_iter()).is_err(), "expected error for '{raw}'");
+        }
     }
 
     #[test]

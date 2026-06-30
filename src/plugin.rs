@@ -245,6 +245,10 @@ pub async fn handle_workflow_execute(request: WorkflowExecuteRequest) -> Result<
         workflow_id: request.workflow_id.clone(),
         task_id,
         requirement_id,
+        // The IPC path projects subject envelopes down to the
+        // task/requirement/title triple via `resolve_subject_fields`; the
+        // generic `--subject-id` subject is a CLI-direct-execute concern.
+        subject: None,
         title,
         description,
         workflow_ref: request.workflow_ref.clone(),

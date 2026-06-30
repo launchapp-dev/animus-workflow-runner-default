@@ -3,8 +3,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context, Result};
 use animus_actor::Actor;
+use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 
 use orchestrator_config::{
@@ -54,6 +54,14 @@ pub struct WorkflowExecuteInternalParams {
     pub workflow_id: Option<String>,
     pub task_id: Option<String>,
     pub requirement_id: Option<String>,
+    /// Generic kind-qualified subject (e.g. `kind=blog`). When set, it takes
+    /// precedence over `task_id`/`requirement_id`/`title` so the run resolves
+    /// under the subject's real kind instead of being projected onto task.
+    /// Populated by the CLI `--subject-id <kind>:<id>` flag (the daemon's
+    /// queue-lease -> runner leg for BaaS dynamic kinds). A `task`/`requirement`
+    /// kind here canonicalizes to the same `SubjectRef` the dedicated flags
+    /// produce.
+    pub subject: Option<SubjectRef>,
     pub title: Option<String>,
     pub description: Option<String>,
     pub workflow_ref: Option<String>,
@@ -1004,6 +1012,51 @@ async fn load_existing_workflow(
 }
 
 fn validate_existing_workflow_subject(workflow: &OrchestratorWorkflow, params: &WorkflowExecuteParams) -> Result<()> {
+    // The generic `subject` takes precedence over the legacy
+    // task_id/requirement_id/title fields (see `resolve_input`), so when it is
+    // set we validate against it exclusively and short-circuit the older
+    // checks — otherwise a fallback `--title` would wrongly demand a `custom`
+    // workflow for a BaaS dynamic-kind subject.
+    if let Some(subject) = &params.subject {
+        // Keep the `task`/`requirement` aliases genuinely equivalent to the
+        // dedicated `--task-id`/`--requirement-id` flags — including the legacy
+        // fallback where an older persisted workflow deserializes with an empty
+        // task subject but still carries `workflow.task_id`. Generic BaaS kinds
+        // validate on the canonical kind + id pair.
+        if let Some(task_id) = subject.task_id() {
+            let workflow_task_id = workflow.subject.task_id().unwrap_or(workflow.task_id.as_str());
+            if workflow_task_id != task_id {
+                return Err(anyhow!("workflow '{}' is for task '{}' not '{}'", workflow.id, workflow_task_id, task_id));
+            }
+        } else if let Some(requirement_id) = subject.requirement_id() {
+            match workflow.subject.requirement_id() {
+                Some(id) if id == requirement_id => {}
+                Some(id) => {
+                    return Err(anyhow!(
+                        "workflow '{}' is for requirement '{}' not '{}'",
+                        workflow.id,
+                        id,
+                        requirement_id
+                    ));
+                }
+                None => {
+                    return Err(anyhow!("workflow '{}' is not a requirement workflow", workflow.id));
+                }
+            }
+        } else if !workflow.subject.kind().eq_ignore_ascii_case(subject.kind()) || workflow.subject.id() != subject.id()
+        {
+            return Err(anyhow!(
+                "workflow '{}' is for subject '{}:{}' not '{}:{}'",
+                workflow.id,
+                workflow.subject.kind(),
+                workflow.subject.id(),
+                subject.kind(),
+                subject.id(),
+            ));
+        }
+        return Ok(());
+    }
+
     if let Some(task_id) = params.task_id.as_deref() {
         let workflow_task_id = workflow.subject.task_id().unwrap_or(workflow.task_id.as_str());
         if workflow_task_id != task_id {
@@ -1038,6 +1091,11 @@ fn validate_existing_workflow_subject(workflow: &OrchestratorWorkflow, params: &
 
 fn resolve_input(params: &WorkflowExecuteParams) -> Result<WorkflowRunInput> {
     let workflow_ref = params.workflow_ref.clone();
+    if let Some(subject) = &params.subject {
+        return Ok(WorkflowRunInput::for_subject(subject.clone(), workflow_ref)
+            .with_input(params.input.clone())
+            .with_vars(params.vars.clone()));
+    }
     match (&params.task_id, &params.requirement_id, &params.title) {
         (Some(task_id), _, _) => Ok(WorkflowRunInput::for_task(task_id.clone(), workflow_ref)
             .with_input(params.input.clone())
