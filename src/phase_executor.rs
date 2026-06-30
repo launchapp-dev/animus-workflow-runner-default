@@ -508,6 +508,26 @@ fn session_request_from_agent_request(
         .unwrap_or_else(|| context_str("project_root").map_or_else(|| PathBuf::from(project_root), PathBuf::from));
     let permission_mode = context_str("permission_mode");
 
+    // Spend attribution: forward run/workflow/phase/agent/conversation/actor ids
+    // as env so the provider harness can stamp them onto each spend_event. The
+    // plugin host filters these by the provider manifest allowlist before they
+    // reach the agent's env.
+    let mut env_vars: Vec<(String, String)> = Vec::new();
+    for (key, value) in [
+        ("ANIMUS_WORKFLOW_ID", context_str("workflow_id")),
+        ("ANIMUS_PHASE_ID", context_str("phase_id")),
+        ("ANIMUS_RUN_ID", Some(request.run_id.0.clone())),
+        ("ANIMUS_AGENT", context_str("agent_id")),
+        ("ANIMUS_CONVERSATION_ID", context_str("conversation_id")),
+        ("ANIMUS_ACTOR_USER_ID", actor.map(|a| a.user_id.clone())),
+    ] {
+        if let Some(v) = value {
+            if !v.trim().is_empty() {
+                env_vars.push((key.to_string(), v));
+            }
+        }
+    }
+
     SessionRequest {
         tool,
         model: request.model.0.clone(),
@@ -524,7 +544,7 @@ fn session_request_from_agent_request(
         mcp_servers: context.get("mcp_servers").cloned(),
         permission_mode,
         timeout_secs: request.timeout_secs,
-        env_vars: Vec::new(),
+        env_vars,
         // The entire phase context rides `extras`; the plugin host reads the
         // launch-affecting keys (runtime_contract, system_prompt,
         // mcp_servers, ...) from the top level. A non-object context (never
@@ -1774,6 +1794,10 @@ async fn run_workflow_phase_with_agent(params: PhaseAgentParams<'_>) -> Result<A
             .or(applied_skills.application.timeout_secs)
             .or(phase_runtime_settings.and_then(|settings| settings.timeout_secs));
         let mut last_outcome: Option<PhaseExecutionOutcome> = None;
+        let conversation_id = params
+            .dispatch_input
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .and_then(|v| v.get("__animus_conversation_id").and_then(Value::as_str).map(ToOwned::to_owned));
         let base_context = serde_json::json!({
             "tool": effective_tool_id,
             "prompt": prompt,
@@ -1783,6 +1807,7 @@ async fn run_workflow_phase_with_agent(params: PhaseAgentParams<'_>) -> Result<A
             "subject_id": subject_id,
             "phase_id": phase_id,
             "phase_capabilities": serde_json::to_value(&effective_caps)?,
+            "conversation_id": conversation_id,
         });
         let phase_contract = ctx.phase_output_contract(phase_id).cloned();
         let phase_output_schema = phase_output_json_schema_for(ctx, phase_id)?;
