@@ -24,7 +24,7 @@ use animus_workflow_runner_protocol::{
     WorkflowPhaseRunRequest, WorkflowPhaseRunResult, KIND as WORKFLOW_RUNNER_KIND,
 };
 use anyhow::{anyhow, Result};
-use orchestrator_core::{services::ServiceHub, FileServiceHub, WorkflowStatus};
+use orchestrator_core::{services::ServiceHub, FileServiceHub, SubjectRef, WorkflowStatus};
 use serde_json::Value;
 
 use crate::phase_event_recorder::PhaseEventRecorder;
@@ -237,20 +237,22 @@ pub async fn handle_workflow_execute(request: WorkflowExecuteRequest) -> Result<
     // `resolve_input` only understands the convenience fields, so we
     // project the v0.5 envelopes down to the equivalent task / requirement
     // / title triple before constructing `WorkflowExecuteInternalParams`.
-    let (task_id, requirement_id, title, description) =
-        resolve_subject_fields(&request).map_err(|e| anyhow!("invalid subject envelope: {e}"))?;
+    let resolved = resolve_subject_fields(&request).map_err(|e| anyhow!("invalid subject envelope: {e}"))?;
 
     let params = WorkflowExecuteInternalParams {
         project_root: project_root_str.clone(),
         workflow_id: request.workflow_id.clone(),
-        task_id,
-        requirement_id,
-        // The IPC path projects subject envelopes down to the
-        // task/requirement/title triple via `resolve_subject_fields`; the
-        // generic `--subject-id` subject is a CLI-direct-execute concern.
-        subject: None,
-        title,
-        description,
+        task_id: resolved.task_id,
+        requirement_id: resolved.requirement_id,
+        // Generic BaaS dynamic-kind subjects (e.g. `blog:BLOG-001`) carry no
+        // task_id/requirement_id and must NOT be collapsed to a `custom` title —
+        // that loses the real kind+id, so the run resolves the wrong subject and
+        // the reattach path rejects it as "not a custom workflow". Carry the full
+        // kind-qualified `SubjectRef` so `resolve_input` builds
+        // `WorkflowRunInput::for_subject` and the persisted run keeps kind+id.
+        subject: resolved.subject,
+        title: resolved.title,
+        description: resolved.description,
         workflow_ref: request.workflow_ref.clone(),
         input: request.input.clone(),
         vars: request.vars.clone(),
@@ -321,68 +323,84 @@ fn snapshot_from_value(value: Value) -> PhaseResultSnapshot {
     PhaseResultSnapshot { phase_id, status, duration_secs, outcome, metadata, next_phase_id, close_reason }
 }
 
-/// Project the protocol's three-way subject envelope onto the lifted
-/// `(task_id, requirement_id, title, description)` tuple expected by
+/// The lifted subject inputs `resolve_input` in `workflow_execute.rs`
+/// understands: the legacy `(task_id, requirement_id, title, description)`
+/// convenience fields PLUS a first-class generic `subject` for BaaS dynamic
+/// kinds. Exactly one shape is populated per request.
+#[derive(Default)]
+struct ResolvedSubject {
+    task_id: Option<String>,
+    requirement_id: Option<String>,
+    title: Option<String>,
+    description: Option<String>,
+    /// A kind-qualified generic subject (e.g. `blog:BLOG-001`). When set it
+    /// takes precedence in `resolve_input` so the run resolves under the real
+    /// kind instead of being coerced to `custom`.
+    subject: Option<SubjectRef>,
+}
+
+/// Project the protocol's three-way subject envelope onto the inputs expected by
 /// `resolve_input` in `workflow_execute.rs`.
 ///
-/// Priority order (codex P1 round 3 — generic subjects were previously
-/// rejected):
+/// Priority order:
 ///
 /// 1. Explicit convenience fields (`task_id`, `requirement_id`,
 ///    `title`+`description`) take precedence.
-/// 2. `subject_dispatch.subject` is inspected next; task / requirement
-///    kinds project onto the matching id, custom kinds project onto a
-///    synthetic title.
-/// 3. `subject_ref` is the final fallback with the same projection.
+/// 2. `subject_dispatch.subject` is inspected next.
+/// 3. `subject_ref` is the final fallback.
 ///
-/// Generic non-task / non-requirement subjects (e.g. Linear issues) are
-/// projected as a custom title + description so the lifted code can run
-/// them as ad-hoc subjects until first-class generic-subject support
-/// lands. (Tracked as v0.6 work.)
-type SubjectFieldsResult =
-    std::result::Result<(Option<String>, Option<String>, Option<String>, Option<String>), String>;
+/// For (2)/(3): the built-in `task` / `requirement` kinds project onto the
+/// matching convenience id (byte-identical to the dedicated flags); the built-in
+/// `custom` kind projects onto a synthetic title; and every OTHER (generic BaaS
+/// dynamic) kind is carried as a full `SubjectRef` so it resolves under its real
+/// kind via `<kind>/get` instead of being collapsed to a `custom` title (which
+/// loses kind+id and makes the persisted run subjectless / the reattach reject
+/// it).
+type SubjectFieldsResult = std::result::Result<ResolvedSubject, String>;
 
 fn resolve_subject_fields(request: &WorkflowExecuteRequest) -> SubjectFieldsResult {
     if request.task_id.is_some() || request.requirement_id.is_some() || request.title.is_some() {
-        return Ok((
-            request.task_id.clone(),
-            request.requirement_id.clone(),
-            request.title.clone(),
-            request.description.clone(),
-        ));
+        return Ok(ResolvedSubject {
+            task_id: request.task_id.clone(),
+            requirement_id: request.requirement_id.clone(),
+            title: request.title.clone(),
+            description: request.description.clone(),
+            subject: None,
+        });
     }
 
     if let Some(dispatch) = &request.subject_dispatch {
-        let subject = &dispatch.subject;
-        let kind = subject.kind();
-        let id = subject.id().to_string();
-        if kind.eq_ignore_ascii_case(animus_subject_protocol::subject_kind::TASK) {
-            return Ok((Some(id), None, None, None));
-        }
-        if kind.eq_ignore_ascii_case(animus_subject_protocol::subject_kind::REQUIREMENT) {
-            return Ok((None, Some(id), None, None));
-        }
-        // Generic kind — project as a custom subject.
-        let title = subject.title.clone().unwrap_or_else(|| id.clone());
-        let description = subject.description.clone().unwrap_or_default();
-        return Ok((None, None, Some(title), Some(description)));
+        return Ok(resolve_subject_ref(&dispatch.subject));
     }
 
     if let Some(subject_ref) = &request.subject_ref {
-        let kind = subject_ref.kind();
-        let id = subject_ref.id().to_string();
-        if kind.eq_ignore_ascii_case(animus_subject_protocol::subject_kind::TASK) {
-            return Ok((Some(id), None, None, None));
-        }
-        if kind.eq_ignore_ascii_case(animus_subject_protocol::subject_kind::REQUIREMENT) {
-            return Ok((None, Some(id), None, None));
-        }
-        let title = subject_ref.title.clone().unwrap_or_else(|| id.clone());
-        let description = subject_ref.description.clone().unwrap_or_default();
-        return Ok((None, None, Some(title), Some(description)));
+        return Ok(resolve_subject_ref(subject_ref));
     }
 
     Err("one of task_id / requirement_id / title / subject_ref / subject_dispatch must be set".to_string())
+}
+
+/// Project a single [`SubjectRef`] onto [`ResolvedSubject`] (shared by the
+/// `subject_dispatch` and `subject_ref` envelopes).
+fn resolve_subject_ref(subject: &SubjectRef) -> ResolvedSubject {
+    let kind = subject.kind();
+    let id = subject.id().to_string();
+    if kind.eq_ignore_ascii_case(animus_subject_protocol::subject_kind::TASK) {
+        return ResolvedSubject { task_id: Some(id), ..Default::default() };
+    }
+    if kind.eq_ignore_ascii_case(animus_subject_protocol::subject_kind::REQUIREMENT) {
+        return ResolvedSubject { requirement_id: Some(id), ..Default::default() };
+    }
+    if kind.eq_ignore_ascii_case(animus_subject_protocol::subject_kind::CUSTOM) {
+        // Genuine built-in custom subject — project onto the title/description
+        // pair (unchanged behavior for schedule-style ad-hoc subjects).
+        let title = subject.title.clone().unwrap_or_else(|| id.clone());
+        let description = subject.description.clone().unwrap_or_default();
+        return ResolvedSubject { title: Some(title), description: Some(description), ..Default::default() };
+    }
+    // Generic BaaS dynamic kind — carry the full kind-qualified subject so the
+    // run keeps kind+id end to end.
+    ResolvedSubject { subject: Some(subject.clone()), ..Default::default() }
 }
 
 fn workflow_status_to_wire(status: WorkflowStatus) -> &'static str {
@@ -646,5 +664,74 @@ mod tests {
         assert!(serialized.get("mcp_config").is_some(), "mcp_config must round-trip on the wire");
         let back: WorkflowPhaseRunRequest = serde_json::from_value(serialized).expect("deserialize");
         assert_eq!(back.mcp_config, original.mcp_config);
+    }
+
+    fn execute_request_with_dispatch(dispatch: Option<protocol::SubjectDispatch>) -> WorkflowExecuteRequest {
+        WorkflowExecuteRequest {
+            workflow_id: None,
+            task_id: None,
+            requirement_id: None,
+            title: None,
+            description: None,
+            subject_dispatch: dispatch,
+            subject_ref: None,
+            workflow_ref: None,
+            input: None,
+            vars: Default::default(),
+            model: None,
+            tool: None,
+            phase_timeout_secs: None,
+            phase_filter: None,
+            phase_routing: None,
+            mcp_config: None,
+            actor: None,
+        }
+    }
+
+    fn dispatch_for(subject: SubjectRef) -> protocol::SubjectDispatch {
+        protocol::SubjectDispatch::for_subject_with_metadata(subject, "draft-blog", "test", chrono::Utc::now())
+    }
+
+    #[test]
+    fn resolve_subject_fields_carries_generic_baas_subject() {
+        // Regression: a generic BaaS dynamic-kind dispatch (kind=blog) must NOT
+        // be collapsed to a custom title — it must travel as a full SubjectRef so
+        // the persisted run keeps kind+id (and the reattach path validates it).
+        let request = execute_request_with_dispatch(Some(dispatch_for(SubjectRef::new("blog", "blog:BLOG-001"))));
+        let resolved = resolve_subject_fields(&request).expect("resolves");
+        let subject = resolved.subject.expect("generic subject must be carried");
+        assert_eq!(subject.kind(), "blog");
+        assert_eq!(subject.id(), "blog:BLOG-001");
+        assert!(resolved.task_id.is_none());
+        assert!(resolved.requirement_id.is_none());
+        assert!(resolved.title.is_none(), "generic subject must not be coerced to a custom title");
+    }
+
+    #[test]
+    fn resolve_subject_fields_keeps_task_projection() {
+        let request = execute_request_with_dispatch(Some(dispatch_for(SubjectRef::task("TASK-9"))));
+        let resolved = resolve_subject_fields(&request).expect("resolves");
+        assert_eq!(resolved.task_id.as_deref(), Some("TASK-9"));
+        assert!(resolved.subject.is_none(), "task kind keeps the convenience-id projection");
+        assert!(resolved.title.is_none());
+    }
+
+    #[test]
+    fn resolve_subject_fields_keeps_custom_projection() {
+        let request =
+            execute_request_with_dispatch(Some(dispatch_for(SubjectRef::custom("schedule:nightly", "nightly run"))));
+        let resolved = resolve_subject_fields(&request).expect("resolves");
+        assert_eq!(resolved.title.as_deref(), Some("schedule:nightly"));
+        assert_eq!(resolved.description.as_deref(), Some("nightly run"));
+        assert!(resolved.subject.is_none(), "genuine custom subject keeps the title/description projection");
+    }
+
+    #[test]
+    fn resolve_subject_fields_explicit_convenience_fields_win() {
+        let mut request = execute_request_with_dispatch(None);
+        request.task_id = Some("TASK-EXPLICIT".to_string());
+        let resolved = resolve_subject_fields(&request).expect("resolves");
+        assert_eq!(resolved.task_id.as_deref(), Some("TASK-EXPLICIT"));
+        assert!(resolved.subject.is_none());
     }
 }
