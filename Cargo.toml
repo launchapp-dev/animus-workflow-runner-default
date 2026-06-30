@@ -1,6 +1,6 @@
 [package]
 name = "animus-workflow-runner-default"
-version = "0.4.14"
+version = "0.4.15"
 edition = "2021"
 description = "Reference workflow_runner plugin for Animus v0.5 (stdio JSON-RPC + direct-execute CLI; replaces in-tree workflow-runner-v2)"
 license = "Elastic-2.0"
@@ -43,11 +43,11 @@ protocol                    = { git = "https://github.com/launchapp-dev/animus-p
 # (the daemon→runner `ANIMUS_ACTOR_JSON` channel — encode on the daemon side,
 # decode here) and is already pulled transitively via orchestrator-core, so
 # pinning it directly at the same rev adds no new version surface. -----------
-orchestrator-core          = { git = "https://github.com/launchapp-dev/animus-cli", rev = "74cffc5e75b4d1664345063d4ef7b7c1a13dc236" }
-orchestrator-config        = { git = "https://github.com/launchapp-dev/animus-cli", rev = "74cffc5e75b4d1664345063d4ef7b7c1a13dc236" }
-orchestrator-plugin-host   = { git = "https://github.com/launchapp-dev/animus-cli", rev = "74cffc5e75b4d1664345063d4ef7b7c1a13dc236" }
-orchestrator-logging       = { git = "https://github.com/launchapp-dev/animus-cli", rev = "74cffc5e75b4d1664345063d4ef7b7c1a13dc236" }
-animus-runtime-shared      = { git = "https://github.com/launchapp-dev/animus-cli", rev = "74cffc5e75b4d1664345063d4ef7b7c1a13dc236" }
+orchestrator-core          = { git = "https://github.com/launchapp-dev/animus-cli", rev = "5759d03cf4628d2e502f92f5e499fc050e9c8f35" }
+orchestrator-config        = { git = "https://github.com/launchapp-dev/animus-cli", rev = "5759d03cf4628d2e502f92f5e499fc050e9c8f35" }
+orchestrator-plugin-host   = { git = "https://github.com/launchapp-dev/animus-cli", rev = "5759d03cf4628d2e502f92f5e499fc050e9c8f35" }
+orchestrator-logging       = { git = "https://github.com/launchapp-dev/animus-cli", rev = "5759d03cf4628d2e502f92f5e499fc050e9c8f35" }
+animus-runtime-shared      = { git = "https://github.com/launchapp-dev/animus-cli", rev = "5759d03cf4628d2e502f92f5e499fc050e9c8f35" }
 
 # --- stdlib-ish deps (move with the crate) ----------------------------------
 anyhow = "1.0"
