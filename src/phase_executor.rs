@@ -1089,10 +1089,22 @@ async fn process_phase_event_stream(
     let mut pending_commit_message: Option<String> = None;
     let mut pending_phase_decision: Option<orchestrator_core::PhaseDecision> = None;
     let mut pending_result_payload: Option<Value> = None;
-    // Full assistant output, accumulated across chunks. Reasoning + tool-calling
-    // models stream the result object across multiple chunks, often after a long
-    // prose-and-reasoning preamble, so capture must scan the WHOLE output (not a
-    // single chunk) and keep the latest valid object (not the first match).
+    // Whether `pending_result_payload` holds a REAL result object (matching the
+    // expected kind) vs a decision-derived fallback. A real result freezes the
+    // payload (last-wins among real results); a decision fallback must keep
+    // refreshing so it tracks the last-wins verdict rather than the first one.
+    let mut result_payload_is_real = false;
+    // Full assistant output, accumulated VERBATIM across chunks (no injected
+    // separator) so the model's real line boundaries survive. Reasoning +
+    // tool-calling models stream the result/decision object across many chunks,
+    // often after a long prose-and-reasoning preamble, so capture must scan the
+    // WHOLE output (not a single chunk) and keep the latest valid object. An
+    // earlier version injected a '\n' after every chunk; for providers that
+    // stream fine-grained token deltas (e.g. the portal AI-SDK harness) that
+    // shattered a single-line JSON decision across many one-fragment lines, so
+    // the per-line parser never reassembled it and the verdict was silently
+    // dropped. Verbatim concatenation reconstructs the model's own lines, and
+    // the balanced-brace scanners find objects regardless of chunk boundaries.
     let mut accumulated_output = String::new();
     let mut provider_exhaustion_reason: Option<String> = None;
     let mut diagnostics = VecDeque::new();
@@ -1251,52 +1263,36 @@ async fn process_phase_event_stream(
                     provider_exhaustion_reason = PhaseFailureClassifier::provider_exhaustion_reason_from_text(&text);
                 }
                 PhaseFailureClassifier::push_phase_diagnostic_line(&mut diagnostics, &text);
-                if parse_commit_message && pending_commit_message.is_none() {
-                    pending_commit_message = parse_commit_message_from_text(&text);
-                }
-                if parse_phase_decision && pending_phase_decision.is_none() {
-                    if let Some(decision) = parse_phase_decision_from_text(&text, phase_id) {
-                        if pending_commit_message.is_none() {
-                            if let Some(ref cm) = decision.commit_message {
-                                pending_commit_message = Some(cm.clone());
-                            }
-                        }
-                        pending_phase_decision = Some(decision);
-                    }
-                }
                 accumulated_output.push_str(&text);
-                accumulated_output.push('\n');
-                if let Some(result) = parse_result_payload_from_text(&accumulated_output, expected_result_kind) {
-                    pending_result_payload = Some(result);
-                } else if pending_result_payload.is_none() && parse_phase_decision {
-                    pending_result_payload = parse_decision_payload_from_text(&accumulated_output, phase_id);
-                }
+                accumulate_phase_signals(
+                    &accumulated_output,
+                    phase_id,
+                    expected_result_kind,
+                    parse_commit_message,
+                    parse_phase_decision,
+                    &mut pending_commit_message,
+                    &mut pending_phase_decision,
+                    &mut pending_result_payload,
+                    &mut result_payload_is_real,
+                );
             }
             AgentRunEvent::Thinking { content, .. } => {
                 if provider_exhaustion_reason.is_none() {
                     provider_exhaustion_reason = PhaseFailureClassifier::provider_exhaustion_reason_from_text(&content);
                 }
                 PhaseFailureClassifier::push_phase_diagnostic_line(&mut diagnostics, &content);
-                if parse_commit_message && pending_commit_message.is_none() {
-                    pending_commit_message = parse_commit_message_from_text(&content);
-                }
-                if parse_phase_decision && pending_phase_decision.is_none() {
-                    if let Some(decision) = parse_phase_decision_from_text(&content, phase_id) {
-                        if pending_commit_message.is_none() {
-                            if let Some(ref cm) = decision.commit_message {
-                                pending_commit_message = Some(cm.clone());
-                            }
-                        }
-                        pending_phase_decision = Some(decision);
-                    }
-                }
                 accumulated_output.push_str(&content);
-                accumulated_output.push('\n');
-                if let Some(result) = parse_result_payload_from_text(&accumulated_output, expected_result_kind) {
-                    pending_result_payload = Some(result);
-                } else if pending_result_payload.is_none() && parse_phase_decision {
-                    pending_result_payload = parse_decision_payload_from_text(&accumulated_output, phase_id);
-                }
+                accumulate_phase_signals(
+                    &accumulated_output,
+                    phase_id,
+                    expected_result_kind,
+                    parse_commit_message,
+                    parse_phase_decision,
+                    &mut pending_commit_message,
+                    &mut pending_phase_decision,
+                    &mut pending_result_payload,
+                    &mut result_payload_is_real,
+                );
             }
             AgentRunEvent::Error { error, .. } => {
                 PhaseFailureClassifier::push_phase_diagnostic_line(&mut diagnostics, &error);
@@ -1356,6 +1352,56 @@ async fn process_phase_event_stream(
     ))
 }
 
+/// Update the phase's pending commit message, decision verdict, and result
+/// payload from the WHOLE accumulated (verbatim) assistant output so far. Called
+/// once per output/thinking chunk with the growing buffer, so every capture is a
+/// last-wins scan over the full text — robust to token-delta fragmentation and
+/// to interim/example objects preceding the authoritative one.
+#[allow(clippy::too_many_arguments)]
+fn accumulate_phase_signals(
+    accumulated: &str,
+    phase_id: &str,
+    expected_result_kind: &str,
+    parse_commit_message: bool,
+    parse_phase_decision: bool,
+    pending_commit_message: &mut Option<String>,
+    pending_phase_decision: &mut Option<orchestrator_core::PhaseDecision>,
+    pending_result_payload: &mut Option<Value>,
+    result_payload_is_real: &mut bool,
+) {
+    // Parse the decision FIRST so the commit-message fallback below can track the
+    // last-wins verdict rather than an earlier interim one.
+    if parse_phase_decision {
+        if let Some(decision) = parse_phase_decision_from_text(accumulated, phase_id) {
+            *pending_phase_decision = Some(decision);
+        }
+    }
+    if parse_commit_message {
+        // Last-wins, and consistent with the final decision: an explicit COMMIT
+        // marker in the text takes precedence; otherwise fall back to the current
+        // (last-wins) decision's own `commit_message`. Re-derived every chunk so a
+        // revised final decision never leaves a stale commit message behind.
+        *pending_commit_message = parse_commit_message_from_text(accumulated)
+            .or_else(|| pending_phase_decision.as_ref().and_then(|decision| decision.commit_message.clone()));
+    }
+    if let Some(result) = parse_result_payload_from_text(accumulated, expected_result_kind) {
+        *pending_result_payload = Some(result);
+        *result_payload_is_real = true;
+    } else if !*result_payload_is_real && parse_phase_decision {
+        // No real result yet: refresh the decision-derived fallback so it follows
+        // the last-wins verdict instead of freezing at the first decision. A real
+        // result (above) still takes over on any later chunk. NOTE: this fallback
+        // only captures explicit-`kind` decision objects; in the exotic case of an
+        // explicit decision followed by a LEGACY no-kind final verdict, the routed
+        // verdict (from `parse_phase_decision_from_text`) updates but this payload
+        // stays on the explicit object. The current contract emits a single
+        // consistent format, so mixed explicit/legacy streams do not occur.
+        if let Some(payload) = parse_decision_payload_from_text(accumulated, phase_id) {
+            *pending_result_payload = Some(payload);
+        }
+    }
+}
+
 fn parse_result_payload_from_text(text: &str, expected_kind: &str) -> Option<Value> {
     // Reasoning + tool-calling models emit prose, reasoning, and tool-call noise
     // before the real answer, often with the result object pretty-printed across
@@ -1385,7 +1431,14 @@ fn parse_result_payload_from_text(text: &str, expected_kind: &str) -> Option<Val
 /// JSON, pretty-printed / multi-line objects, and objects embedded mid-line.
 /// Brace counting respects JSON string literals so `{` / `}` inside string
 /// values (e.g. song lyrics) don't throw off the span.
-fn collect_balanced_json_objects(text: &str) -> Vec<Value> {
+pub(crate) fn collect_balanced_json_objects(text: &str) -> Vec<Value> {
+    collect_balanced_json_object_spans(text).into_iter().map(|(_, value)| value).collect()
+}
+
+/// Like [`collect_balanced_json_objects`] but also returns each object's byte
+/// start offset in `text`, so callers can order matches from different scans
+/// (balanced vs whole-line) by true document position for last-wins selection.
+pub(crate) fn collect_balanced_json_object_spans(text: &str) -> Vec<(usize, Value)> {
     let bytes = text.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
@@ -1394,7 +1447,7 @@ fn collect_balanced_json_objects(text: &str) -> Vec<Value> {
             if let Some(end) = balanced_object_end(bytes, i) {
                 if let Ok(value) = serde_json::from_str::<Value>(&text[i..=end]) {
                     if value.is_object() {
-                        out.push(value);
+                        out.push((i, value));
                     }
                 }
                 i = end + 1;
@@ -1489,12 +1542,27 @@ fn truncate_json_value(value: &Value, max_chars: usize) -> Value {
 }
 
 fn parse_decision_payload_from_text(text: &str, phase_id: &str) -> Option<Value> {
-    for (_raw, payload) in collect_json_payload_lines(text) {
+    // Balanced-brace scan, LAST-wins — consistent with the last-wins verdict in
+    // `parse_phase_decision_from_text`, so the persisted decision-derived payload
+    // reflects the same final decision the phase is routed on rather than an
+    // earlier interim one. `parse_decision_payload_from_payload` already requires
+    // an explicit `kind:"phase_decision"`, so the scan needs no extra gate.
+    let mut last = None;
+    for payload in collect_balanced_json_objects(text) {
         if let Some(result) = parse_decision_payload_from_payload(&payload, phase_id) {
-            return Some(result);
+            last = Some(result);
         }
     }
-    None
+    if last.is_some() {
+        return last;
+    }
+    // Fallback: whole-line scan also covers top-level arrays / JSONL, last-wins.
+    for (_raw, payload) in collect_json_payload_lines(text) {
+        if let Some(result) = parse_decision_payload_from_payload(&payload, phase_id) {
+            last = Some(result);
+        }
+    }
+    last
 }
 
 fn parse_decision_payload_from_payload(payload: &Value, _phase_id: &str) -> Option<Value> {
@@ -2786,6 +2854,77 @@ mod tests {
     use crate::runtime_support::{inject_cli_launch_env, WorkflowPhaseRuntimeSettings};
 
     use std::collections::BTreeMap;
+
+    #[test]
+    fn parse_phase_decision_recovers_multiline_and_fragmented_json() {
+        use super::parse_phase_decision_from_text;
+        // Single line reassembled from token deltas — the common streaming case.
+        let one_line =
+            "Reviewed.\n{\"kind\":\"phase_decision\",\"verdict\":\"rework\",\"reason\":\"tests missing\"}\nOK";
+        let d = parse_phase_decision_from_text(one_line, "review").expect("decision recovered");
+        assert_eq!(d.verdict, orchestrator_core::PhaseDecisionVerdict::Rework);
+        // An interim/example decision followed by the final one: last wins.
+        let interim_then_final = "example: {\"kind\":\"phase_decision\",\"verdict\":\"advance\"}\nfinal: {\"kind\":\"phase_decision\",\"verdict\":\"rework\",\"reason\":\"real\"}";
+        let d = parse_phase_decision_from_text(interim_then_final, "review").expect("decision recovered");
+        assert_eq!(d.verdict, orchestrator_core::PhaseDecisionVerdict::Rework);
+        // A legacy no-kind decision on its OWN line is still trusted.
+        let legacy = "notes\n{\"verdict\":\"rework\",\"reason\":\"legacy\"}\n";
+        let d = parse_phase_decision_from_text(legacy, "review").expect("legacy decision recovered");
+        assert_eq!(d.verdict, orchestrator_core::PhaseDecisionVerdict::Rework);
+        // Incidental embedded JSON must NOT override the real explicit verdict:
+        // `{"kind":"phase_decision","verdict":"advance"}` then a prose object
+        // carrying a scalar `decision` + `verdict` embedded mid-line.
+        let noise_after = "{\"kind\":\"phase_decision\",\"verdict\":\"advance\"} — note: {\"decision\":\"reject\",\"verdict\":\"fail\"} in my view";
+        let d = parse_phase_decision_from_text(noise_after, "review").expect("explicit decision recovered");
+        assert_eq!(d.verdict, orchestrator_core::PhaseDecisionVerdict::Advance);
+        // Pretty-printed multi-line object — the legacy per-line scan missed it.
+        let multiline = "thinking...\n{\n  \"kind\": \"phase_decision\",\n  \"verdict\": \"rework\",\n  \"reason\": \"needs another pass\"\n}\n";
+        let d = parse_phase_decision_from_text(multiline, "review").expect("decision recovered");
+        assert_eq!(d.verdict, orchestrator_core::PhaseDecisionVerdict::Rework);
+    }
+
+    #[tokio::test]
+    async fn phase_decision_survives_token_delta_fragmentation() {
+        use protocol::{AgentRunEvent, OutputStreamType, RunId};
+        // Reproduces the portal AI-SDK harness: the verdict JSON is streamed as
+        // many tiny token deltas, each a separate OutputChunk, so no single
+        // chunk is complete JSON. Pre-fix the per-chunk / newline-shattered
+        // parse dropped the verdict and the phase advanced instead of reworking.
+        let run_id = RunId("wf-test-frag".to_string());
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let json = r#"{"kind":"phase_decision","verdict":"rework","reason":"insufficient coverage"}"#;
+        // Prose preamble, then the verdict chopped into 5-char slices.
+        tx.send(AgentRunEvent::OutputChunk {
+            run_id: run_id.clone(),
+            stream_type: OutputStreamType::Stdout,
+            text: "Here is my review.\n".to_string(),
+        })
+        .await
+        .unwrap();
+        for chunk in json.as_bytes().chunks(5) {
+            tx.send(AgentRunEvent::OutputChunk {
+                run_id: run_id.clone(),
+                stream_type: OutputStreamType::Stdout,
+                text: String::from_utf8(chunk.to_vec()).unwrap(),
+            })
+            .await
+            .unwrap();
+        }
+        tx.send(AgentRunEvent::Finished { run_id: run_id.clone(), exit_code: Some(0), duration_ms: 1 }).await.unwrap();
+        drop(tx);
+
+        let outcome =
+            process_phase_event_stream(rx, &run_id, "wf-test", "review", false, true, "", None, None, None, None)
+                .await
+                .expect("stream processed");
+        match outcome {
+            PhaseExecutionOutcome::Completed { phase_decision, .. } => {
+                let decision = phase_decision.expect("verdict must survive delta fragmentation");
+                assert_eq!(decision.verdict, orchestrator_core::PhaseDecisionVerdict::Rework);
+            }
+            other => panic!("expected Completed with a rework verdict, got {other:?}"),
+        }
+    }
 
     #[test]
     fn parse_result_payload_recovers_from_prose_and_multiline_json() {

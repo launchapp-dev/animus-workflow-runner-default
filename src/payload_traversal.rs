@@ -49,13 +49,80 @@ pub fn traverse_text<T>(
 }
 
 pub fn parse_phase_decision_from_text(text: &str, phase_id: &str) -> Option<orchestrator_core::PhaseDecision> {
-    traverse_text(
-        text,
-        &|payload| extract_phase_decision(payload, phase_id),
-        &|_raw| None,
-        &["phase_decision", "decision"],
-        &[],
-    )
+    // A single last-wins scan ordered by true byte position in `text`, drawing
+    // decisions from two sources with different trust rules:
+    //
+    //   * Balanced-brace objects (anywhere in the text — tolerates prose,
+    //     pretty-printed / multi-line JSON, mid-line embedding) are accepted ONLY
+    //     via `extract_phase_decision_strict`, which requires an EXPLICIT decision
+    //     shape (a nested `phase_decision`/`decision` OBJECT, or a top-level
+    //     `kind:"phase_decision"`). Without that gate an incidental transcript
+    //     object like `{"verdict":"fail"}` — or `{"decision":"reject",
+    //     "verdict":"fail"}` — would be accepted (`try_parse_decision` defaults a
+    //     missing `kind` to `phase_decision`) and could override the real verdict
+    //     under last-wins.
+    //   * Whole-line objects keep the legacy lenient no-kind compatibility: a
+    //     decision on its OWN line is intentional. A no-kind object that is NOT a
+    //     whole line (e.g. glued to preceding prose/thinking by chunk merging) is
+    //     deliberately NOT trusted — it is indistinguishable from prose noise, so
+    //     safety wins. The current contract emits explicit-`kind` decisions,
+    //     which the balanced scan captures regardless of line boundaries.
+    //
+    // The authoritative verdict is emitted last, so the highest-offset match
+    // wins across BOTH sources — an early explicit decision never shadows a later
+    // legacy one, and vice versa.
+    let mut best: Option<(usize, orchestrator_core::PhaseDecision)> = None;
+    let mut consider = |offset: usize, decision: orchestrator_core::PhaseDecision| {
+        if best.as_ref().map(|(o, _)| offset >= *o).unwrap_or(true) {
+            best = Some((offset, decision));
+        }
+    };
+    for (offset, payload) in crate::phase_executor::collect_balanced_json_object_spans(text) {
+        if let Some(decision) = extract_phase_decision_strict(&payload, phase_id) {
+            consider(offset, decision);
+        }
+    }
+    let mut line_start = 0usize;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            if let Ok(payload) = serde_json::from_str::<Value>(trimmed) {
+                if let Some(decision) = extract_phase_decision(&payload, phase_id) {
+                    consider(line_start, decision);
+                }
+            }
+        }
+        line_start += line.len();
+    }
+    best.map(|(_, decision)| decision)
+}
+
+/// Extract a phase decision from an object found by the balanced-brace scan,
+/// accepting ONLY an explicit decision shape so incidental transcript JSON can't
+/// masquerade as a verdict: a nested `phase_decision`/`decision` OBJECT carrying
+/// a valid decision, or a top-level object that declares `kind:"phase_decision"`.
+/// Unlike [`extract_phase_decision`] it never falls back to parsing a top-level
+/// object with a defaulted (missing) `kind`.
+fn extract_phase_decision_strict(payload: &Value, phase_id: &str) -> Option<orchestrator_core::PhaseDecision> {
+    if let Some(nested) = payload.get("phase_decision").filter(|value| value.is_object()) {
+        if let Some(decision) = try_parse_decision(nested, phase_id) {
+            return Some(decision);
+        }
+    }
+    if let Some(nested) = payload.get("decision").filter(|value| value.is_object()) {
+        if let Some(decision) = try_parse_decision(nested, phase_id) {
+            return Some(decision);
+        }
+    }
+    let has_explicit_kind = payload
+        .get("kind")
+        .and_then(Value::as_str)
+        .map(|kind| kind.eq_ignore_ascii_case("phase_decision"))
+        .unwrap_or(false);
+    if has_explicit_kind {
+        return try_parse_decision(payload, phase_id);
+    }
+    None
 }
 
 fn extract_phase_decision(payload: &Value, phase_id: &str) -> Option<orchestrator_core::PhaseDecision> {
