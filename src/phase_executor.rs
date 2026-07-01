@@ -2070,6 +2070,20 @@ async fn run_workflow_phase_with_agent(params: PhaseAgentParams<'_>) -> Result<A
                         .as_object_mut()
                         .expect("json object")
                         .insert("runtime_contract".to_string(), runtime_contract);
+                    // Thread the phase response schema (output + phase_decision)
+                    // to the TOP LEVEL of the context so it reaches session-backend
+                    // providers verbatim via `extras.response_schema` (which
+                    // `build_run_params` lifts into `AgentRunRequest.response_schema`).
+                    // CLI providers get the same schema via a launch-args flag
+                    // (`inject_response_schema_into_launch_args`); session backends
+                    // (e.g. the portal AI-SDK harness) had no path to it, so a
+                    // decision phase could never enforce its verdict schema.
+                    if let Some(schema) = phase_response_schema.as_ref() {
+                        context
+                            .as_object_mut()
+                            .expect("json object")
+                            .insert("response_schema".to_string(), schema.clone());
+                    }
                 } else {
                     info!(
                         workflow_id = %workflow_id,
