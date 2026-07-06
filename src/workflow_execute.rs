@@ -54,6 +54,11 @@ pub struct WorkflowExecuteInternalParams {
     pub workflow_id: Option<String>,
     pub task_id: Option<String>,
     pub requirement_id: Option<String>,
+    /// Qualified `<kind>:<id>` for a subject of any (incl. runtime-declared)
+    /// kind, dispatched by the daemon via `--subject-id`. Resolved through
+    /// `WorkflowRunInput::for_subject` so dynamic kinds bind their real
+    /// subject instead of being collapsed to a task/custom convenience form.
+    pub subject_id: Option<String>,
     pub title: Option<String>,
     pub description: Option<String>,
     pub workflow_ref: Option<String>,
@@ -1038,6 +1043,24 @@ fn validate_existing_workflow_subject(workflow: &OrchestratorWorkflow, params: &
 
 fn resolve_input(params: &WorkflowExecuteParams) -> Result<WorkflowRunInput> {
     let workflow_ref = params.workflow_ref.clone();
+    // A qualified `<kind>:<id>` subject of ANY kind — the daemon emits
+    // `--subject-id` for every dynamic-kind dispatch (see
+    // build_runner_command_from_dispatch). Bind the real subject via
+    // `for_subject` so runtime-declared kinds resolve through `<kind>/get`
+    // rather than being collapsed to a task/custom shape (the arg-parse
+    // rejection of `--subject-id` was TASK-186: runs stalled with 0 events).
+    // Takes precedence over the task/requirement/title convenience forms.
+    if let Some(subject_id) = params.subject_id.as_deref() {
+        let (kind, id) = subject_id.split_once(':').ok_or_else(|| {
+            anyhow!("--subject-id '{subject_id}' must be qualified as '<kind>:<id>'")
+        })?;
+        if kind.is_empty() || id.is_empty() {
+            return Err(anyhow!("--subject-id '{subject_id}' must be qualified as '<kind>:<id>'"));
+        }
+        return Ok(WorkflowRunInput::for_subject(SubjectRef::new(kind, id), workflow_ref)
+            .with_input(params.input.clone())
+            .with_vars(params.vars.clone()));
+    }
     match (&params.task_id, &params.requirement_id, &params.title) {
         (Some(task_id), _, _) => Ok(WorkflowRunInput::for_task(task_id.clone(), workflow_ref)
             .with_input(params.input.clone())

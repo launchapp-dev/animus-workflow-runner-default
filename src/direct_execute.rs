@@ -24,6 +24,12 @@ pub struct ExecuteArgs {
     pub workflow_id: Option<String>,
     pub task_id: Option<String>,
     pub requirement_id: Option<String>,
+    /// Qualified `<kind>:<id>` of a subject of any (incl. runtime-declared)
+    /// kind. The daemon emits `--subject-id` for every dynamic-kind dispatch
+    /// (see build_runner_command_from_dispatch); the runner resolves it via
+    /// `WorkflowRunInput::for_subject`. Mutually exclusive with the task /
+    /// requirement / title convenience forms.
+    pub subject_id: Option<String>,
     pub title: Option<String>,
     pub description: Option<String>,
     pub workflow_ref: Option<String>,
@@ -50,6 +56,7 @@ impl ExecuteArgs {
         let mut workflow_id = None;
         let mut task_id = None;
         let mut requirement_id = None;
+        let mut subject_id = None;
         let mut title = None;
         let mut description = None;
         let mut workflow_ref = None;
@@ -68,6 +75,7 @@ impl ExecuteArgs {
                 "--workflow-id"
                 | "--task-id"
                 | "--requirement-id"
+                | "--subject-id"
                 | "--title"
                 | "--description"
                 | "--workflow-ref"
@@ -89,6 +97,7 @@ impl ExecuteArgs {
                 "--workflow-id" => workflow_id = Some(value),
                 "--task-id" => task_id = Some(value),
                 "--requirement-id" => requirement_id = Some(value),
+                "--subject-id" => subject_id = Some(value),
                 "--title" => title = Some(value),
                 "--description" => description = Some(value),
                 "--workflow-ref" => workflow_ref = Some(value),
@@ -111,6 +120,7 @@ impl ExecuteArgs {
             workflow_id,
             task_id,
             requirement_id,
+            subject_id,
             title,
             description,
             workflow_ref,
@@ -171,6 +181,7 @@ async fn run_execute_inner(args: ExecuteArgs) -> anyhow::Result<u8> {
         .as_deref()
         .or(args.task_id.as_deref())
         .or(args.requirement_id.as_deref())
+        .or(args.subject_id.as_deref())
         .or(args.title.as_deref())
         .unwrap_or("unknown")
         .to_string();
@@ -197,6 +208,7 @@ async fn run_execute_inner(args: ExecuteArgs) -> anyhow::Result<u8> {
         workflow_id: args.workflow_id,
         task_id: args.task_id,
         requirement_id: args.requirement_id,
+        subject_id: args.subject_id,
         title: args.title,
         description: args.description,
         workflow_ref: args.workflow_ref.clone(),
@@ -363,6 +375,28 @@ mod tests {
         assert_eq!(args.task_id.as_deref(), Some("TASK-001"));
         assert_eq!(args.project_root, "/tmp/project");
         assert_eq!(args.workflow_ref.as_deref(), Some("default"));
+        assert!(args.requirement_id.is_none());
+        assert!(args.title.is_none());
+        assert!(args.subject_id.is_none());
+    }
+
+    #[test]
+    fn execute_args_parse_subject_id_dynamic_kind() {
+        // TASK-186 regression: the daemon dispatches every dynamic (incl.
+        // runtime-declared) kind with `--subject-id <kind>:<id>`. The runner
+        // used to reject it ("unknown argument: --subject-id") and die before
+        // any phase. It must now parse into `subject_id`.
+        let argv = vec![
+            "--subject-id".to_string(),
+            "transcript:TRANSCRIPT-001".to_string(),
+            "--project-root".to_string(),
+            "/tmp/project".to_string(),
+            "--workflow-ref".to_string(),
+            "transcript".to_string(),
+        ];
+        let args = ExecuteArgs::parse(argv.into_iter()).expect("--subject-id must parse");
+        assert_eq!(args.subject_id.as_deref(), Some("transcript:TRANSCRIPT-001"));
+        assert!(args.task_id.is_none());
         assert!(args.requirement_id.is_none());
         assert!(args.title.is_none());
     }

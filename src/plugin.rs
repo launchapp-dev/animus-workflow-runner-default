@@ -245,6 +245,11 @@ pub async fn handle_workflow_execute(request: WorkflowExecuteRequest) -> Result<
         workflow_id: request.workflow_id.clone(),
         task_id,
         requirement_id,
+        // The stdio plugin path resolves its subject envelope via
+        // `resolve_subject_fields` into the task/requirement/title triple;
+        // `--subject-id` is only used by the direct-execute (daemon-dispatch)
+        // path, so it is None here.
+        subject_id: None,
         title,
         description,
         workflow_ref: request.workflow_ref.clone(),
