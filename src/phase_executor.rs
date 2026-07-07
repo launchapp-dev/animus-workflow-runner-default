@@ -5,8 +5,8 @@ use crate::ipc::{
 };
 use crate::payload_traversal::{parse_commit_message_from_text, parse_phase_decision_from_text};
 use crate::phase_command::{
-    build_command_phase_decision, build_command_result_payload, run_workflow_phase_with_command,
-    CommandExecutionContext,
+    build_command_phase_decision, build_command_result_payload, command_failure_is_terminal,
+    run_workflow_phase_with_command, summarize_output_excerpt, CommandExecutionContext, CommandPhaseFailedError,
 };
 use crate::phase_failover::{failure_token, retry_decision_for_token, PhaseFailureClassifier};
 use crate::phase_git::commit_implementation_changes;
@@ -266,7 +266,10 @@ fn load_agent_runtime_config_strict(project_root: &str) -> Result<orchestrator_c
     orchestrator_core::agent_runtime_config::load_agent_runtime_config_with_metadata(Path::new(project_root))
 }
 
-fn load_workflow_config_strict(project_root: &str, actor: Option<&Actor>) -> Result<orchestrator_core::LoadedWorkflowConfig> {
+fn load_workflow_config_strict(
+    project_root: &str,
+    actor: Option<&Actor>,
+) -> Result<orchestrator_core::LoadedWorkflowConfig> {
     orchestrator_core::load_workflow_config_with_metadata(Path::new(project_root), actor)
 }
 
@@ -2663,6 +2666,29 @@ async fn run_workflow_phase_inner(params: &PhaseRunParams<'_>) -> Result<PhaseRu
                         Some(failure_summary.as_str()),
                     )
                 });
+
+                // TASK-205 change 2: when the resolved failure disposition is a
+                // terminal `fail`, surface a structured `phase_failed` carrying
+                // the exit-code + stderr snippet (persisted into journal_events
+                // by the ao-cli #299 mapping) instead of a `Completed{Fail}` that
+                // emits `phase_completed` and drops the exit metadata. QA-gate
+                // verdicts (rework/advance/skip) keep the Completed path so a
+                // failing test/lint command still drives the rework loop.
+                if command_failure_is_terminal(&decision) {
+                    let stderr_excerpt =
+                        summarize_output_excerpt(&command_result.stderr, command.excerpt_max_chars.unwrap_or(800));
+                    let message = format!(
+                        "phase '{}' command '{}' exited with code {} and failed the phase",
+                        phase_id, command_result.program, command_result.exit_code
+                    );
+                    return Err(anyhow::Error::new(CommandPhaseFailedError {
+                        message,
+                        program: Some(command_result.program.clone()),
+                        exit_code: Some(command_result.exit_code),
+                        stderr_excerpt,
+                    }));
+                }
+
                 let result_payload = build_command_result_payload(
                     command,
                     phase_id,

@@ -39,6 +39,118 @@ pub(crate) struct CommandExecutionResult {
     pub failure_summary: Option<String>,
 }
 
+/// Template variables that a command phase MUST have bound to a non-empty
+/// value before it is safe to execute. Today this is the subject identity:
+/// a command like `animus subject status --id {{subject_id}}` dispatched on a
+/// run with no bound subject expands `{{subject_id}}` to the empty string and
+/// invokes `animus subject status --id ""`, which the CLI rejects with
+/// "--id must not be empty" (exit 2). The pre-fix runner then treated that as
+/// a normal non-zero exit -> rework -> 4 retries -> escalated. Detecting the
+/// unresolved binding up front lets the phase fail-fast on attempt 1 with a
+/// clear message instead of burning the whole rework budget. Extend this list
+/// as other required-non-empty bindings are identified.
+pub(crate) const COMMAND_REQUIRED_NONEMPTY_VARS: &[&str] = &["subject_id"];
+
+/// Sentinel error attached to a terminal command-phase failure. Carries the
+/// structured exit-code + stderr snippet so the `workflow_execute` error arms
+/// can emit a `phase_failed` runtime event that the ao-cli journal mapping
+/// (ao-cli PR #299) persists into `journal_events` with the exit metadata,
+/// instead of a `phase_completed`+rework that drops it. Recovered upstream via
+/// `error.downcast_ref::<CommandPhaseFailedError>()`.
+#[derive(Debug, Clone)]
+pub struct CommandPhaseFailedError {
+    pub message: String,
+    pub program: Option<String>,
+    pub exit_code: Option<i32>,
+    pub stderr_excerpt: Option<String>,
+}
+
+impl std::fmt::Display for CommandPhaseFailedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for CommandPhaseFailedError {}
+
+/// Collect the `{{name}}` placeholder names referenced in `text`. Mirrors the
+/// scanning rules of `orchestrator_config::expand_variables` (a placeholder is
+/// the exact text between the first `{{` and the next `}}`; no trimming).
+fn referenced_template_vars(text: &str) -> Vec<&str> {
+    let mut names = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("{{") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("}}") else {
+            break;
+        };
+        names.push(&after[..end]);
+        rest = &after[end + 2..];
+    }
+    names
+}
+
+/// Return the required-non-empty template vars (see
+/// [`COMMAND_REQUIRED_NONEMPTY_VARS`]) that a command references via a
+/// `{{name}}` placeholder but which resolve to an empty value in
+/// `template_vars` (or are absent entirely). A non-empty result means the
+/// command must NOT be executed — its required binding is unresolved.
+pub(crate) fn unresolved_required_command_vars(
+    command: &orchestrator_core::PhaseCommandDefinition,
+    template_vars: &HashMap<String, String>,
+) -> Vec<String> {
+    let mut fields: Vec<&str> = Vec::with_capacity(1 + command.args.len() + command.env.len());
+    fields.push(command.program.as_str());
+    fields.extend(command.args.iter().map(String::as_str));
+    fields.extend(command.env.values().map(String::as_str));
+    if let Some(cwd) = command.cwd_path.as_deref() {
+        fields.push(cwd);
+    }
+
+    let mut unresolved: Vec<String> = Vec::new();
+    for field in fields {
+        for name in referenced_template_vars(field) {
+            let required = COMMAND_REQUIRED_NONEMPTY_VARS.contains(&name);
+            let empty = template_vars.get(name).map(|value| value.trim().is_empty()).unwrap_or(true);
+            if required && empty && !unresolved.iter().any(|existing| existing == name) {
+                unresolved.push(name.to_string());
+            }
+        }
+    }
+    unresolved
+}
+
+/// True when a failed command phase's resolved decision is a terminal `fail`
+/// (as opposed to a QA-gate `rework`/`advance`/`skip`). Only terminal-fail
+/// command exits are re-routed into a `phase_failed` event carrying the exit
+/// metadata; rework gates keep their existing `phase_completed` path so a
+/// failing test/lint command still drives the implement->review loop.
+pub(crate) fn command_failure_is_terminal(decision: &orchestrator_core::PhaseDecision) -> bool {
+    matches!(decision.verdict, orchestrator_core::PhaseDecisionVerdict::Fail)
+}
+
+/// Build the `phase_failed` runtime-event payload for a terminal command
+/// failure, carrying the exit-code + stderr snippet the journal mapping
+/// persists. Shared by both `workflow_execute` error arms (single-phase and
+/// multi-phase) so the wire shape stays identical.
+pub(crate) fn command_phase_failed_event_payload(phase_id: &str, error: &CommandPhaseFailedError) -> Value {
+    let mut payload = serde_json::json!({
+        "phase_id": phase_id,
+        "phase_status": "failed",
+        "error": error.message,
+    });
+    if let Some(code) = error.exit_code {
+        payload["exit_code"] = serde_json::json!(code);
+    }
+    if let Some(ref stderr) = error.stderr_excerpt {
+        payload["stderr"] = serde_json::json!(stderr);
+    }
+    if let Some(ref program) = error.program {
+        payload["program"] = serde_json::json!(program);
+    }
+    payload
+}
+
 pub(crate) fn build_command_template_vars(context: &CommandExecutionContext<'_>) -> HashMap<String, String> {
     let mut vars = HashMap::from([
         ("project_root".to_string(), context.project_root.to_string()),
@@ -192,7 +304,7 @@ fn extract_failing_tests(
     failing
 }
 
-fn summarize_output_excerpt(text: &str, max_len: usize) -> Option<String> {
+pub(crate) fn summarize_output_excerpt(text: &str, max_len: usize) -> Option<String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return None;
@@ -362,6 +474,37 @@ pub(crate) async fn run_workflow_phase_with_command(
     }
 
     let template_vars = build_command_template_vars(context);
+
+    // Fail-fast (TASK-205): a required binding like `{{subject_id}}` that
+    // expands to empty (no subject bound) would run e.g. `animus subject
+    // status --id ""` and get rejected by the CLI, then be retried until the
+    // rework budget escalates. Refuse to execute the command and surface a
+    // clear, attempt-1 terminal failure instead.
+    let unresolved = unresolved_required_command_vars(command, &template_vars);
+    if !unresolved.is_empty() {
+        let placeholders = unresolved
+            .iter()
+            .map(|name| {
+                let mut placeholder = String::with_capacity(name.len() + 4);
+                placeholder.push_str("{{");
+                placeholder.push_str(name);
+                placeholder.push_str("}}");
+                placeholder
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let message = format!(
+            "phase '{}' command '{}' references unresolved template {} — no subject bound; failing before execution to avoid burning the rework budget",
+            context.phase_id, command.program, placeholders
+        );
+        return Err(anyhow::Error::new(CommandPhaseFailedError {
+            message,
+            program: Some(command.program.clone()),
+            exit_code: None,
+            stderr_excerpt: None,
+        }));
+    }
+
     let args =
         command.args.iter().map(|arg| orchestrator_config::expand_variables(arg, &template_vars)).collect::<Vec<_>>();
     let env = command
@@ -518,6 +661,128 @@ fn validate_command_contract(
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    fn command_def(program: &str, args: &[&str]) -> orchestrator_core::PhaseCommandDefinition {
+        serde_json::from_value(serde_json::json!({ "program": program, "args": args })).expect("command def")
+    }
+
+    fn command_def_with_failure_verdict(
+        program: &str,
+        on_failure_verdict: Option<&str>,
+    ) -> orchestrator_core::PhaseCommandDefinition {
+        serde_json::from_value(serde_json::json!({
+            "program": program,
+            "on_failure_verdict": on_failure_verdict,
+        }))
+        .expect("command def")
+    }
+
+    fn subjectless_context<'a>() -> CommandExecutionContext<'a> {
+        CommandExecutionContext {
+            project_root: ".",
+            execution_cwd: ".",
+            workflow_id: "wf-test",
+            phase_id: "sync-status",
+            workflow_ref: "default",
+            subject_id: "",
+            subject_title: "",
+            subject_description: "",
+            pipeline_vars: None,
+            dispatch_input: None,
+            schedule_input: None,
+        }
+    }
+
+    #[test]
+    fn unresolved_required_command_vars_flags_empty_subject_id() {
+        let command = command_def("animus", &["subject", "status", "--id", "{{subject_id}}"]);
+        let mut vars = HashMap::new();
+        vars.insert("subject_id".to_string(), String::new());
+        assert_eq!(unresolved_required_command_vars(&command, &vars), vec!["subject_id".to_string()]);
+
+        // Bound subject: nothing to flag.
+        vars.insert("subject_id".to_string(), "task:TASK-1".to_string());
+        assert!(unresolved_required_command_vars(&command, &vars).is_empty());
+    }
+
+    #[test]
+    fn unresolved_required_command_vars_ignores_unreferenced_and_optional() {
+        // subject_id is empty but not referenced by the command -> not flagged.
+        let command = command_def("echo", &["hello"]);
+        let mut vars = HashMap::new();
+        vars.insert("subject_id".to_string(), String::new());
+        assert!(unresolved_required_command_vars(&command, &vars).is_empty());
+
+        // A non-required var expanding to empty is not a fail-fast condition.
+        let command = command_def("echo", &["{{dispatch_input}}"]);
+        vars.insert("dispatch_input".to_string(), String::new());
+        assert!(unresolved_required_command_vars(&command, &vars).is_empty());
+    }
+
+    #[tokio::test]
+    async fn run_workflow_phase_with_command_fails_fast_on_empty_required_var() {
+        let command = command_def("false", &["{{subject_id}}"]);
+        let runtime =
+            orchestrator_core::AgentRuntimeConfig { tools_allowlist: vec!["false".to_string()], ..Default::default() };
+
+        let err = run_workflow_phase_with_command(&subjectless_context(), &runtime, &command)
+            .await
+            .expect_err("empty required var must fail fast");
+        let cmd_fail =
+            err.downcast_ref::<CommandPhaseFailedError>().expect("fail-fast returns a CommandPhaseFailedError");
+        // exit_code None proves the command never ran: a real run of `false`
+        // would surface exit_code Some(1) via failure_summary, not fail-fast.
+        assert!(cmd_fail.exit_code.is_none(), "fail-fast must not execute the command");
+        assert!(cmd_fail.message.contains("{{subject_id}}"), "message names the unresolved placeholder");
+        assert!(cmd_fail.message.contains("no subject bound"));
+    }
+
+    #[tokio::test]
+    async fn run_workflow_phase_with_command_runs_when_required_var_bound() {
+        // Control: a bound subject_id must NOT fail-fast — the command runs and
+        // a genuine non-zero exit is reported via failure_summary (proving the
+        // fail-fast guard does not over-trigger and swallow real executions).
+        let command = command_def("false", &["{{subject_id}}"]);
+        let runtime =
+            orchestrator_core::AgentRuntimeConfig { tools_allowlist: vec!["false".to_string()], ..Default::default() };
+        let mut context = subjectless_context();
+        context.subject_id = "task:TASK-1";
+
+        let result = run_workflow_phase_with_command(&context, &runtime, &command).await.expect("command runs");
+        assert_eq!(result.exit_code, 1);
+        assert!(result.failure_summary.is_some());
+    }
+
+    #[test]
+    fn command_phase_failed_event_payload_carries_exit_code_and_stderr() {
+        let error = CommandPhaseFailedError {
+            message: "phase 'sync-status' command 'animus' exited with code 2 and failed the phase".to_string(),
+            program: Some("animus".to_string()),
+            exit_code: Some(2),
+            stderr_excerpt: Some("--id must not be empty".to_string()),
+        };
+        let payload = command_phase_failed_event_payload("sync-status", &error);
+        assert_eq!(payload["phase_id"], "sync-status");
+        assert_eq!(payload["phase_status"], "failed");
+        assert_eq!(payload["exit_code"], 2);
+        assert_eq!(payload["stderr"], "--id must not be empty");
+        assert_eq!(payload["program"], "animus");
+        assert!(payload["error"].as_str().expect("error string").contains("code 2"));
+    }
+
+    #[test]
+    fn command_failure_is_terminal_only_for_fail_verdict() {
+        // on_failure_verdict "fail" -> terminal phase_failed routing.
+        let fail_cmd = command_def_with_failure_verdict("false", Some("fail"));
+        let fail_decision = build_command_phase_decision(&fail_cmd, "gate", 1, Some("boom"));
+        assert!(command_failure_is_terminal(&fail_decision));
+
+        // Default failure verdict is rework (a QA gate) -> NOT terminal, so the
+        // existing Completed+rework path is preserved.
+        let rework_cmd = command_def_with_failure_verdict("false", None);
+        let rework_decision = build_command_phase_decision(&rework_cmd, "gate", 1, Some("boom"));
+        assert!(!command_failure_is_terminal(&rework_decision));
+    }
 
     /// Codex P3 #5 (Box::leak): drives `capture_command_stream` through 10k
     /// iterations and asserts each pass completes without panicking. Pre-fix
