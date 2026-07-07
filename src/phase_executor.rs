@@ -5,7 +5,7 @@ use crate::ipc::{
 };
 use crate::payload_traversal::{parse_commit_message_from_text, parse_phase_decision_from_text};
 use crate::phase_command::{
-    build_command_phase_decision, build_command_result_payload, command_failure_is_terminal,
+    build_command_result_payload, command_failure_is_terminal, resolve_command_decision,
     run_workflow_phase_with_command, summarize_output_excerpt, CommandExecutionContext, CommandPhaseFailedError,
 };
 use crate::phase_failover::{failure_token, retry_decision_for_token, PhaseFailureClassifier};
@@ -2657,15 +2657,12 @@ async fn run_workflow_phase_inner(params: &PhaseRunParams<'_>) -> Result<PhaseRu
                 }
             }
 
-            if let Some(ref failure_summary) = command_result.failure_summary {
-                let decision = command_result.phase_decision.clone().unwrap_or_else(|| {
-                    build_command_phase_decision(
-                        command,
-                        phase_id,
-                        command_result.exit_code,
-                        Some(failure_summary.as_str()),
-                    )
-                });
+            if command_result.failure_summary.is_some() {
+                // TASK-206: an emitted JSON verdict is authoritative only when
+                // the command opted into decision production; otherwise the
+                // disposition falls back to exit-code inference via
+                // on_failure_verdict. See `resolve_command_decision`.
+                let decision = resolve_command_decision(command, phase_id, &command_result);
 
                 // TASK-205 change 2: when the resolved failure disposition is a
                 // terminal `fail`, surface a structured `phase_failed` carrying
@@ -2719,10 +2716,31 @@ async fn run_workflow_phase_inner(params: &PhaseRunParams<'_>) -> Result<PhaseRu
                 });
             }
 
-            let decision = command_result
-                .phase_decision
-                .clone()
-                .unwrap_or_else(|| build_command_phase_decision(command, phase_id, command_result.exit_code, None));
+            // TASK-206: on a successful exit a JSON verdict on stdout still
+            // decides the phase — a decision-producing command can print
+            // {"verdict":"rework"|"skip"|"fail",...} to override the default
+            // advance. The verdict is honored only when the command opted in
+            // (see `resolve_command_decision`); otherwise a clean exit advances.
+            let decision = resolve_command_decision(command, phase_id, &command_result);
+
+            // TASK-205 + TASK-206: a terminal `fail` verdict (even on a zero
+            // exit, when explicitly emitted) surfaces phase_failed with the
+            // exit-code + stderr, unifying with the non-zero-exit fail path.
+            if command_failure_is_terminal(&decision) {
+                let stderr_excerpt =
+                    summarize_output_excerpt(&command_result.stderr, command.excerpt_max_chars.unwrap_or(800));
+                let message = format!(
+                    "phase '{}' command '{}' emitted a fail verdict (exit code {})",
+                    phase_id, command_result.program, command_result.exit_code
+                );
+                return Err(anyhow::Error::new(CommandPhaseFailedError {
+                    message,
+                    program: Some(command_result.program.clone()),
+                    exit_code: Some(command_result.exit_code),
+                    stderr_excerpt,
+                }));
+            }
+
             let result_payload = build_command_result_payload(
                 command,
                 phase_id,
