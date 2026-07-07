@@ -3,8 +3,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context, Result};
 use animus_actor::Actor;
+use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 
 use orchestrator_config::{
@@ -416,27 +416,34 @@ pub async fn execute_workflow_with_hub(
                 });
             }
             Err(err) => {
+                // TASK-205: enrich the single-phase (`--phase`) failure event
+                // with the structured command exit-code + stderr when the error
+                // is a terminal command-phase failure, mirroring the multi-phase
+                // arm so both paths feed the journal mapping the same shape.
+                let cmd_fail = err.downcast_ref::<crate::phase_command::CommandPhaseFailedError>();
+                let error_message = cmd_fail.map(|c| c.message.clone()).unwrap_or_else(|| err.to_string());
+                let failed_payload = match cmd_fail {
+                    Some(cmd_fail) => crate::phase_command::command_phase_failed_event_payload(&phase_filter, cmd_fail),
+                    None => serde_json::json!({
+                        "phase_id": phase_filter,
+                        "phase_status": "failed",
+                        "error": error_message,
+                    }),
+                };
                 emit(PhaseEvent::Completed {
                     phase_id: &phase_filter,
                     duration: phase_elapsed,
                     success: false,
-                    error: Some(err.to_string()),
+                    error: Some(error_message.clone()),
                     model: None,
                     tool: None,
                 });
-                emit_runtime(
-                    RuntimeWorkflowEventKind::PhaseFailed,
-                    serde_json::json!({
-                        "phase_id": phase_filter,
-                        "phase_status": "failed",
-                        "error": err.to_string(),
-                    }),
-                );
+                emit_runtime(RuntimeWorkflowEventKind::PhaseFailed, failed_payload);
                 results.push(serde_json::json!({
                     "phase_id": phase_filter,
                     "status": "failed",
                     "duration_secs": phase_elapsed.as_secs(),
-                    "error": err.to_string(),
+                    "error": error_message,
                 }));
                 let total_duration = workflow_start.elapsed();
                 return Ok(WorkflowExecuteResult {
@@ -892,6 +899,37 @@ pub async fn execute_workflow_with_hub(
                         "duration_secs": phase_elapsed.as_secs(),
                         "workflow_status": format!("{:?}", workflow.status).to_ascii_lowercase(),
                         "error": err.to_string(),
+                    }));
+                    break;
+                }
+                // TASK-205: a terminal command-phase failure (fail-fast on an
+                // unresolved required template var, or a non-zero exit resolving
+                // to a `fail` verdict) carries structured exit-code + stderr.
+                // Emit a `phase_failed` runtime event with those fields so the
+                // ao-cli #299 journal mapping persists them, instead of the bare
+                // error string the generic arm below produces.
+                if let Some(cmd_fail) = err.downcast_ref::<crate::phase_command::CommandPhaseFailedError>() {
+                    workflow = hub.workflows().fail_current_phase(&workflow.id, cmd_fail.message.clone()).await?;
+                    reported_workflow_status = workflow.status;
+                    emit(PhaseEvent::Completed {
+                        phase_id: &phase_id,
+                        duration: phase_elapsed,
+                        success: false,
+                        error: Some(cmd_fail.message.clone()),
+                        model: None,
+                        tool: None,
+                    });
+                    emit_runtime(
+                        RuntimeWorkflowEventKind::PhaseFailed,
+                        crate::phase_command::command_phase_failed_event_payload(&phase_id, cmd_fail),
+                    );
+                    results.push(serde_json::json!({
+                        "phase_id": phase_id,
+                        "status": "failed",
+                        "duration_secs": phase_elapsed.as_secs(),
+                        "workflow_status": format!("{:?}", workflow.status).to_ascii_lowercase(),
+                        "error": cmd_fail.message,
+                        "exit_code": cmd_fail.exit_code,
                     }));
                     break;
                 }
