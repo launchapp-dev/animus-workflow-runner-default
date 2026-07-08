@@ -1294,6 +1294,29 @@ fn build_dynamic_subject_context(
     fallback_title: Option<&str>,
     fallback_description: Option<&str>,
 ) -> Result<SubjectContext> {
+    // Guard against a backend that ignores the requested `kind` (or matches a
+    // bare native id under a DIFFERENT kind) and hands back an unrelated
+    // subject: if the response carries its own `kind` / `id`, they must match
+    // what we asked for, else we would mislabel a wrong-kind row as this
+    // subject and run phases against the wrong context.
+    if let Some(returned_kind) = response.get("kind").and_then(Value::as_str) {
+        if !returned_kind.eq_ignore_ascii_case(subject.kind()) {
+            return Err(anyhow!(
+                "subject_backend returned kind '{returned_kind}' for a '{}' request (id '{}')",
+                subject.kind(),
+                subject.id()
+            ));
+        }
+    }
+    if let Some(returned_id) = response.get("id").and_then(Value::as_str) {
+        if !response_id_matches(returned_id, subject) {
+            return Err(anyhow!(
+                "subject_backend returned id '{returned_id}' for requested subject '{}'",
+                subject.id()
+            ));
+        }
+    }
+
     let title = response
         .get("title")
         .and_then(Value::as_str)
@@ -1327,6 +1350,20 @@ fn build_dynamic_subject_context(
         attributes,
         task: None,
     })
+}
+
+/// Whether a backend-returned subject id denotes the requested subject. Accepts
+/// the bare native id (`TRANSCRIPT-001`) or the kind-qualified form the
+/// consolidated backend echoes (`transcript:TRANSCRIPT-001`); the kind prefix
+/// is compared case-insensitively, the native id exactly.
+fn response_id_matches(returned_id: &str, subject: &SubjectRef) -> bool {
+    if returned_id == subject.id() {
+        return true;
+    }
+    match returned_id.split_once(':') {
+        Some((prefix, rest)) => prefix.eq_ignore_ascii_case(subject.kind()) && rest == subject.id(),
+        None => false,
+    }
 }
 
 /// A discovered plugin is a subject backend when it declares the
@@ -1612,5 +1649,44 @@ mod dynamic_subject_context_tests {
         assert!(!is_builtin_subject_kind("transcript"));
         assert!(!is_builtin_subject_kind("blog"));
         assert!(!is_builtin_subject_kind("linear.issue"));
+    }
+
+    #[test]
+    fn build_dynamic_subject_context_rejects_wrong_kind_or_id() {
+        let subject = SubjectRef::new("transcript", "TRANSCRIPT-001");
+
+        // A backend that ignored `kind` and matched a bare id under a different
+        // kind (e.g. a `task` row) must be rejected, not mislabeled.
+        let wrong_kind =
+            build_dynamic_subject_context(&subject, json!({ "id": "TRANSCRIPT-001", "kind": "task" }), None, None);
+        assert!(wrong_kind.is_err(), "wrong-kind response must be rejected");
+
+        // A backend that returned a different id must be rejected.
+        let wrong_id = build_dynamic_subject_context(
+            &subject,
+            json!({ "id": "transcript:TRANSCRIPT-999", "kind": "transcript" }),
+            None,
+            None,
+        );
+        assert!(wrong_id.is_err(), "wrong-id response must be rejected");
+
+        // The matching-kind, kind-qualified-id response is accepted.
+        let ok = build_dynamic_subject_context(
+            &subject,
+            json!({ "id": "transcript:TRANSCRIPT-001", "kind": "TRANSCRIPT", "title": "T" }),
+            None,
+            None,
+        );
+        assert!(ok.is_ok(), "matching kind (case-insensitive) + qualified id must be accepted");
+    }
+
+    #[test]
+    fn response_id_matches_bare_and_qualified_forms() {
+        let subject = SubjectRef::new("transcript", "TRANSCRIPT-001");
+        assert!(response_id_matches("TRANSCRIPT-001", &subject));
+        assert!(response_id_matches("transcript:TRANSCRIPT-001", &subject));
+        assert!(response_id_matches("TRANSCRIPT:TRANSCRIPT-001", &subject));
+        assert!(!response_id_matches("TRANSCRIPT-002", &subject));
+        assert!(!response_id_matches("blog:TRANSCRIPT-001", &subject));
     }
 }
