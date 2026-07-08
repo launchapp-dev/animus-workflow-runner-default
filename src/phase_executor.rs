@@ -73,13 +73,28 @@ impl orchestrator_core::PhaseExecutor for CliPhaseExecutor {
         request: orchestrator_core::PhaseExecutionRequest,
     ) -> Result<orchestrator_core::PhaseExecutionResult> {
         let hub = orchestrator_core::FileServiceHub::new(&request.project_root)?;
-        let (subject_id, subject_title, subject_description, task_complexity) =
+        let (subject_id, subject_kind, subject_title, subject_description, task_complexity) =
             if let Ok(task) = hub.tasks().get(&request.task_id).await {
-                (task.id.clone(), task.title.clone(), task.description.clone(), Some(task.complexity))
+                (
+                    task.id.clone(),
+                    orchestrator_core::SUBJECT_KIND_TASK.to_string(),
+                    task.title.clone(),
+                    task.description.clone(),
+                    Some(task.complexity),
+                )
             } else if let Ok(req) = hub.planning().get_requirement(&request.task_id).await {
-                (req.id.clone(), req.title.clone(), req.description.clone(), None)
+                (
+                    req.id.clone(),
+                    orchestrator_core::SUBJECT_KIND_REQUIREMENT.to_string(),
+                    req.title.clone(),
+                    req.description.clone(),
+                    None,
+                )
             } else {
-                (request.task_id.clone(), request.task_id.clone(), String::new(), None)
+                // No task/requirement match and this entrypoint carries no kind
+                // metadata: leave the kind empty so the id is rendered bare
+                // (unchanged behavior).
+                (request.task_id.clone(), String::new(), request.task_id.clone(), String::new(), None)
             };
 
         let execution_cwd = if Path::new(&request.config_dir).is_dir() {
@@ -107,6 +122,7 @@ impl orchestrator_core::PhaseExecutor for CliPhaseExecutor {
             workflow_id: &request.workflow_ref,
             workflow_ref: &request.workflow_ref,
             subject_id: &subject_id,
+            subject_kind: &subject_kind,
             subject_title: &subject_title,
             subject_description: &subject_description,
             task_complexity,
@@ -2255,6 +2271,10 @@ pub struct PhaseRunParams<'a> {
     pub workflow_id: &'a str,
     pub workflow_ref: &'a str,
     pub subject_id: &'a str,
+    /// Subject kind for the bound subject, threaded into the command-phase
+    /// context so `{{subject_id}}` can render kind-qualified (`<kind>:<native>`).
+    /// Empty when no kind is available (the id is then left bare).
+    pub subject_kind: &'a str,
     pub subject_title: &'a str,
     pub subject_description: &'a str,
     pub task_complexity: Option<orchestrator_core::Complexity>,
@@ -2293,6 +2313,7 @@ async fn run_workflow_phase_inner(params: &PhaseRunParams<'_>) -> Result<PhaseRu
     let workflow_id = params.workflow_id;
     let workflow_ref = params.workflow_ref;
     let subject_id = params.subject_id;
+    let subject_kind = params.subject_kind;
     let subject_title = params.subject_title;
     let subject_description = params.subject_description;
     let task_complexity = params.task_complexity;
@@ -2549,6 +2570,7 @@ async fn run_workflow_phase_inner(params: &PhaseRunParams<'_>) -> Result<PhaseRu
                 phase_id,
                 workflow_ref,
                 subject_id,
+                subject_kind,
                 subject_title,
                 subject_description,
                 pipeline_vars,
