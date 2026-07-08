@@ -189,7 +189,11 @@ fn ensure_workflow_pack_execution_requirements(
 
 fn workflow_phase_inputs(workflow: &OrchestratorWorkflow) -> WorkflowPhaseInputs {
     let dispatch_input = workflow.input.as_ref().map(Value::to_string);
-    let schedule_input = if workflow.subject.id().starts_with("schedule:") { dispatch_input.clone() } else { None };
+    let schedule_input = if workflow.subject.as_ref().map(|s| s.id()).unwrap_or_default().starts_with("schedule:") {
+        dispatch_input.clone()
+    } else {
+        None
+    };
 
     WorkflowPhaseInputs { dispatch_input, schedule_input }
 }
@@ -214,32 +218,45 @@ pub async fn execute_workflow_with_hub(
         Some(workflow_id) => load_existing_workflow(hub.clone(), workflow_id, &params).await?,
         None => {
             let input = resolve_input(&params)?;
-            let subject = input.subject().clone();
-            let subject_id = subject.id().to_string();
+            let subject = input.subject().cloned();
+            let subject_id = subject.as_ref().map(|s| s.id().to_string()).unwrap_or_default();
             hub.workflows().run(input, params.actor.as_ref()).await.or_else(|run_err| {
-                if subject.kind().eq_ignore_ascii_case(SUBJECT_KIND_CUSTOM) {
+                // A subjectless run (None) or a genuine custom subject has no
+                // existing-subject fallback to search, so surface the real
+                // `run_err` instead of masking it as "no workflow found".
+                if subject.as_ref().is_none_or(|s| s.kind().eq_ignore_ascii_case(SUBJECT_KIND_CUSTOM)) {
                     return Err(run_err);
                 }
                 let all =
                     tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(hub.workflows().list()))?;
                 all.into_iter()
-                    .find(|w| w.subject.id() == subject_id || w.task_id == subject_id)
+                    .find(|w| {
+                        w.subject.as_ref().map(|s| s.id()) == Some(subject_id.as_str()) || w.task_id == subject_id
+                    })
                     .ok_or_else(|| anyhow!("no workflow found for subject '{}'", subject_id))
             })?
         }
     };
+    // rc.6 Option-ized `OrchestratorWorkflow.subject` to support genuinely
+    // subjectless runs. This runner binds a concrete subject for every dispatch
+    // path (task / requirement / title / subject-id); a subjectless workflow is
+    // not something it can execute, so require one up front and reuse it below.
+    let workflow_subject = workflow
+        .subject
+        .clone()
+        .ok_or_else(|| anyhow!("subjectless workflow runs are not supported by this runner"))?;
     let _runner_pid_guard = WorkflowRunnerPidGuard::register(&params.project_root, &workflow.id)
         .context("failed to register active workflow execution")?;
     let mut subject_context = resolve_execution_subject_context(
         hub.clone(),
-        &workflow.subject,
+        &workflow_subject,
         params.title.as_deref(),
         params.description.as_deref(),
     )
     .await?;
     let mut task = subject_context.task.take();
 
-    let execution_cwd = ensure_execution_cwd(hub.clone(), &params.project_root, &workflow.subject, &subject_context)
+    let execution_cwd = ensure_execution_cwd(hub.clone(), &params.project_root, &workflow_subject, &subject_context)
         .await
         .context("failed to resolve execution cwd")?;
 
@@ -271,7 +288,7 @@ pub async fn execute_workflow_with_hub(
         eprintln!("warning: failed to auto-start runner for workflow execute: {err}");
     }
 
-    let subject_id_str = workflow.subject.id().to_string();
+    let subject_id_str = workflow_subject.id().to_string();
     let subject_title = subject_context.subject_title.clone();
     let subject_description = subject_context.subject_description.clone();
     let task_complexity = task.as_ref().map(|t| t.complexity);
@@ -969,7 +986,7 @@ pub async fn execute_workflow_with_hub(
         "reason": "workflow did not complete all phases",
     });
     if workflow.status == WorkflowStatus::Completed {
-        project_requirement_success_status(hub.clone(), &workflow.subject, &workflow_ref).await?;
+        project_requirement_success_status(hub.clone(), &workflow_subject, &workflow_ref).await?;
         post_success = if let Some(ref t) = task {
             execute_post_success_actions(&params.project_root, t, &workflow, &workflow_config, &execution_cwd).await
         } else {
@@ -1047,15 +1064,18 @@ async fn load_existing_workflow(
 }
 
 fn validate_existing_workflow_subject(workflow: &OrchestratorWorkflow, params: &WorkflowExecuteParams) -> Result<()> {
+    // rc.6: `OrchestratorWorkflow.subject` is `Option<SubjectRef>` (subjectless
+    // runs). Bind it once; every selector below tolerates an absent subject.
+    let subject = workflow.subject.as_ref();
     if let Some(task_id) = params.task_id.as_deref() {
-        let workflow_task_id = workflow.subject.task_id().unwrap_or(workflow.task_id.as_str());
+        let workflow_task_id = subject.and_then(|s| s.task_id()).unwrap_or(workflow.task_id.as_str());
         if workflow_task_id != task_id {
             return Err(anyhow!("workflow '{}' is for task '{}' not '{}'", workflow.id, workflow_task_id, task_id));
         }
     }
 
     if let Some(requirement_id) = params.requirement_id.as_deref() {
-        match workflow.subject.requirement_id() {
+        match subject.and_then(|s| s.requirement_id()) {
             Some(id) if id == requirement_id => {}
             Some(id) => {
                 return Err(anyhow!("workflow '{}' is for requirement '{}' not '{}'", workflow.id, id, requirement_id));
@@ -1067,10 +1087,11 @@ fn validate_existing_workflow_subject(workflow: &OrchestratorWorkflow, params: &
     }
 
     if let Some(title) = params.title.as_deref() {
-        if !workflow.subject.kind().eq_ignore_ascii_case(SUBJECT_KIND_CUSTOM) {
+        if !subject.map(|s| s.kind()).unwrap_or_default().eq_ignore_ascii_case(SUBJECT_KIND_CUSTOM) {
             return Err(anyhow!("workflow '{}' is not a custom workflow", workflow.id));
         }
-        let actual = workflow.subject.title.as_deref().unwrap_or_else(|| workflow.subject.id());
+        let actual =
+            subject.and_then(|s| s.title.as_deref()).unwrap_or_else(|| subject.map(|s| s.id()).unwrap_or_default());
         if actual != title {
             return Err(anyhow!("workflow '{}' is for custom subject '{}' not '{}'", workflow.id, actual, title));
         }
@@ -1089,9 +1110,9 @@ fn resolve_input(params: &WorkflowExecuteParams) -> Result<WorkflowRunInput> {
     // rejection of `--subject-id` was TASK-186: runs stalled with 0 events).
     // Takes precedence over the task/requirement/title convenience forms.
     if let Some(subject_id) = params.subject_id.as_deref() {
-        let (kind, id) = subject_id.split_once(':').ok_or_else(|| {
-            anyhow!("--subject-id '{subject_id}' must be qualified as '<kind>:<id>'")
-        })?;
+        let (kind, id) = subject_id
+            .split_once(':')
+            .ok_or_else(|| anyhow!("--subject-id '{subject_id}' must be qualified as '<kind>:<id>'"))?;
         if kind.is_empty() || id.is_empty() {
             return Err(anyhow!("--subject-id '{subject_id}' must be qualified as '<kind>:<id>'"));
         }

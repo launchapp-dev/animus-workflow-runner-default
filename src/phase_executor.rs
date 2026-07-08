@@ -2891,6 +2891,7 @@ mod tests {
                 kind: "phase_decision".to_string(),
                 phase_id: "requirements".to_string(),
                 verdict: orchestrator_core::PhaseDecisionVerdict::Advance,
+                verdict_key: None,
                 confidence: 0.9,
                 risk: orchestrator_core::WorkflowDecisionRisk::Low,
                 reason: "Complete".to_string(),

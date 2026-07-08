@@ -139,6 +139,9 @@ pub fn plugin_manifest() -> PluginManifest {
         name: PLUGIN_NAME.to_string(),
         version: PLUGIN_VERSION.to_string(),
         plugin_kind: WORKFLOW_RUNNER_KIND.to_string(),
+        // rc.6 multi-kind manifests: this plugin serves a single role, declared
+        // via the legacy `plugin_kind` field; no additional kinds.
+        plugin_kinds: Vec::new(),
         description: PLUGIN_DESCRIPTION.to_string(),
         protocol_version: PLUGIN_PROTOCOL_VERSION.to_string(),
         capabilities: vec![
@@ -204,6 +207,7 @@ pub fn plugin_initialize_result(params: &Value) -> Result<InitializeResult> {
             name: PLUGIN_NAME.to_string(),
             version: PLUGIN_VERSION.to_string(),
             plugin_kind: WORKFLOW_RUNNER_KIND.to_string(),
+            plugin_kinds: Vec::new(),
             description: Some(PLUGIN_DESCRIPTION.to_string()),
         },
         capabilities: PluginCapabilities {
@@ -354,19 +358,23 @@ fn resolve_subject_fields(request: &WorkflowExecuteRequest) -> SubjectFieldsResu
     }
 
     if let Some(dispatch) = &request.subject_dispatch {
-        let subject = &dispatch.subject;
-        let kind = subject.kind();
-        let id = subject.id().to_string();
-        if kind.eq_ignore_ascii_case(animus_subject_protocol::subject_kind::TASK) {
-            return Ok((Some(id), None, None, None));
+        // rc.6: `SubjectDispatch.subject` is `Option<SubjectRef>` (subjectless
+        // dispatch). Only project a selector when a subject is bound; a
+        // subjectless dispatch falls through to the other selectors below.
+        if let Some(subject) = &dispatch.subject {
+            let kind = subject.kind();
+            let id = subject.id().to_string();
+            if kind.eq_ignore_ascii_case(animus_subject_protocol::subject_kind::TASK) {
+                return Ok((Some(id), None, None, None));
+            }
+            if kind.eq_ignore_ascii_case(animus_subject_protocol::subject_kind::REQUIREMENT) {
+                return Ok((None, Some(id), None, None));
+            }
+            // Generic kind — project as a custom subject.
+            let title = subject.title.clone().unwrap_or_else(|| id.clone());
+            let description = subject.description.clone().unwrap_or_default();
+            return Ok((None, None, Some(title), Some(description)));
         }
-        if kind.eq_ignore_ascii_case(animus_subject_protocol::subject_kind::REQUIREMENT) {
-            return Ok((None, Some(id), None, None));
-        }
-        // Generic kind — project as a custom subject.
-        let title = subject.title.clone().unwrap_or_else(|| id.clone());
-        let description = subject.description.clone().unwrap_or_default();
-        return Ok((None, None, Some(title), Some(description)));
     }
 
     if let Some(subject_ref) = &request.subject_ref {

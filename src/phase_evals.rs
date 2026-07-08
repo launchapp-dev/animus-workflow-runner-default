@@ -170,6 +170,7 @@ fn synthetic_eval_decision(
         kind: "phase_decision".to_string(),
         phase_id: phase_id.to_string(),
         verdict,
+        verdict_key: None,
         confidence: 1.0,
         risk: orchestrator_core::WorkflowDecisionRisk::Medium,
         reason,

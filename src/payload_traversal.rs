@@ -137,6 +137,11 @@ fn try_parse_decision(value: &Value, phase_id: &str) -> Option<orchestrator_core
         kind: "phase_decision".to_string(),
         phase_id: phase_id.to_string(),
         verdict,
+        // TODO(codex-p2): adopt v0.7 custom `on_verdict` routing — a non-built-in
+        // verdict string should parse as `PhaseDecisionVerdict::Unknown` with the
+        // raw key preserved here. `None` keeps the v0.4.20 built-in-verdict
+        // behavior (no regression); custom-key routing is a separate follow-up.
+        verdict_key: None,
         confidence,
         risk,
         reason,
