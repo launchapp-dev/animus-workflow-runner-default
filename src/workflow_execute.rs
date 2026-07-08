@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use animus_actor::Actor;
 use anyhow::{anyhow, Context, Result};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use orchestrator_config::{
     collect_workflow_refs, ensure_pack_execution_requirements, resolve_active_pack_for_workflow_ref,
@@ -14,9 +14,11 @@ use orchestrator_config::{
 use orchestrator_core::{
     dispatch_workflow_event, ensure_workflow_config_compiled, load_workflow_config,
     project_requirement_workflow_status, register_workflow_runner_pid, services::ServiceHub,
-    subject_adapter::SubjectContext, unregister_workflow_runner_pid, OrchestratorTask, OrchestratorWorkflow,
-    PhaseDecisionVerdict, SubjectRef, WorkflowEvent, WorkflowRunInput, WorkflowStatus, SUBJECT_KIND_CUSTOM,
+    subject_adapter::adapter::SUBJECT_ATTR_PLUGIN_RESOLVED, subject_adapter::SubjectContext,
+    unregister_workflow_runner_pid, OrchestratorTask, OrchestratorWorkflow, PhaseDecisionVerdict, SubjectRef,
+    WorkflowEvent, WorkflowRunInput, WorkflowStatus, SUBJECT_KIND_CUSTOM, SUBJECT_KIND_REQUIREMENT, SUBJECT_KIND_TASK,
 };
+use orchestrator_plugin_host::PluginRegistry;
 
 use crate::config_context::RuntimeConfigContext;
 use crate::ensure_execution_cwd::ensure_execution_cwd;
@@ -249,6 +251,7 @@ pub async fn execute_workflow_with_hub(
         .context("failed to register active workflow execution")?;
     let mut subject_context = resolve_execution_subject_context(
         hub.clone(),
+        &params.project_root,
         &workflow_subject,
         params.title.as_deref(),
         params.description.as_deref(),
@@ -1144,16 +1147,231 @@ fn resolve_input(params: &WorkflowExecuteParams) -> Result<WorkflowRunInput> {
     }
 }
 
+/// Generic, kind-agnostic subject fetch verb every `subject_backend` plugin
+/// advertises. A consolidated multi-kind BaaS backend routes it (with a `kind`
+/// param) to the right table for ANY declared kind, including runtime-declared
+/// ones it never lists as a per-kind `<kind>/get` capability.
+const SUBJECT_GET_METHOD: &str = "subject/get";
+
 async fn resolve_execution_subject_context(
     hub: Arc<dyn ServiceHub>,
+    project_root: &str,
     subject: &SubjectRef,
     fallback_title: Option<&str>,
     fallback_description: Option<&str>,
 ) -> Result<SubjectContext> {
-    hub.subject_resolver()
-        .resolve_subject_context(subject, fallback_title, fallback_description)
-        .await
-        .with_context(|| format!("failed to resolve subject context for '{}'", subject.id()))
+    match hub.subject_resolver().resolve_subject_context(subject, fallback_title, fallback_description).await {
+        Ok(context) => Ok(context),
+        Err(primary_err) => {
+            // The in-tree resolver's plugin fallback only routes to a
+            // subject_backend plugin that STATICALLY advertises the per-kind
+            // `<kind>/get` capability. A consolidated BaaS backend serves
+            // runtime-declared kinds (`transcript`, ...) through its generic
+            // `subject/get` handler and never advertises `<kind>/get`, so the
+            // in-tree candidate filter selects no plugin and resolution fails
+            // before any phase runs (mark-running never executes, no run dir,
+            // no journal events). The built-in kinds (task / requirement /
+            // custom) are owned by in-tree adapters or advertise their own
+            // `<kind>/get`, so leave their behavior untouched; only reach for
+            // the direct backend fetch on a dynamic kind.
+            if is_builtin_subject_kind(subject.kind()) {
+                return Err(primary_err)
+                    .with_context(|| format!("failed to resolve subject context for '{}'", subject.id()));
+            }
+            match resolve_dynamic_subject_context_via_plugin(
+                project_root,
+                subject,
+                fallback_title,
+                fallback_description,
+            )
+            .await
+            {
+                Ok(context) => Ok(context),
+                Err(fallback_err) => Err(anyhow!(
+                    "failed to resolve subject context for '{}': in-tree resolver: {primary_err}; \
+                     subject_backend fallback: {fallback_err}",
+                    subject.id()
+                )),
+            }
+        }
+    }
+}
+
+/// Built-in subject kinds owned by the in-tree adapters (or advertising their
+/// own `<kind>/get` capability). These resolve through the standard resolver;
+/// the dynamic-kind backend fallback deliberately skips them so their
+/// resolution and not-found semantics are unchanged.
+fn is_builtin_subject_kind(kind: &str) -> bool {
+    let kind = kind.trim();
+    kind.eq_ignore_ascii_case(SUBJECT_KIND_TASK)
+        || kind.eq_ignore_ascii_case("task")
+        || kind.eq_ignore_ascii_case(SUBJECT_KIND_REQUIREMENT)
+        || kind.eq_ignore_ascii_case("requirement")
+        || kind.eq_ignore_ascii_case(SUBJECT_KIND_CUSTOM)
+}
+
+/// Resolve a runtime-declared dynamic-kind subject by calling the owning
+/// `subject_backend` plugin directly, bypassing the in-tree resolver's
+/// static per-kind capability gate.
+///
+/// A plugin can serve `subject.kind()` when it advertises either the generic
+/// [`SUBJECT_GET_METHOD`] (`subject/get`, called with `{kind, id}`) or the
+/// per-kind `<kind>/get` (called with `{id}`). The generic verb is preferred
+/// because the consolidated BaaS backend routes it for every declared kind.
+/// The resulting context is marked [`SUBJECT_ATTR_PLUGIN_RESOLVED`] so
+/// `ensure_execution_cwd` uses the project root instead of the in-tree task
+/// adapter's managed worktree.
+async fn resolve_dynamic_subject_context_via_plugin(
+    project_root: &str,
+    subject: &SubjectRef,
+    fallback_title: Option<&str>,
+    fallback_description: Option<&str>,
+) -> Result<SubjectContext> {
+    let kind = subject.kind();
+    let id = subject.id().to_string();
+    let kind_method = format!("{kind}/get");
+
+    let mut registry = PluginRegistry::discover(project_root)
+        .with_context(|| format!("subject_backend plugin discovery failed for '{project_root}'"))?;
+
+    // Precompute the (plugin, method, params) triples before touching the
+    // registry mutably (`get_plugin` borrows it `&mut`). Prefer the generic
+    // `subject/get {kind,id}` verb, falling back to `<kind>/get {id}` for a
+    // single-kind backend that only offers the per-kind form.
+    let candidates: Vec<(String, String, Value)> = registry
+        .list_plugins()
+        .filter(|plugin| is_subject_backend(plugin))
+        .filter_map(|plugin| {
+            let capabilities = &plugin.manifest.capabilities;
+            if capabilities.iter().any(|cap| cap == SUBJECT_GET_METHOD) {
+                Some((plugin.name.clone(), SUBJECT_GET_METHOD.to_string(), json!({ "kind": kind, "id": id })))
+            } else if capabilities.iter().any(|cap| cap == &kind_method) {
+                Some((plugin.name.clone(), kind_method.clone(), json!({ "id": id })))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if candidates.is_empty() {
+        return Err(anyhow!(
+            "no subject_backend plugin advertises '{SUBJECT_GET_METHOD}' or '{kind_method}' for kind '{kind}'"
+        ));
+    }
+
+    let mut last_error: Option<String> = None;
+    for (name, method, params) in &candidates {
+        let host = registry
+            .get_plugin(name)
+            .await
+            .with_context(|| format!("failed to load subject_backend plugin '{name}'"))?;
+        match host.request(method.clone(), Some(params.clone())).await {
+            Ok(value) => return build_dynamic_subject_context(subject, value, fallback_title, fallback_description),
+            Err(err) if err.code == animus_plugin_protocol::error_codes::METHOD_NOT_FOUND => {
+                last_error = Some(format!("plugin '{name}' does not handle '{method}'"));
+            }
+            Err(err) => {
+                last_error = Some(format!(
+                    "plugin '{name}' rejected '{method}' for id '{id}': {} (code {})",
+                    err.message, err.code
+                ));
+            }
+        }
+    }
+
+    Err(anyhow!(last_error.unwrap_or_else(|| format!("no subject_backend plugin resolved kind '{kind}'"))))
+}
+
+/// Build a [`SubjectContext`] from a subject_backend plugin's `subject/get`
+/// (or `<kind>/get`) response. Mirrors the in-tree
+/// `build_context_from_plugin`: prefer the plugin's title/description, fall
+/// back to the caller-supplied values, then the bare id; carry `attributes`
+/// through and stamp the plugin-resolved marker so cwd provisioning routes
+/// around the in-tree task adapter.
+fn build_dynamic_subject_context(
+    subject: &SubjectRef,
+    response: Value,
+    fallback_title: Option<&str>,
+    fallback_description: Option<&str>,
+) -> Result<SubjectContext> {
+    // Guard against a backend that ignores the requested `kind` (or matches a
+    // bare native id under a DIFFERENT kind) and hands back an unrelated
+    // subject: if the response carries its own `kind` / `id`, they must match
+    // what we asked for, else we would mislabel a wrong-kind row as this
+    // subject and run phases against the wrong context.
+    if let Some(returned_kind) = response.get("kind").and_then(Value::as_str) {
+        if !returned_kind.eq_ignore_ascii_case(subject.kind()) {
+            return Err(anyhow!(
+                "subject_backend returned kind '{returned_kind}' for a '{}' request (id '{}')",
+                subject.kind(),
+                subject.id()
+            ));
+        }
+    }
+    if let Some(returned_id) = response.get("id").and_then(Value::as_str) {
+        if !response_id_matches(returned_id, subject) {
+            return Err(anyhow!(
+                "subject_backend returned id '{returned_id}' for requested subject '{}'",
+                subject.id()
+            ));
+        }
+    }
+
+    let title = response
+        .get("title")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .or_else(|| fallback_title.map(ToOwned::to_owned))
+        .unwrap_or_else(|| subject.id().to_string());
+    let description = response
+        .get("description")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .or_else(|| fallback_description.map(ToOwned::to_owned))
+        .unwrap_or_default();
+    let mut attributes: HashMap<String, String> = response
+        .get("attributes")
+        .and_then(Value::as_object)
+        .map(|map| {
+            map.iter()
+                .map(|(key, value)| match value {
+                    Value::String(text) => (key.clone(), text.clone()),
+                    other => (key.clone(), other.to_string()),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    attributes.insert(SUBJECT_ATTR_PLUGIN_RESOLVED.to_string(), "true".to_string());
+    Ok(SubjectContext {
+        subject_kind: subject.kind().to_string(),
+        subject_id: subject.id().to_string(),
+        subject_title: title,
+        subject_description: description,
+        attributes,
+        task: None,
+    })
+}
+
+/// Whether a backend-returned subject id denotes the requested subject. Accepts
+/// the bare native id (`TRANSCRIPT-001`) or the kind-qualified form the
+/// consolidated backend echoes (`transcript:TRANSCRIPT-001`); the kind prefix
+/// is compared case-insensitively, the native id exactly.
+fn response_id_matches(returned_id: &str, subject: &SubjectRef) -> bool {
+    if returned_id == subject.id() {
+        return true;
+    }
+    match returned_id.split_once(':') {
+        Some((prefix, rest)) => prefix.eq_ignore_ascii_case(subject.kind()) && rest == subject.id(),
+        None => false,
+    }
+}
+
+/// A discovered plugin is a subject backend when it declares the
+/// `subject_backend` kind (either as its primary `plugin_kind` or among the
+/// consolidated `plugin_kinds`).
+fn is_subject_backend(plugin: &orchestrator_plugin_host::DiscoveredPlugin) -> bool {
+    plugin.manifest.plugin_kind.eq_ignore_ascii_case("subject_backend")
+        || plugin.manifest.plugin_kinds.iter().any(|kind| kind.eq_ignore_ascii_case("subject_backend"))
 }
 
 async fn project_requirement_success_status(
@@ -1339,4 +1557,136 @@ async fn execute_post_success_actions(
         "reason": "post_success actions removed in v0.5.x (merge/PR no longer a workflow-runner responsibility)",
         "workflow_ref": workflow_ref_id,
     })
+}
+
+#[cfg(test)]
+mod dynamic_subject_context_tests {
+    use super::*;
+    use crate::phase_command::qualified_subject_id;
+
+    // The consolidated Postgres BaaS backend's `subject/get` response shape for
+    // the live `transcript:TRANSCRIPT-001` subject (title + description +
+    // attributes), trimmed to the fields the context build reads.
+    fn transcript_get_response() -> Value {
+        json!({
+            "id": "transcript:TRANSCRIPT-001",
+            "kind": "transcript",
+            "title": "Startup Daily Check-In/Stand Up",
+            "description": "# Standup\n\nsamiziiv: hello",
+            "status": "captured",
+            "attributes": { "source": "krisp" }
+        })
+    }
+
+    #[test]
+    fn build_dynamic_subject_context_from_plugin_response() {
+        let subject = SubjectRef::new("transcript", "TRANSCRIPT-001");
+        let context =
+            build_dynamic_subject_context(&subject, transcript_get_response(), None, None).expect("build context");
+
+        assert_eq!(context.subject_kind, "transcript");
+        assert_eq!(context.subject_id, "TRANSCRIPT-001");
+        assert_eq!(context.subject_title, "Startup Daily Check-In/Stand Up");
+        assert_eq!(context.subject_description, "# Standup\n\nsamiziiv: hello");
+        // No in-tree task/requirement record for a dynamic kind.
+        assert!(context.task.is_none());
+        // Plugin-resolved marker so `ensure_execution_cwd` uses the project
+        // root rather than the in-tree task adapter's managed worktree.
+        assert_eq!(context.attributes.get(SUBJECT_ATTR_PLUGIN_RESOLVED).map(String::as_str), Some("true"));
+        // Backend attributes are carried through.
+        assert_eq!(context.attributes.get("source").map(String::as_str), Some("krisp"));
+    }
+
+    #[test]
+    fn dynamic_context_feeds_qualified_mark_running_render() {
+        // The regression this fixes: a dynamic-kind subject must build a
+        // context AND then render `{{subject_id}}` kind-qualified so
+        // `mark-running` runs `animus subject status --id transcript:TRANSCRIPT-001`
+        // against the transcript backend instead of failing before any phase.
+        let subject = SubjectRef::new("transcript", "TRANSCRIPT-001");
+        let context =
+            build_dynamic_subject_context(&subject, transcript_get_response(), None, None).expect("build context");
+
+        let rendered = qualified_subject_id(&context.subject_kind, &context.subject_id);
+        assert_eq!(rendered, "transcript:TRANSCRIPT-001");
+    }
+
+    #[test]
+    fn build_dynamic_subject_context_uses_fallbacks_when_response_is_bare() {
+        let subject = SubjectRef::new("transcript", "TRANSCRIPT-777");
+
+        // Caller-supplied fallbacks win when the response omits title/description.
+        let with_fallbacks = build_dynamic_subject_context(
+            &subject,
+            json!({ "id": "transcript:TRANSCRIPT-777" }),
+            Some("Fallback"),
+            Some("Fallback body"),
+        )
+        .expect("build context");
+        assert_eq!(with_fallbacks.subject_title, "Fallback");
+        assert_eq!(with_fallbacks.subject_description, "Fallback body");
+
+        // With no fallbacks either, the title degrades to the bare id and the
+        // description to empty.
+        let bare = build_dynamic_subject_context(&subject, json!({ "id": "transcript:TRANSCRIPT-777" }), None, None)
+            .expect("build context");
+        assert_eq!(bare.subject_title, "TRANSCRIPT-777");
+        assert_eq!(bare.subject_description, "");
+    }
+
+    #[test]
+    fn builtin_subject_kinds_bypass_the_dynamic_backend_fallback() {
+        // Built-in kinds (in-tree adapters / advertised `<kind>/get`) must keep
+        // their existing resolution + not-found semantics, so they are gated
+        // out of the dynamic-kind backend fallback.
+        assert!(is_builtin_subject_kind(SUBJECT_KIND_TASK));
+        assert!(is_builtin_subject_kind("task"));
+        assert!(is_builtin_subject_kind(SUBJECT_KIND_REQUIREMENT));
+        assert!(is_builtin_subject_kind("requirement"));
+        assert!(is_builtin_subject_kind(SUBJECT_KIND_CUSTOM));
+
+        // Runtime-declared dynamic kinds engage the fallback.
+        assert!(!is_builtin_subject_kind("transcript"));
+        assert!(!is_builtin_subject_kind("blog"));
+        assert!(!is_builtin_subject_kind("linear.issue"));
+    }
+
+    #[test]
+    fn build_dynamic_subject_context_rejects_wrong_kind_or_id() {
+        let subject = SubjectRef::new("transcript", "TRANSCRIPT-001");
+
+        // A backend that ignored `kind` and matched a bare id under a different
+        // kind (e.g. a `task` row) must be rejected, not mislabeled.
+        let wrong_kind =
+            build_dynamic_subject_context(&subject, json!({ "id": "TRANSCRIPT-001", "kind": "task" }), None, None);
+        assert!(wrong_kind.is_err(), "wrong-kind response must be rejected");
+
+        // A backend that returned a different id must be rejected.
+        let wrong_id = build_dynamic_subject_context(
+            &subject,
+            json!({ "id": "transcript:TRANSCRIPT-999", "kind": "transcript" }),
+            None,
+            None,
+        );
+        assert!(wrong_id.is_err(), "wrong-id response must be rejected");
+
+        // The matching-kind, kind-qualified-id response is accepted.
+        let ok = build_dynamic_subject_context(
+            &subject,
+            json!({ "id": "transcript:TRANSCRIPT-001", "kind": "TRANSCRIPT", "title": "T" }),
+            None,
+            None,
+        );
+        assert!(ok.is_ok(), "matching kind (case-insensitive) + qualified id must be accepted");
+    }
+
+    #[test]
+    fn response_id_matches_bare_and_qualified_forms() {
+        let subject = SubjectRef::new("transcript", "TRANSCRIPT-001");
+        assert!(response_id_matches("TRANSCRIPT-001", &subject));
+        assert!(response_id_matches("transcript:TRANSCRIPT-001", &subject));
+        assert!(response_id_matches("TRANSCRIPT:TRANSCRIPT-001", &subject));
+        assert!(!response_id_matches("TRANSCRIPT-002", &subject));
+        assert!(!response_id_matches("blog:TRANSCRIPT-001", &subject));
+    }
 }
