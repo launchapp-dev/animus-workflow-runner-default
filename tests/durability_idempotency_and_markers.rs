@@ -215,6 +215,7 @@ fn make_decision(phase_id: &str, verdict: PhaseDecisionVerdict, reason: &str) ->
         kind: "phase_decision".to_string(),
         phase_id: phase_id.to_string(),
         verdict,
+        verdict_key: None,
         confidence: 0.9,
         risk: WorkflowDecisionRisk::Low,
         reason: reason.to_string(),

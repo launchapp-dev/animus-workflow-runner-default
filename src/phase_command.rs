@@ -395,6 +395,10 @@ pub(crate) fn build_command_phase_decision(
         kind: "phase_decision".to_string(),
         phase_id: phase_id.to_string(),
         verdict,
+        // TODO(codex-p2): a non-built-in `on_success_verdict`/`on_failure_verdict`
+        // should route via v0.7 `Unknown + verdict_key`; `None` preserves the
+        // v0.4.20 built-in mapping (no regression) pending custom-key adoption.
+        verdict_key: None,
         confidence,
         risk,
         reason: reason.clone(),
@@ -759,6 +763,7 @@ mod tests {
             kind: "phase_decision".to_string(),
             phase_id: "gate".to_string(),
             verdict,
+            verdict_key: None,
             confidence: 1.0,
             risk: orchestrator_core::WorkflowDecisionRisk::Low,
             reason: "test".to_string(),
