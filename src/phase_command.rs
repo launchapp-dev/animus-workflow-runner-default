@@ -18,6 +18,12 @@ pub(crate) struct CommandExecutionContext<'a> {
     pub phase_id: &'a str,
     pub workflow_ref: &'a str,
     pub subject_id: &'a str,
+    /// Subject kind for the bound subject (e.g. `animus.task`, `custom`, or a
+    /// dynamic backend kind like `transcript`). Used to render `{{subject_id}}`
+    /// in the kind-qualified `<kind>:<native>` form (see
+    /// [`qualified_subject_id`]) so subject verbs like `animus subject status`
+    /// resolve the right backend without a `default_subject_kind` fallback.
+    pub subject_kind: &'a str,
     pub subject_title: &'a str,
     pub subject_description: &'a str,
     pub pipeline_vars: Option<&'a HashMap<String, String>>,
@@ -183,6 +189,59 @@ pub(crate) fn command_phase_failed_event_payload(phase_id: &str, error: &Command
     payload
 }
 
+/// Map a subject kind to the bare kind alias the CLI subject backends dispatch
+/// on. The built-in kinds are namespaced on the wire (`animus.task`,
+/// `animus.requirement`) but the default `subject_backend` plugins advertise —
+/// and route — the bare `task` / `requirement` methods, so the qualified id
+/// prefix must use the bare alias. Returns `None` for the `custom` kind
+/// (ad-hoc / schedule-driven subjects are never kind-qualified — their bare id,
+/// e.g. `schedule:...`, already carries a prefix the schedule-input binding
+/// depends on) and for an empty kind (no kind information available).
+fn subject_kind_command_alias(kind: &str) -> Option<&str> {
+    let kind = kind.trim();
+    if kind.is_empty() || kind.eq_ignore_ascii_case(orchestrator_core::SUBJECT_KIND_CUSTOM) {
+        return None;
+    }
+    if kind.eq_ignore_ascii_case(orchestrator_core::SUBJECT_KIND_TASK) {
+        return Some("task");
+    }
+    if kind.eq_ignore_ascii_case(orchestrator_core::SUBJECT_KIND_REQUIREMENT) {
+        return Some("requirement");
+    }
+    // Dynamic backend kinds (`transcript`, `blog`, ...) already dispatch on
+    // their bare name, so use them verbatim.
+    Some(kind)
+}
+
+/// Render a subject id in the kind-qualified `<kind>:<native>` form the CLI
+/// resolves without a `default_subject_kind` fallback.
+///
+/// A workflow's `mark-running` command is `animus subject status --id
+/// {{subject_id}} --status in-progress` with no `--kind`. A BARE native id
+/// (`TRANSCRIPT-001`) forces the CLI onto the `default_subject_kind` (=`task`)
+/// path, which the backend rejects for any non-task subject
+/// (`id 'TRANSCRIPT-001' is a 'transcript' subject, not 'task'`). Emitting the
+/// qualified id (`transcript:TRANSCRIPT-001`) lets the CLI derive the kind from
+/// the prefix. Tasks stay backward compatible: `task:TASK-1` still resolves to
+/// kind `task`, the same backend the bare-id + default-task path hit.
+///
+/// Pass-through cases (returned unchanged) so we never break an existing
+/// consumer or double-prefix:
+/// - an empty id (subjectless run — the fail-fast guard handles it), and
+/// - an already-qualified id (contains `:`) — either a `<kind>:<native>` id the
+///   caller supplied, or a `custom` schedule id (`schedule:...`) whose bare form
+///   the schedule-input binding relies on.
+pub(crate) fn qualified_subject_id(kind: &str, id: &str) -> String {
+    let trimmed = id.trim();
+    if trimmed.is_empty() || trimmed.contains(':') {
+        return id.to_string();
+    }
+    match subject_kind_command_alias(kind) {
+        Some(alias) => format!("{alias}:{trimmed}"),
+        None => id.to_string(),
+    }
+}
+
 pub(crate) fn build_command_template_vars(context: &CommandExecutionContext<'_>) -> HashMap<String, String> {
     let mut vars = HashMap::from([
         ("project_root".to_string(), context.project_root.to_string()),
@@ -190,7 +249,12 @@ pub(crate) fn build_command_template_vars(context: &CommandExecutionContext<'_>)
         ("workflow_id".to_string(), context.workflow_id.to_string()),
         ("phase_id".to_string(), context.phase_id.to_string()),
         ("workflow_ref".to_string(), context.workflow_ref.to_string()),
-        ("subject_id".to_string(), context.subject_id.to_string()),
+        // `{{subject_id}}` renders kind-qualified so subject verbs resolve the
+        // right backend; `{{subject_native_id}}` preserves the BARE native id
+        // for any consumer that genuinely needs it.
+        ("subject_id".to_string(), qualified_subject_id(context.subject_kind, context.subject_id)),
+        ("subject_native_id".to_string(), context.subject_id.to_string()),
+        ("subject_kind".to_string(), context.subject_kind.to_string()),
         ("subject_title".to_string(), context.subject_title.to_string()),
         ("subject_description".to_string(), context.subject_description.to_string()),
     ]);
@@ -735,6 +799,7 @@ mod tests {
             phase_id: "sync-status",
             workflow_ref: "default",
             subject_id: "",
+            subject_kind: "",
             subject_title: "",
             subject_description: "",
             pipeline_vars: None,
@@ -817,6 +882,63 @@ mod tests {
         let command = command_def("echo", &["{{dispatch_input}}"]);
         vars.insert("dispatch_input".to_string(), String::new());
         assert!(unresolved_required_command_vars(&command, &vars).is_empty());
+    }
+
+    #[test]
+    fn qualified_subject_id_qualifies_dynamic_and_builtin_kinds() {
+        // Dynamic (custom-declared) kind: `mark-running` must render the
+        // kind-qualified id so the CLI derives kind `transcript` from the
+        // prefix instead of falling back to `default_subject_kind` (=task).
+        assert_eq!(qualified_subject_id("transcript", "TRANSCRIPT-001"), "transcript:TRANSCRIPT-001");
+        assert_eq!(qualified_subject_id("blog", "BLOG-42"), "blog:BLOG-42");
+
+        // Built-in task: the wire kind is namespaced (`animus.task`) but the
+        // CLI backend dispatches on the bare `task` alias — and `task:TASK-1`
+        // still resolves to kind `task`, so this stays backward compatible with
+        // the old bare-id + default-task path.
+        assert_eq!(qualified_subject_id(orchestrator_core::SUBJECT_KIND_TASK, "TASK-1"), "task:TASK-1");
+        assert_eq!(qualified_subject_id("task", "TASK-1"), "task:TASK-1");
+        assert_eq!(qualified_subject_id(orchestrator_core::SUBJECT_KIND_REQUIREMENT, "REQ-9"), "requirement:REQ-9");
+        assert_eq!(qualified_subject_id("requirement", "REQ-9"), "requirement:REQ-9");
+    }
+
+    #[test]
+    fn qualified_subject_id_passes_through_special_cases() {
+        // Empty (subjectless) id is untouched — the fail-fast guard handles it.
+        assert_eq!(qualified_subject_id("transcript", ""), "");
+        // Already-qualified ids are never double-prefixed.
+        assert_eq!(qualified_subject_id("transcript", "transcript:TRANSCRIPT-001"), "transcript:TRANSCRIPT-001");
+        assert_eq!(qualified_subject_id(orchestrator_core::SUBJECT_KIND_TASK, "task:TASK-1"), "task:TASK-1");
+        // Custom / schedule-driven subjects keep their bare id (their prefix is
+        // meaningful to the schedule-input binding, not a kind qualifier).
+        assert_eq!(
+            qualified_subject_id(orchestrator_core::SUBJECT_KIND_CUSTOM, "schedule:nightly"),
+            "schedule:nightly"
+        );
+        // No kind information -> leave the id bare (non-regression).
+        assert_eq!(qualified_subject_id("", "TASK-1"), "TASK-1");
+    }
+
+    #[test]
+    fn build_command_template_vars_exposes_qualified_and_native_subject_id() {
+        // A dynamic-kind command context: `{{subject_id}}` is qualified,
+        // `{{subject_native_id}}` keeps the bare native id, and `{{subject_kind}}`
+        // is exposed.
+        let mut ctx = subjectless_context();
+        ctx.subject_id = "TRANSCRIPT-001";
+        ctx.subject_kind = "transcript";
+        let vars = build_command_template_vars(&ctx);
+        assert_eq!(vars.get("subject_id").map(String::as_str), Some("transcript:TRANSCRIPT-001"));
+        assert_eq!(vars.get("subject_native_id").map(String::as_str), Some("TRANSCRIPT-001"));
+        assert_eq!(vars.get("subject_kind").map(String::as_str), Some("transcript"));
+
+        // A built-in task context: qualified as `task:...`, native id preserved.
+        let mut task_ctx = subjectless_context();
+        task_ctx.subject_id = "TASK-254";
+        task_ctx.subject_kind = orchestrator_core::SUBJECT_KIND_TASK;
+        let task_vars = build_command_template_vars(&task_ctx);
+        assert_eq!(task_vars.get("subject_id").map(String::as_str), Some("task:TASK-254"));
+        assert_eq!(task_vars.get("subject_native_id").map(String::as_str), Some("TASK-254"));
     }
 
     #[tokio::test]

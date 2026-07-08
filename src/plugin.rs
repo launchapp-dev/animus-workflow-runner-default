@@ -450,6 +450,11 @@ pub async fn handle_workflow_run_phase(request: WorkflowPhaseRunRequest) -> Resu
         workflow_id: &request.workflow_id,
         workflow_ref: &request.workflow_ref,
         subject_id: &request.subject_id,
+        // `WorkflowPhaseRunRequest` carries no subject kind, so the id is left
+        // as sent. When the daemon supplies an already-qualified id
+        // (`<kind>:<native>`) the command phase resolves the right backend;
+        // a bare id stays bare (unchanged pre-fix behavior).
+        subject_kind: "",
         subject_title: &request.subject_title,
         subject_description: &request.subject_description,
         task_complexity,

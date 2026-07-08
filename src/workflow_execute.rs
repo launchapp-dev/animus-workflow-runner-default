@@ -289,6 +289,10 @@ pub async fn execute_workflow_with_hub(
     }
 
     let subject_id_str = workflow_subject.id().to_string();
+    // Subject kind for rendering `{{subject_id}}` kind-qualified in command
+    // phases (e.g. `mark-running`), so a dynamic-kind subject's status call
+    // targets its own backend instead of the `task` default.
+    let subject_kind_str = workflow_subject.kind().to_string();
     let subject_title = subject_context.subject_title.clone();
     let subject_description = subject_context.subject_description.clone();
     let task_complexity = task.as_ref().map(|t| t.complexity);
@@ -353,6 +357,7 @@ pub async fn execute_workflow_with_hub(
             workflow_id: &workflow.id,
             workflow_ref: workflow_ref.as_str(),
             subject_id: &subject_id_str,
+            subject_kind: &subject_kind_str,
             subject_title: &subject_title,
             subject_description: &subject_description,
             task_complexity,
@@ -580,6 +585,7 @@ pub async fn execute_workflow_with_hub(
             workflow_id: &workflow.id,
             workflow_ref: workflow_ref.as_str(),
             subject_id: &subject_id_str,
+            subject_kind: &subject_kind_str,
             subject_title: &subject_title,
             subject_description: &subject_description,
             task_complexity,
