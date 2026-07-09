@@ -1,6 +1,6 @@
 [package]
 name = "animus-workflow-runner-default"
-version = "0.4.24"
+version = "0.4.25"
 edition = "2021"
 description = "Reference workflow_runner plugin for Animus v0.5 (stdio JSON-RPC + direct-execute CLI; replaces in-tree workflow-runner-v2)"
 license = "Elastic-2.0"
@@ -15,20 +15,20 @@ name = "animus-workflow-runner-default"
 path = "src/main.rs"
 
 [dependencies]
-# --- protocol crates — pinned to animus-protocol tag v0.7.0-rc.5, the SAME tag
+# --- protocol crates — pinned to animus-protocol tag v0.7.0-rc.6, the SAME tag
 # ao-cli release/0.7 (rc.6, rev 48ad8507) resolves ALL its protocol/wire crates
-# to. Keeping every protocol crate on the single v0.7.0-rc.5 tag avoids
+# to. Keeping every protocol crate on the single v0.7.0-rc.6 tag avoids
 # duplicate-crate / type-mismatch errors with orchestrator-core's transitive
 # deps (the tag-unification hazard). Bumped from v0.1.25 in lockstep with the
 # orchestrator-* rev below so the runner's vendored plugin discovery understands
 # the multi-kind `plugin_kinds` manifest field (config_source served by the
 # consolidated animus-postgres BaaS plugin). ---------------------------------
-animus-session-backend      = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.7.0-rc.5" }
-animus-subject-protocol     = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.7.0-rc.5" }
-animus-workflow-runner-protocol = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.7.0-rc.5" }
-animus-plugin-protocol      = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.7.0-rc.5" }
-animus-actor                = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.7.0-rc.5" }
-protocol                    = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.7.0-rc.5", package = "protocol" }
+animus-session-backend      = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.7.0-rc.6" }
+animus-subject-protocol     = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.7.0-rc.6" }
+animus-workflow-runner-protocol = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.7.0-rc.6" }
+animus-plugin-protocol      = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.7.0-rc.6" }
+animus-actor                = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.7.0-rc.6" }
+protocol                    = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.7.0-rc.6", package = "protocol" }
 
 # --- ao-cli kernel crates — pinned to the current HEAD rev. The session
 # dispatch types (`SessionBackendResolver`, `PluginSessionBackend`,
@@ -37,10 +37,17 @@ protocol                    = { git = "https://github.com/launchapp-dev/animus-p
 # `orchestrator-config`, `orchestrator-plugin-host`, and `orchestrator-logging`
 # are in-tree path deps inside the kernel workspace, so they have no standalone
 # published tag — pin them to the kernel git rev instead. ---------------------
-orchestrator-core          = { git = "https://github.com/launchapp-dev/animus-cli", rev = "b4c0ae23559981e288dcf6c9989139c28c77cfc5" }
-orchestrator-config        = { git = "https://github.com/launchapp-dev/animus-cli", rev = "b4c0ae23559981e288dcf6c9989139c28c77cfc5" }
-orchestrator-plugin-host   = { git = "https://github.com/launchapp-dev/animus-cli", rev = "b4c0ae23559981e288dcf6c9989139c28c77cfc5" }
-orchestrator-logging       = { git = "https://github.com/launchapp-dev/animus-cli", rev = "b4c0ae23559981e288dcf6c9989139c28c77cfc5" }
+orchestrator-core          = { git = "https://github.com/launchapp-dev/animus-cli", rev = "b39a08a9a6eb1142247b482f7addb0078cf63c45" }
+orchestrator-config        = { git = "https://github.com/launchapp-dev/animus-cli", rev = "b39a08a9a6eb1142247b482f7addb0078cf63c45" }
+orchestrator-plugin-host   = { git = "https://github.com/launchapp-dev/animus-cli", rev = "b39a08a9a6eb1142247b482f7addb0078cf63c45" }
+orchestrator-logging       = { git = "https://github.com/launchapp-dev/animus-cli", rev = "b39a08a9a6eb1142247b482f7addb0078cf63c45" }
+# rc.9 (#318/TASK-276): the task-status projection now writes through a
+# `TaskProjectionStore`. `resolve_task_projection_store` selects the subject
+# router when a `subject_backend` plugin owns `task`/`*` (portal) and falls back
+# to the in-tree hub store otherwise — the runner reuses the daemon's exact
+# builder so its own in-process projections route through the plugin instead of
+# the empty in-tree store (else finished/paused runs leave the subject stuck).
+orchestrator-daemon-runtime = { git = "https://github.com/launchapp-dev/animus-cli", rev = "b39a08a9a6eb1142247b482f7addb0078cf63c45" }
 
 # --- stdlib-ish deps (move with the crate) ----------------------------------
 anyhow = "1.0"

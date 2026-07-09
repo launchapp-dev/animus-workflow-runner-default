@@ -150,6 +150,9 @@ pub fn plugin_manifest() -> PluginManifest {
         ],
         env_required: Vec::new(),
         notification_buffer_size: None,
+        // rc.6 (TASK-277): MCP capability is undeclared for this workflow_runner
+        // plugin; the kernel applies its default. `None` = not an MCP provider.
+        supports_mcp: None,
     }
 }
 

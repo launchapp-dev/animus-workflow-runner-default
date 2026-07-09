@@ -843,8 +843,20 @@ pub async fn execute_workflow_with_hub(
                         continue;
                     }
                     PhaseExecutionOutcome::ManualPending { .. } => {
+                        // #318 (TASK-276): route the pause-annotation projection
+                        // through the subject router when a `subject_backend`
+                        // plugin owns `task` (portal), matching the daemon's
+                        // `dispatch_workflow_event` call sites. Passing the
+                        // in-tree hub store here would leave the plugin-backed
+                        // subject's pause marker unwritten on the portal.
+                        let task_store = orchestrator_daemon_runtime::resolve_task_projection_store(
+                            &params.project_root,
+                            hub.clone(),
+                        )
+                        .await;
                         let outcome = dispatch_workflow_event(
                             hub.clone(),
+                            task_store.as_ref(),
                             &params.project_root,
                             WorkflowEvent::Pause { workflow_id: workflow.id.clone(), reason_detail: None },
                         )
