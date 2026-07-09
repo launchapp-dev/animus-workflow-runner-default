@@ -1,6 +1,6 @@
 [package]
 name = "animus-workflow-runner-default"
-version = "0.4.23"
+version = "0.4.24"
 edition = "2021"
 description = "Reference workflow_runner plugin for Animus v0.5 (stdio JSON-RPC + direct-execute CLI; replaces in-tree workflow-runner-v2)"
 license = "Elastic-2.0"
@@ -37,10 +37,10 @@ protocol                    = { git = "https://github.com/launchapp-dev/animus-p
 # `orchestrator-config`, `orchestrator-plugin-host`, and `orchestrator-logging`
 # are in-tree path deps inside the kernel workspace, so they have no standalone
 # published tag — pin them to the kernel git rev instead. ---------------------
-orchestrator-core          = { git = "https://github.com/launchapp-dev/animus-cli", rev = "48ad850761247e8df368e818f6ee66fc086ab57b" }
-orchestrator-config        = { git = "https://github.com/launchapp-dev/animus-cli", rev = "48ad850761247e8df368e818f6ee66fc086ab57b" }
-orchestrator-plugin-host   = { git = "https://github.com/launchapp-dev/animus-cli", rev = "48ad850761247e8df368e818f6ee66fc086ab57b" }
-orchestrator-logging       = { git = "https://github.com/launchapp-dev/animus-cli", rev = "48ad850761247e8df368e818f6ee66fc086ab57b" }
+orchestrator-core          = { git = "https://github.com/launchapp-dev/animus-cli", rev = "b4c0ae23559981e288dcf6c9989139c28c77cfc5" }
+orchestrator-config        = { git = "https://github.com/launchapp-dev/animus-cli", rev = "b4c0ae23559981e288dcf6c9989139c28c77cfc5" }
+orchestrator-plugin-host   = { git = "https://github.com/launchapp-dev/animus-cli", rev = "b4c0ae23559981e288dcf6c9989139c28c77cfc5" }
+orchestrator-logging       = { git = "https://github.com/launchapp-dev/animus-cli", rev = "b4c0ae23559981e288dcf6c9989139c28c77cfc5" }
 
 # --- stdlib-ish deps (move with the crate) ----------------------------------
 anyhow = "1.0"
