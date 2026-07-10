@@ -58,6 +58,11 @@ pub(crate) struct CommandExecutionResult {
 /// as other required-non-empty bindings are identified.
 pub(crate) const COMMAND_REQUIRED_NONEMPTY_VARS: &[&str] = &["subject_id"];
 
+/// Upper bound on the best-effort subject/get enrichment run before every
+/// command phase. On timeout the phase degrades to scalar context rather than
+/// stalling on a slow subject_backend.
+const SUBJECT_FETCH_TIMEOUT_SECS: u64 = 5;
+
 /// Sentinel error attached to a terminal command-phase failure. Carries the
 /// structured exit-code + stderr snippet so the `workflow_execute` error arms
 /// can emit a `phase_failed` runtime event that the ao-cli journal mapping
@@ -306,6 +311,22 @@ fn command_context_file_path(context: &CommandExecutionContext<'_>) -> PathBuf {
         uuid::Uuid::new_v4().simple()
     );
     std::env::temp_dir().join(name)
+}
+
+/// Write the context JSON with owner-only (0600) permissions — it carries the
+/// full `subject.data`, which may contain sensitive fields. On unix the file is
+/// created 0600 up front so it is never briefly world-readable.
+#[cfg(unix)]
+fn write_context_file_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
+    file.write_all(bytes)
+}
+
+#[cfg(not(unix))]
+fn write_context_file_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    std::fs::write(path, bytes)
 }
 
 /// The `ANIMUS_*` scalar env catalog promoted onto the command subprocess. A
@@ -793,7 +814,26 @@ pub(crate) async fn run_workflow_phase_with_command(
     // blob carries status/priority/data/labels/dependencies the runner does not
     // otherwise track. A fetch failure must NOT crash the phase — degrade to
     // the scalar env + a minimal context file.
-    let subject_record = fetch_subject_record(context.project_root, context.subject_kind, context.subject_id).await;
+    // Bound the fetch: it spawns/connects a subject_backend plugin host and runs
+    // on EVERY command phase (incl. trivial mark-running/mark-done). A slow or
+    // hung backend must not stall the phase — cap it and degrade to scalar context.
+    let subject_record = match tokio::time::timeout(
+        std::time::Duration::from_secs(SUBJECT_FETCH_TIMEOUT_SECS),
+        fetch_subject_record(context.project_root, context.subject_kind, context.subject_id),
+    )
+    .await
+    {
+        Ok(record) => record,
+        Err(_) => {
+            tracing::warn!(
+                phase_id = context.phase_id,
+                subject_id = context.subject_id,
+                timeout_secs = SUBJECT_FETCH_TIMEOUT_SECS,
+                "command-phase context: subject/get timed out; degrading to scalar context"
+            );
+            None
+        }
+    };
     if subject_record.is_none() && !context.subject_id.trim().is_empty() {
         tracing::debug!(
             phase_id = context.phase_id,
@@ -813,17 +853,24 @@ pub(crate) async fn run_workflow_phase_with_command(
     // run. The RAII guard removes it on every return path so it never leaks
     // across phases; stdin stays null.
     let context_file = command_context_file_path(context);
-    let context_file_guard = match std::fs::write(&context_file, serde_json::to_vec(&context_json).unwrap_or_default())
-    {
-        Ok(()) => Some(TempContextFile { path: context_file.clone() }),
-        Err(error) => {
-            tracing::warn!(
-                phase_id = context.phase_id,
-                path = %context_file.display(),
-                %error,
-                "command-phase context: failed to write ANIMUS_CONTEXT_FILE; continuing with scalar env only"
-            );
-            None
+    let context_bytes = serde_json::to_vec(&context_json).unwrap_or_default();
+    // Own the path with the RAII guard BEFORE writing so a partial file left by a
+    // mid-write error is still cleaned up (the guard drops on the Err arm). The
+    // file is written 0600 — it embeds subject.data which may carry secrets,
+    // unlike the scalar ANIMUS_* env.
+    let context_file_guard = {
+        let guard = TempContextFile { path: context_file.clone() };
+        match write_context_file_private(&context_file, &context_bytes) {
+            Ok(()) => Some(guard),
+            Err(error) => {
+                tracing::warn!(
+                    phase_id = context.phase_id,
+                    path = %context_file.display(),
+                    %error,
+                    "command-phase context: failed to write ANIMUS_CONTEXT_FILE; continuing with scalar env only"
+                );
+                None
+            }
         }
     };
 
