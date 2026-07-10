@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
-use serde_json::Value;
+use orchestrator_plugin_host::PluginRegistry;
+use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
@@ -278,6 +279,163 @@ pub(crate) fn build_command_template_vars(context: &CommandExecutionContext<'_>)
     vars
 }
 
+/// RAII guard that deletes the per-phase context temp file on drop, so the
+/// `ANIMUS_CONTEXT_FILE` never leaks across phases — it is removed on the
+/// success, failure, and timeout return paths alike.
+struct TempContextFile {
+    path: PathBuf,
+}
+
+impl Drop for TempContextFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn sanitize_path_component(value: &str) -> String {
+    value.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' }).collect()
+}
+
+/// Absolute temp path for this phase run's context file, scoped by run id +
+/// phase id + a random suffix so concurrent phases never collide.
+fn command_context_file_path(context: &CommandExecutionContext<'_>) -> PathBuf {
+    let name = format!(
+        "animus-ctx-{}-{}-{}.json",
+        sanitize_path_component(context.workflow_id),
+        sanitize_path_component(context.phase_id),
+        uuid::Uuid::new_v4().simple()
+    );
+    std::env::temp_dir().join(name)
+}
+
+/// The `ANIMUS_*` scalar env catalog promoted onto the command subprocess. A
+/// superset of the `{{var}}` template catalog (which keeps working — this is
+/// additive) plus the subject status from the fetched record.
+pub(crate) fn build_animus_context_env(
+    context: &CommandExecutionContext<'_>,
+    template_vars: &HashMap<String, String>,
+    subject_status: &str,
+) -> Vec<(&'static str, String)> {
+    let qualified_subject_id =
+        template_vars.get("subject_id").cloned().unwrap_or_else(|| context.subject_id.to_string());
+    let dispatch_input = template_vars.get("dispatch_input").cloned().unwrap_or_default();
+    vec![
+        ("ANIMUS_SUBJECT_ID", qualified_subject_id),
+        ("ANIMUS_SUBJECT_NATIVE_ID", context.subject_id.to_string()),
+        ("ANIMUS_SUBJECT_KIND", context.subject_kind.to_string()),
+        ("ANIMUS_SUBJECT_TITLE", context.subject_title.to_string()),
+        ("ANIMUS_SUBJECT_STATUS", subject_status.to_string()),
+        ("ANIMUS_WORKFLOW_REF", context.workflow_ref.to_string()),
+        ("ANIMUS_WORKFLOW_ID", context.workflow_id.to_string()),
+        ("ANIMUS_PHASE_ID", context.phase_id.to_string()),
+        ("ANIMUS_PROJECT_ROOT", context.project_root.to_string()),
+        ("ANIMUS_EXECUTION_CWD", context.execution_cwd.to_string()),
+        ("ANIMUS_DISPATCH_INPUT", dispatch_input),
+    ]
+}
+
+/// Build the structured context JSON written to `ANIMUS_CONTEXT_FILE`. Subject
+/// identity/title/description come from the (always-present) execution context;
+/// `status`/`priority`/`data`/`labels`/`dependencies` are enriched from the
+/// best-effort `subject/get` record (null when the fetch degraded). `phases`
+/// carries prior completed phases this run (id + verdict + persisted outputs).
+pub(crate) fn build_command_context_json(
+    context: &CommandExecutionContext<'_>,
+    template_vars: &HashMap<String, String>,
+    subject_record: Option<&Value>,
+    prior_phases: &[crate::phase_output::PersistedPhaseOutput],
+) -> Value {
+    let field = |key: &str| subject_record.and_then(|rec| rec.get(key)).cloned();
+    // `data` prefers an explicit `data` object, then the backend `attributes`
+    // bag; `labels` prefers `labels`, then `tags`. Absent fields stay `null`.
+    let data = field("data").or_else(|| field("attributes")).unwrap_or(Value::Null);
+    let labels = field("labels").or_else(|| field("tags")).unwrap_or(Value::Null);
+
+    let qualified_subject_id =
+        template_vars.get("subject_id").cloned().unwrap_or_else(|| context.subject_id.to_string());
+
+    let subject = json!({
+        "id": qualified_subject_id,
+        "native_id": context.subject_id,
+        "kind": context.subject_kind,
+        "title": context.subject_title,
+        "status": field("status").unwrap_or(Value::Null),
+        "priority": field("priority").unwrap_or(Value::Null),
+        "description": context.subject_description,
+        "data": data,
+        "labels": labels,
+        "dependencies": field("dependencies").unwrap_or(Value::Null),
+    });
+
+    let phases: Vec<Value> = prior_phases
+        .iter()
+        .map(|output| {
+            json!({
+                "id": output.phase_id,
+                "verdict": output.verdict,
+                "outputs": output.payload.clone().unwrap_or(Value::Null),
+            })
+        })
+        .collect();
+
+    // dispatch_input is surfaced as parsed JSON when it is valid JSON, else as
+    // the raw string; absent -> null.
+    let dispatch_input = template_vars
+        .get("dispatch_input")
+        .map(|raw| serde_json::from_str::<Value>(raw).unwrap_or_else(|_| Value::String(raw.clone())))
+        .unwrap_or(Value::Null);
+
+    json!({
+        "subject": subject,
+        "workflow": {
+            "ref": context.workflow_ref,
+            "run_id": context.workflow_id,
+            "phase_id": context.phase_id,
+        },
+        "phases": phases,
+        "dispatch_input": dispatch_input,
+    })
+}
+
+/// Best-effort fetch of the FULL subject record via a `subject_backend`
+/// plugin's generic `subject/get` (`{kind, id}`), falling back to the per-kind
+/// `<kind>/get` (`{id}`) — the same discovery the runner uses for dynamic-kind
+/// context builds. Returns `None` (never errors) on any failure so a command
+/// phase degrades gracefully to the scalar env + minimal context file.
+async fn fetch_subject_record(project_root: &str, kind: &str, native_id: &str) -> Option<Value> {
+    let kind = kind.trim();
+    let native_id = native_id.trim();
+    if kind.is_empty() || native_id.is_empty() {
+        return None;
+    }
+
+    let mut registry = PluginRegistry::discover(project_root).ok()?;
+    let kind_method = format!("{kind}/get");
+    let candidates: Vec<(String, String, Value)> = registry
+        .list_plugins()
+        .filter(|plugin| crate::workflow_execute::is_subject_backend(plugin))
+        .filter_map(|plugin| {
+            let capabilities = &plugin.manifest.capabilities;
+            if capabilities.iter().any(|cap| cap.as_str() == "subject/get") {
+                Some((plugin.name.clone(), "subject/get".to_string(), json!({ "kind": kind, "id": native_id })))
+            } else if capabilities.iter().any(|cap| cap.as_str() == kind_method.as_str()) {
+                Some((plugin.name.clone(), kind_method.clone(), json!({ "id": native_id })))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    for (name, method, params) in &candidates {
+        if let Ok(host) = registry.get_plugin(name).await {
+            if let Ok(value) = host.request(method.clone(), Some(params.clone())).await {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
 fn resolve_command_cwd(
     context: &CommandExecutionContext<'_>,
     command: &orchestrator_core::PhaseCommandDefinition,
@@ -415,6 +573,27 @@ pub(crate) fn summarize_output_excerpt(text: &str, max_len: usize) -> Option<Str
     Some(excerpt)
 }
 
+/// Map a configured `on_success_verdict` / `on_failure_verdict` string to a
+/// `(verdict, verdict_key)` pair. A built-in verdict maps to its enum variant
+/// with no key; a non-empty non-built-in string is carried as `Unknown` + the
+/// raw key so the executor routes it through the phase `on_verdict` map (custom
+/// verdict routing). An absent/empty configuration falls back to `default`.
+fn map_configured_command_verdict(
+    configured: Option<&str>,
+    default: orchestrator_core::PhaseDecisionVerdict,
+) -> (orchestrator_core::PhaseDecisionVerdict, Option<String>) {
+    match configured.map(str::trim).filter(|value| !value.is_empty()) {
+        None => (default, None),
+        Some(value) => match value.to_ascii_lowercase().as_str() {
+            "advance" => (orchestrator_core::PhaseDecisionVerdict::Advance, None),
+            "rework" => (orchestrator_core::PhaseDecisionVerdict::Rework, None),
+            "skip" => (orchestrator_core::PhaseDecisionVerdict::Skip, None),
+            "fail" => (orchestrator_core::PhaseDecisionVerdict::Fail, None),
+            _ => (orchestrator_core::PhaseDecisionVerdict::Unknown, Some(value.to_string())),
+        },
+    }
+}
+
 pub(crate) fn build_command_phase_decision(
     command: &orchestrator_core::PhaseCommandDefinition,
     phase_id: &str,
@@ -427,20 +606,16 @@ pub(crate) fn build_command_phase_decision(
         .map(str::to_string)
         .unwrap_or_else(|| format!("Command `{}` completed successfully", command.program));
 
-    let verdict = if success {
-        match command.on_success_verdict.as_deref() {
-            Some("rework") => orchestrator_core::PhaseDecisionVerdict::Rework,
-            Some("fail") => orchestrator_core::PhaseDecisionVerdict::Fail,
-            Some("skip") => orchestrator_core::PhaseDecisionVerdict::Skip,
-            _ => orchestrator_core::PhaseDecisionVerdict::Advance,
-        }
+    let (verdict, verdict_key) = if success {
+        map_configured_command_verdict(
+            command.on_success_verdict.as_deref(),
+            orchestrator_core::PhaseDecisionVerdict::Advance,
+        )
     } else {
-        match command.on_failure_verdict.as_deref() {
-            Some("advance") => orchestrator_core::PhaseDecisionVerdict::Advance,
-            Some("fail") => orchestrator_core::PhaseDecisionVerdict::Fail,
-            Some("skip") => orchestrator_core::PhaseDecisionVerdict::Skip,
-            _ => orchestrator_core::PhaseDecisionVerdict::Rework,
-        }
+        map_configured_command_verdict(
+            command.on_failure_verdict.as_deref(),
+            orchestrator_core::PhaseDecisionVerdict::Rework,
+        )
     };
 
     let confidence = command.confidence.unwrap_or(1.0);
@@ -459,10 +634,9 @@ pub(crate) fn build_command_phase_decision(
         kind: "phase_decision".to_string(),
         phase_id: phase_id.to_string(),
         verdict,
-        // TODO(codex-p2): a non-built-in `on_success_verdict`/`on_failure_verdict`
-        // should route via v0.7 `Unknown + verdict_key`; `None` preserves the
-        // v0.4.20 built-in mapping (no regression) pending custom-key adoption.
-        verdict_key: None,
+        // A non-built-in `on_success_verdict`/`on_failure_verdict` routes via
+        // `Unknown` + the raw key; built-in mappings leave it `None`.
+        verdict_key,
         confidence,
         risk,
         reason: reason.clone(),
@@ -613,6 +787,46 @@ pub(crate) async fn run_workflow_phase_with_command(
         .map(|(key, value)| (key.clone(), orchestrator_config::expand_variables(value, &template_vars)))
         .collect::<BTreeMap<_, _>>();
     let cwd = resolve_command_cwd(context, command, &template_vars)?;
+
+    // TASK-292: rich context injection. Best-effort fetch of the FULL subject
+    // record via the subject_backend's generic `subject/get` so the context
+    // blob carries status/priority/data/labels/dependencies the runner does not
+    // otherwise track. A fetch failure must NOT crash the phase — degrade to
+    // the scalar env + a minimal context file.
+    let subject_record = fetch_subject_record(context.project_root, context.subject_kind, context.subject_id).await;
+    if subject_record.is_none() && !context.subject_id.trim().is_empty() {
+        tracing::debug!(
+            phase_id = context.phase_id,
+            subject_id = context.subject_id,
+            subject_kind = context.subject_kind,
+            "command-phase context: subject/get returned no record; degrading to scalar context"
+        );
+    }
+    let prior_phases =
+        crate::phase_output::list_prior_phase_outputs(context.project_root, context.workflow_id, context.phase_id);
+    let context_json = build_command_context_json(context, &template_vars, subject_record.as_ref(), &prior_phases);
+    let subject_status =
+        subject_record.as_ref().and_then(|rec| rec.get("status")).and_then(Value::as_str).unwrap_or_default();
+    let animus_env = build_animus_context_env(context, &template_vars, subject_status);
+
+    // Write the structured context JSON to a temp file scoped to THIS phase
+    // run. The RAII guard removes it on every return path so it never leaks
+    // across phases; stdin stays null.
+    let context_file = command_context_file_path(context);
+    let context_file_guard = match std::fs::write(&context_file, serde_json::to_vec(&context_json).unwrap_or_default())
+    {
+        Ok(()) => Some(TempContextFile { path: context_file.clone() }),
+        Err(error) => {
+            tracing::warn!(
+                phase_id = context.phase_id,
+                path = %context_file.display(),
+                %error,
+                "command-phase context: failed to write ANIMUS_CONTEXT_FILE; continuing with scalar env only"
+            );
+            None
+        }
+    };
+
     let started = std::time::Instant::now();
 
     let mut process = TokioCommand::new(&command.program);
@@ -626,6 +840,16 @@ pub(crate) async fn run_workflow_phase_with_command(
 
     for (key, value) in &env {
         process.env(key, value);
+    }
+
+    // TASK-292: promote the context scalars to real env vars (additive — the
+    // `{{var}}` templating above is unchanged). Set AFTER the user's
+    // command.env so the runner-provided ANIMUS_* contract is authoritative.
+    for (key, value) in &animus_env {
+        process.env(key, value);
+    }
+    if let Some(guard) = context_file_guard.as_ref() {
+        process.env("ANIMUS_CONTEXT_FILE", &guard.path);
     }
 
     let mut child = process.spawn()?;
@@ -1119,5 +1343,163 @@ mod tests {
             assert!(capture.text.contains("world"));
             assert!(capture.phase_decision.is_none());
         }
+    }
+
+    // ---- TASK-293: custom verdict keys on command decisions ----
+
+    #[test]
+    fn map_configured_command_verdict_maps_builtin_and_custom() {
+        use orchestrator_core::PhaseDecisionVerdict as V;
+        assert_eq!(map_configured_command_verdict(None, V::Advance), (V::Advance, None));
+        assert_eq!(map_configured_command_verdict(Some("rework"), V::Advance), (V::Rework, None));
+        assert_eq!(map_configured_command_verdict(Some("SKIP"), V::Rework), (V::Skip, None));
+        assert_eq!(map_configured_command_verdict(Some("  fail "), V::Advance), (V::Fail, None));
+        // A non-built-in verdict carries the raw key verbatim as Unknown.
+        let (verdict, key) = map_configured_command_verdict(Some("needs-research"), V::Advance);
+        assert_eq!(verdict, V::Unknown);
+        assert_eq!(key.as_deref(), Some("needs-research"));
+    }
+
+    #[test]
+    fn build_command_phase_decision_custom_failure_verdict_carries_key() {
+        let cmd = command_def_with_failure_verdict("false", Some("needs-research"));
+        let decision = build_command_phase_decision(&cmd, "gate", 1, Some("boom"));
+        assert_eq!(decision.verdict, orchestrator_core::PhaseDecisionVerdict::Unknown);
+        assert_eq!(decision.verdict_key.as_deref(), Some("needs-research"));
+        // A custom verdict is not a terminal fail, so the QA-gate Completed path
+        // (not the phase_failed path) carries it — routing happens downstream.
+        assert!(!command_failure_is_terminal(&decision));
+    }
+
+    // ---- TASK-292: rich context injection ----
+
+    #[test]
+    fn build_command_context_json_enriches_from_record_and_prior_phases() {
+        let mut ctx = subjectless_context();
+        ctx.subject_id = "TRANSCRIPT-001";
+        ctx.subject_kind = "transcript";
+        ctx.subject_title = "Standup";
+        ctx.subject_description = "notes";
+        let vars = build_command_template_vars(&ctx);
+
+        let record = serde_json::json!({
+            "id": "transcript:TRANSCRIPT-001",
+            "kind": "transcript",
+            "status": "captured",
+            "priority": "p1",
+            "data": { "source": "krisp" },
+            "labels": ["standup"],
+            "dependencies": ["TASK-1"],
+        });
+        let prior = vec![crate::phase_output::PersistedPhaseOutput {
+            phase_id: "research".to_string(),
+            completed_at: "2026-03-01T00:00:00Z".to_string(),
+            verdict: Some("advance".to_string()),
+            confidence: Some(0.9),
+            reason: Some("done".to_string()),
+            commit_message: None,
+            evidence: vec![],
+            guardrail_violations: vec![],
+            payload: Some(serde_json::json!({ "findings": ["a"] })),
+        }];
+
+        let json = build_command_context_json(&ctx, &vars, Some(&record), &prior);
+        assert_eq!(json["subject"]["id"], "transcript:TRANSCRIPT-001");
+        assert_eq!(json["subject"]["native_id"], "TRANSCRIPT-001");
+        assert_eq!(json["subject"]["kind"], "transcript");
+        assert_eq!(json["subject"]["status"], "captured");
+        assert_eq!(json["subject"]["priority"], "p1");
+        assert_eq!(json["subject"]["data"]["source"], "krisp");
+        assert_eq!(json["subject"]["labels"][0], "standup");
+        assert_eq!(json["subject"]["dependencies"][0], "TASK-1");
+        assert_eq!(json["workflow"]["run_id"], ctx.workflow_id);
+        assert_eq!(json["workflow"]["phase_id"], ctx.phase_id);
+        assert_eq!(json["phases"][0]["id"], "research");
+        assert_eq!(json["phases"][0]["verdict"], "advance");
+        assert_eq!(json["phases"][0]["outputs"]["findings"][0], "a");
+    }
+
+    #[test]
+    fn build_command_context_json_degrades_without_record() {
+        let ctx = bound_context();
+        let vars = build_command_template_vars(&ctx);
+        let json = build_command_context_json(&ctx, &vars, None, &[]);
+        assert_eq!(json["subject"]["native_id"], "task:TASK-1");
+        // Keys stay present but null when the subject fetch degraded.
+        assert!(json["subject"]["data"].is_null());
+        assert!(json["subject"]["status"].is_null());
+        assert!(json["subject"]["dependencies"].is_null());
+        assert!(json["phases"].as_array().expect("phases is array").is_empty());
+    }
+
+    #[test]
+    fn build_animus_context_env_exposes_full_catalog() {
+        let mut ctx = subjectless_context();
+        ctx.subject_id = "TASK-9";
+        ctx.subject_kind = orchestrator_core::SUBJECT_KIND_TASK;
+        ctx.subject_title = "Do it";
+        let vars = build_command_template_vars(&ctx);
+        let env = build_animus_context_env(&ctx, &vars, "in-progress");
+        let map: HashMap<_, _> = env.into_iter().collect();
+        assert_eq!(map.get("ANIMUS_SUBJECT_ID").map(String::as_str), Some("task:TASK-9"));
+        assert_eq!(map.get("ANIMUS_SUBJECT_NATIVE_ID").map(String::as_str), Some("TASK-9"));
+        assert_eq!(map.get("ANIMUS_SUBJECT_KIND").map(String::as_str), Some(orchestrator_core::SUBJECT_KIND_TASK));
+        assert_eq!(map.get("ANIMUS_SUBJECT_TITLE").map(String::as_str), Some("Do it"));
+        assert_eq!(map.get("ANIMUS_SUBJECT_STATUS").map(String::as_str), Some("in-progress"));
+        assert_eq!(map.get("ANIMUS_PHASE_ID").map(String::as_str), Some(ctx.phase_id));
+        for key in [
+            "ANIMUS_WORKFLOW_REF",
+            "ANIMUS_WORKFLOW_ID",
+            "ANIMUS_PROJECT_ROOT",
+            "ANIMUS_EXECUTION_CWD",
+            "ANIMUS_DISPATCH_INPUT",
+        ] {
+            assert!(map.contains_key(key), "missing {key}");
+        }
+    }
+
+    #[tokio::test]
+    async fn run_workflow_phase_with_command_injects_animus_env_and_context_file() {
+        // The command subprocess must receive the ANIMUS_* env catalog and a
+        // readable ANIMUS_CONTEXT_FILE whose JSON carries the subject context;
+        // the temp file must be cleaned up after the phase returns.
+        let script = r#"printf 'SID=%s\nKIND=%s\nCTX=%s\n' "$ANIMUS_SUBJECT_ID" "$ANIMUS_SUBJECT_KIND" "$ANIMUS_CONTEXT_FILE"; cat "$ANIMUS_CONTEXT_FILE""#;
+        let command: orchestrator_core::PhaseCommandDefinition =
+            serde_json::from_value(serde_json::json!({ "program": "sh", "args": ["-c", script] }))
+                .expect("command def");
+        let runtime =
+            orchestrator_core::AgentRuntimeConfig { tools_allowlist: vec!["sh".to_string()], ..Default::default() };
+        let mut context = subjectless_context();
+        context.subject_id = "TRANSCRIPT-001";
+        context.subject_kind = "transcript";
+        context.subject_title = "Standup";
+
+        let result = run_workflow_phase_with_command(&context, &runtime, &command).await.expect("command runs");
+        assert_eq!(result.exit_code, 0);
+        let stdout = result.stdout;
+
+        // ANIMUS_* env promoted onto the child (kind-qualified id + kind).
+        assert!(stdout.contains("SID=transcript:TRANSCRIPT-001"), "qualified subject id in env: {stdout}");
+        assert!(stdout.contains("KIND=transcript"), "subject kind in env: {stdout}");
+
+        let ctx_path =
+            stdout.lines().find_map(|line| line.strip_prefix("CTX=")).expect("CTX= line present").to_string();
+        assert!(!ctx_path.is_empty(), "ANIMUS_CONTEXT_FILE must be set");
+
+        // The JSON blob (everything from the first `{`) parses and carries the
+        // subject identity + a stable key set (subject.data present, null with
+        // no backend available in the test env).
+        let json_start = stdout.find('{').expect("context JSON present in stdout");
+        let ctx: serde_json::Value =
+            serde_json::from_str(stdout[json_start..].trim()).expect("context file is valid JSON");
+        assert_eq!(ctx["subject"]["native_id"], "TRANSCRIPT-001");
+        assert_eq!(ctx["subject"]["kind"], "transcript");
+        assert_eq!(ctx["subject"]["id"], "transcript:TRANSCRIPT-001");
+        assert!(ctx["subject"].get("data").is_some(), "subject.data key always present");
+        assert!(ctx["workflow"]["run_id"].is_string());
+        assert!(ctx["phases"].is_array());
+
+        // Cleanup: the temp context file must not leak past the phase run.
+        assert!(!std::path::Path::new(&ctx_path).exists(), "ANIMUS_CONTEXT_FILE must be cleaned up after the phase");
     }
 }

@@ -203,6 +203,44 @@ fn yaml_verdict_target(
     }
 }
 
+/// Resolve a custom (non-built-in) phase verdict to a `PhaseVerdict`, mirroring
+/// the daemon `lifecycle_executor` gate semantics for agent phases exactly:
+///
+/// - A keyless `Unknown` (a genuinely unrecognized/empty verdict) preserves the
+///   historically tolerant Pass -> `Advance`.
+/// - A keyed verdict routed by `resolve_target` (the phase `on_verdict` map,
+///   honoring an agent-selected `requested_target` when the mapping allows it)
+///   jumps to the mapped target — represented on the single-phase wire as
+///   `Rework { target_phase }` (the only verdict carrying a target).
+/// - A keyed verdict with NO route fails with the same message shape the
+///   lifecycle executor emits.
+///
+/// `resolve_target` is injected so the routing decision is unit-testable without
+/// on-disk workflow config.
+fn route_custom_verdict<F>(
+    phase_id: &str,
+    verdict_key: Option<&str>,
+    requested_target: Option<&str>,
+    resolve_target: F,
+) -> (orchestrator_core::PhaseVerdict, i32, Option<String>)
+where
+    F: FnOnce(&str, Option<&str>) -> Option<String>,
+{
+    let key = verdict_key.map(str::trim).filter(|k| !k.is_empty());
+    match key {
+        None => (orchestrator_core::PhaseVerdict::Advance, 0, None),
+        Some(key) => match resolve_target(key, requested_target) {
+            Some(target) => (orchestrator_core::PhaseVerdict::Rework { target_phase: target }, 0, None),
+            None => {
+                let reason = format!(
+                    "phase '{phase_id}' emitted verdict '{key}' but no on_verdict route maps it to a target phase; add an on_verdict entry for '{key}' or emit a built-in verdict (advance/rework/skip/fail)"
+                );
+                (orchestrator_core::PhaseVerdict::Failed { reason: reason.clone() }, 1, Some(reason))
+            }
+        },
+    }
+}
+
 fn phase_execution_result_values(
     project_root: &str,
     workflow_ref: &str,
@@ -236,10 +274,19 @@ fn phase_execution_result_values(
                     };
                     (orchestrator_core::PhaseVerdict::Failed { reason: reason.clone() }, 1, Some(reason))
                 }
-                orchestrator_core::PhaseDecisionVerdict::Unknown => {
-                    let reason = "phase verdict unknown".to_string();
-                    (orchestrator_core::PhaseVerdict::Failed { reason: reason.clone() }, 1, Some(reason))
-                }
+                // Custom (non-built-in) verdict routing — mirrors the daemon
+                // lifecycle_executor gate semantics for agent phases exactly:
+                // route the raw `verdict_key` through this phase's `on_verdict`
+                // map (honoring an agent-selected target when the mapping allows
+                // it) to an arbitrary target phase.
+                orchestrator_core::PhaseDecisionVerdict::Unknown => route_custom_verdict(
+                    phase_id,
+                    decision.verdict_key.as_deref(),
+                    decision.target_phase.as_deref(),
+                    |key, requested_target| {
+                        yaml_verdict_target(project_root, workflow_ref, phase_id, key, requested_target)
+                    },
+                ),
             },
             None => (orchestrator_core::PhaseVerdict::Advance, 0, None),
         },
@@ -2824,6 +2871,51 @@ mod tests {
     use crate::runtime_support::{inject_cli_launch_env, WorkflowPhaseRuntimeSettings};
 
     use std::collections::BTreeMap;
+
+    // ---- TASK-293: custom verdict routing (mirrors agent-phase semantics) ----
+
+    #[test]
+    fn custom_verdict_routes_via_on_verdict_to_mapped_target() {
+        // A keyed custom verdict whose on_verdict map resolves a target jumps to
+        // it, represented as Rework { target_phase } on the single-phase wire.
+        let (verdict, exit, err) =
+            super::route_custom_verdict("triage", Some("needs-research"), None, |key, _requested| {
+                assert_eq!(key, "needs-research");
+                Some("research".to_string())
+            });
+        assert_eq!(verdict, orchestrator_core::PhaseVerdict::Rework { target_phase: "research".to_string() });
+        assert_eq!(exit, 0);
+        assert!(err.is_none());
+    }
+
+    #[test]
+    fn custom_verdict_without_route_fails_safely() {
+        // A keyed custom verdict with no on_verdict entry fails (does NOT
+        // silently advance), matching the lifecycle_executor message shape.
+        let (verdict, exit, err) = super::route_custom_verdict("triage", Some("needs-research"), None, |_, _| None);
+        match verdict {
+            orchestrator_core::PhaseVerdict::Failed { reason } => {
+                assert!(reason.contains("needs-research"));
+                assert!(reason.contains("no on_verdict route"));
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert_eq!(exit, 1);
+        assert!(err.is_some());
+    }
+
+    #[test]
+    fn custom_verdict_keyless_is_tolerant_advance() {
+        // A keyless / empty Unknown verdict preserves the historically tolerant
+        // Pass -> Advance (never consults the router).
+        for key in [None, Some(""), Some("   ")] {
+            let (verdict, exit, err) =
+                super::route_custom_verdict("triage", key, None, |_, _| panic!("router must not be consulted"));
+            assert_eq!(verdict, orchestrator_core::PhaseVerdict::Advance);
+            assert_eq!(exit, 0);
+            assert!(err.is_none());
+        }
+    }
 
     #[test]
     fn parse_result_payload_recovers_from_prose_and_multiline_json() {

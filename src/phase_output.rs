@@ -272,6 +272,40 @@ pub fn load_prior_phase_outputs(
     outputs
 }
 
+/// List every persisted prior-phase output for a run WITHOUT needing the
+/// pipeline order. Scans the run's `phase-outputs` dir, parses each
+/// `<phase>.json`, skips the current phase, and sorts by `completed_at` for a
+/// stable order. Used to build the structured command-phase context blob where
+/// the caller only has the current phase id, not the full pipeline plan.
+pub fn list_prior_phase_outputs(
+    project_root: &str,
+    workflow_id: &str,
+    current_phase_id: &str,
+) -> Vec<PersistedPhaseOutput> {
+    let dir = phase_output_dir(project_root, workflow_id);
+    if !dir.exists() {
+        return Vec::new();
+    }
+    let mut outputs = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            if let Ok(contents) = std::fs::read_to_string(&path) {
+                if let Ok(output) = serde_json::from_str::<PersistedPhaseOutput>(&contents) {
+                    if output.phase_id != current_phase_id {
+                        outputs.push(output);
+                    }
+                }
+            }
+        }
+    }
+    outputs.sort_by(|a, b| a.completed_at.cmp(&b.completed_at));
+    outputs
+}
+
 pub fn format_prior_phase_outputs(outputs: &[PersistedPhaseOutput]) -> String {
     if outputs.is_empty() {
         return String::new();

@@ -79,12 +79,19 @@ fn try_parse_decision(value: &Value, phase_id: &str) -> Option<orchestrator_core
     }
 
     let verdict_str = value.get("verdict").and_then(Value::as_str)?;
-    let verdict = match verdict_str.trim().to_ascii_lowercase().as_str() {
-        "advance" => orchestrator_core::PhaseDecisionVerdict::Advance,
-        "rework" => orchestrator_core::PhaseDecisionVerdict::Rework,
-        "fail" => orchestrator_core::PhaseDecisionVerdict::Fail,
-        "skip" => orchestrator_core::PhaseDecisionVerdict::Skip,
-        _ => return None,
+    let verdict_trimmed = verdict_str.trim();
+    // A built-in verdict maps to its enum variant with no `verdict_key`; a
+    // non-empty NON-builtin verdict is carried as `Unknown` + the raw key so
+    // the workflow executor can route it through the phase's `on_verdict` map
+    // (custom verdict routing, parity with agent phases). An empty verdict
+    // string is not a decision.
+    let (verdict, verdict_key) = match verdict_trimmed.to_ascii_lowercase().as_str() {
+        "advance" => (orchestrator_core::PhaseDecisionVerdict::Advance, None),
+        "rework" => (orchestrator_core::PhaseDecisionVerdict::Rework, None),
+        "fail" => (orchestrator_core::PhaseDecisionVerdict::Fail, None),
+        "skip" => (orchestrator_core::PhaseDecisionVerdict::Skip, None),
+        "" => return None,
+        _ => (orchestrator_core::PhaseDecisionVerdict::Unknown, Some(verdict_trimmed.to_string())),
     };
 
     let confidence = value
@@ -137,11 +144,10 @@ fn try_parse_decision(value: &Value, phase_id: &str) -> Option<orchestrator_core
         kind: "phase_decision".to_string(),
         phase_id: phase_id.to_string(),
         verdict,
-        // TODO(codex-p2): adopt v0.7 custom `on_verdict` routing — a non-built-in
-        // verdict string should parse as `PhaseDecisionVerdict::Unknown` with the
-        // raw key preserved here. `None` keeps the v0.4.20 built-in-verdict
-        // behavior (no regression); custom-key routing is a separate follow-up.
-        verdict_key: None,
+        // A non-built-in verdict is preserved verbatim on `verdict_key` so the
+        // executor can route it through the phase `on_verdict` map; built-in
+        // verdicts leave it `None`.
+        verdict_key,
         confidence,
         risk,
         reason,
@@ -220,6 +226,25 @@ mod tests {
     fn parse_phase_decision_rejects_wrong_kind() {
         let text = r#"{"kind":"something_else","verdict":"advance","reason":"test"}"#;
         assert!(parse_phase_decision_from_text(text, "implementation").is_none());
+    }
+
+    #[test]
+    fn parse_phase_decision_custom_verdict_carries_key() {
+        // A non-built-in verdict parses as Unknown and preserves the raw key
+        // verbatim (case + hyphens) for on_verdict routing.
+        let text = r#"{"kind":"phase_decision","phase_id":"triage","verdict":"needs-research","reason":"gap found"}"#;
+        let decision = parse_phase_decision_from_text(text, "triage").unwrap();
+        assert_eq!(decision.verdict, orchestrator_core::PhaseDecisionVerdict::Unknown);
+        assert_eq!(decision.verdict_key.as_deref(), Some("needs-research"));
+        assert_eq!(decision.reason, "gap found");
+    }
+
+    #[test]
+    fn parse_phase_decision_builtin_verdict_has_no_key() {
+        let text = r#"{"kind":"phase_decision","verdict":"advance"}"#;
+        let decision = parse_phase_decision_from_text(text, "gate").unwrap();
+        assert_eq!(decision.verdict, orchestrator_core::PhaseDecisionVerdict::Advance);
+        assert!(decision.verdict_key.is_none());
     }
 
     #[test]

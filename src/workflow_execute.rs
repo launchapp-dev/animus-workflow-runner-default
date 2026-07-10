@@ -1381,7 +1381,7 @@ fn response_id_matches(returned_id: &str, subject: &SubjectRef) -> bool {
 /// A discovered plugin is a subject backend when it declares the
 /// `subject_backend` kind (either as its primary `plugin_kind` or among the
 /// consolidated `plugin_kinds`).
-fn is_subject_backend(plugin: &orchestrator_plugin_host::DiscoveredPlugin) -> bool {
+pub(crate) fn is_subject_backend(plugin: &orchestrator_plugin_host::DiscoveredPlugin) -> bool {
     plugin.manifest.plugin_kind.eq_ignore_ascii_case("subject_backend")
         || plugin.manifest.plugin_kinds.iter().any(|kind| kind.eq_ignore_ascii_case("subject_backend"))
 }
