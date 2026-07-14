@@ -29,6 +29,12 @@ animus-workflow-runner-protocol = { git = "https://github.com/launchapp-dev/anim
 animus-plugin-protocol      = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.7.0-rc.6" }
 animus-actor                = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.7.0-rc.6" }
 protocol                    = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.7.0-rc.6", package = "protocol" }
+# REQUIREMENT-048 Phase B: native workflow-phase environment routing. The
+# environment wire types (EnvironmentSpec / HarnessCommand / RepoRef /
+# ExecResponse / ExecStream / EnvironmentHandle) live in this crate, pinned to
+# the SAME v0.7.0-rc.6 tag as every other protocol crate above (tag-unification
+# hazard — see the note at the top of this block).
+animus-environment-protocol = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.7.0-rc.6" }
 
 # --- ao-cli kernel crates — pinned to the current HEAD rev. The session
 # dispatch types (`SessionBackendResolver`, `PluginSessionBackend`,
@@ -48,6 +54,11 @@ orchestrator-logging       = { git = "https://github.com/launchapp-dev/animus-cl
 # builder so its own in-process projections route through the plugin instead of
 # the empty in-tree store (else finished/paused runs leave the subject stuck).
 orchestrator-daemon-runtime = { git = "https://github.com/launchapp-dev/animus-cli", rev = "b39a08a9a6eb1142247b482f7addb0078cf63c45" }
+# REQUIREMENT-048 Phase B: `inject_codex_config_overrides_list` (codex
+# reasoning-effort override on the env-exec argv) is provided by this ao-cli
+# workspace crate; pinned to the SAME kernel rev as the orchestrator-* crates
+# above so the shared runtime-contract types stay byte-identical.
+animus-runtime-shared      = { git = "https://github.com/launchapp-dev/animus-cli", rev = "b39a08a9a6eb1142247b482f7addb0078cf63c45" }
 
 # --- stdlib-ish deps (move with the crate) ----------------------------------
 anyhow = "1.0"
@@ -68,6 +79,17 @@ uuid = { version = "1", features = ["v4", "v5", "serde"] }
 [dev-dependencies]
 assert_cmd = "2.0"
 tempfile = "3.10"
+# REQUIREMENT-048 Phase B tests: the config-routing gate tests inject a
+# synthetic base WorkflowConfig via the v0.6 `config_source` test seam
+# (`config_source_client::install_yaml_config_source_base`), which is gated
+# behind orchestrator-config's `test-utils` feature. Same kernel rev as the
+# normal dep above so cargo unifies them (this only turns on the extra feature
+# in test builds).
+orchestrator-config = { git = "https://github.com/launchapp-dev/animus-cli", rev = "b39a08a9a6eb1142247b482f7addb0078cf63c45", features = ["test-utils"] }
+# The env-var gate tests use `protocol::test_utils::EnvVarGuard`, gated behind
+# the protocol crate's `test-utils` feature. Same tag as the normal `protocol`
+# dep above so cargo just turns the extra feature on in test builds.
+protocol = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.7.0-rc.6", package = "protocol", features = ["test-utils"] }
 
 # v0.5 lift: mirror the relevant relaxations from ao-cli's workspace lints
 # so the (byte-identical) lifted modules clear `clippy -- -D warnings`. As
