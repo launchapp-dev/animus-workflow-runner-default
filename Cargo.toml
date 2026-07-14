@@ -43,22 +43,22 @@ animus-environment-protocol = { git = "https://github.com/launchapp-dev/animus-p
 # `orchestrator-config`, `orchestrator-plugin-host`, and `orchestrator-logging`
 # are in-tree path deps inside the kernel workspace, so they have no standalone
 # published tag — pin them to the kernel git rev instead. ---------------------
-orchestrator-core          = { git = "https://github.com/launchapp-dev/animus-cli", rev = "b39a08a9a6eb1142247b482f7addb0078cf63c45" }
-orchestrator-config        = { git = "https://github.com/launchapp-dev/animus-cli", rev = "b39a08a9a6eb1142247b482f7addb0078cf63c45" }
-orchestrator-plugin-host   = { git = "https://github.com/launchapp-dev/animus-cli", rev = "b39a08a9a6eb1142247b482f7addb0078cf63c45" }
-orchestrator-logging       = { git = "https://github.com/launchapp-dev/animus-cli", rev = "b39a08a9a6eb1142247b482f7addb0078cf63c45" }
+orchestrator-core          = { git = "https://github.com/launchapp-dev/animus-cli", rev = "d03cd174592370b48b22c1b368fa509e10dd1ce5" }
+orchestrator-config        = { git = "https://github.com/launchapp-dev/animus-cli", rev = "d03cd174592370b48b22c1b368fa509e10dd1ce5" }
+orchestrator-plugin-host   = { git = "https://github.com/launchapp-dev/animus-cli", rev = "d03cd174592370b48b22c1b368fa509e10dd1ce5" }
+orchestrator-logging       = { git = "https://github.com/launchapp-dev/animus-cli", rev = "d03cd174592370b48b22c1b368fa509e10dd1ce5" }
 # rc.9 (#318/TASK-276): the task-status projection now writes through a
 # `TaskProjectionStore`. `resolve_task_projection_store` selects the subject
 # router when a `subject_backend` plugin owns `task`/`*` (portal) and falls back
 # to the in-tree hub store otherwise — the runner reuses the daemon's exact
 # builder so its own in-process projections route through the plugin instead of
 # the empty in-tree store (else finished/paused runs leave the subject stuck).
-orchestrator-daemon-runtime = { git = "https://github.com/launchapp-dev/animus-cli", rev = "b39a08a9a6eb1142247b482f7addb0078cf63c45" }
+orchestrator-daemon-runtime = { git = "https://github.com/launchapp-dev/animus-cli", rev = "d03cd174592370b48b22c1b368fa509e10dd1ce5" }
 # REQUIREMENT-048 Phase B: `inject_codex_config_overrides_list` (codex
 # reasoning-effort override on the env-exec argv) is provided by this ao-cli
 # workspace crate; pinned to the SAME kernel rev as the orchestrator-* crates
 # above so the shared runtime-contract types stay byte-identical.
-animus-runtime-shared      = { git = "https://github.com/launchapp-dev/animus-cli", rev = "b39a08a9a6eb1142247b482f7addb0078cf63c45" }
+animus-runtime-shared      = { git = "https://github.com/launchapp-dev/animus-cli", rev = "d03cd174592370b48b22c1b368fa509e10dd1ce5" }
 
 # --- stdlib-ish deps (move with the crate) ----------------------------------
 anyhow = "1.0"
@@ -85,7 +85,7 @@ tempfile = "3.10"
 # behind orchestrator-config's `test-utils` feature. Same kernel rev as the
 # normal dep above so cargo unifies them (this only turns on the extra feature
 # in test builds).
-orchestrator-config = { git = "https://github.com/launchapp-dev/animus-cli", rev = "b39a08a9a6eb1142247b482f7addb0078cf63c45", features = ["test-utils"] }
+orchestrator-config = { git = "https://github.com/launchapp-dev/animus-cli", rev = "d03cd174592370b48b22c1b368fa509e10dd1ce5", features = ["test-utils"] }
 # The env-var gate tests use `protocol::test_utils::EnvVarGuard`, gated behind
 # the protocol crate's `test-utils` feature. Same tag as the normal `protocol`
 # dep above so cargo just turns the extra feature on in test builds.
