@@ -15,28 +15,30 @@
 //!
 //! [`resolve_exec_environment`] decides whether a phase is env-routed:
 //!
-//! - `ANIMUS_ENVIRONMENT_EXEC` unset → consult the compiled config's
-//!   `environment_routing:` table via
-//!   [`orchestrator_config::workflow_config::resolve_environment`] (subject
-//!   kind `None`; harness = the phase's tool).
+//! - `ANIMUS_ENVIRONMENT_EXEC` unset → consult the compiled config via
+//!   [`orchestrator_config::workflow_config::resolve_environment`], honoring the
+//!   phase/workflow-level `environment:` overrides plus the phase's subject kind
+//!   and harness against the `environment_routing:` table.
 //! - `ANIMUS_ENVIRONMENT_EXEC` set to a falsy token (`0` / `false` / `no` /
 //!   `off` / empty) → hard kill-switch: local execution even when config routes.
 //! - `ANIMUS_ENVIRONMENT_EXEC` set to any other value → that value is the
 //!   environment plugin id (dev/test override).
 //!
 //! A resolution of `None`, a LOCAL environment id (`local` / `worktree`), or a
-//! routing rule that declares NO repos to materialize leaves the existing local
-//! path untouched.
+//! resolved environment that declares NO repos to materialize leaves the
+//! existing local path untouched.
 //!
 //! ## Adaptation vs. the kernel seam (the railway-plugin constraint)
 //!
 //! The kernel seam hardcodes the run's repo to `[project_root]` (a LOCAL path).
 //! A remote environment plugin (e.g. railway) REJECTS a local path — it can
-//! only clone remote urls. So here the [`EnvironmentSpec::repos`] are built from
-//! the matched routing rule's `spec.repos` (a list of `{url, git_ref?, name?,
-//! primary?}`). A rule with no repos is treated as "not routable" and falls
-//! through to local execution rather than sending a local path the plugin
-//! rejects.
+//! only clone remote urls. So here the [`EnvironmentSpec::repos`] are resolved
+//! from (in precedence order): a referenced `workspace:` (a named [`Workspace`]
+//! repo set from `phase.workspace` / `workflow.workspace`), else the matched
+//! routing rule's inline `spec.repos` — each a list of `{url, git_ref?, name?,
+//! primary?}`. An environment with no repos from either source is treated as
+//! "not routable" and falls through to local execution rather than sending a
+//! local path the plugin rejects.
 //!
 //! ## Failure posture
 //!
@@ -59,7 +61,7 @@ use animus_environment_protocol::{
 use animus_plugin_protocol::error_codes::METHOD_NOT_SUPPORTED;
 use animus_session_backend::session::{SessionEvent, SessionRequest, SessionRun};
 use anyhow::{anyhow, Result};
-use orchestrator_config::workflow_config::resolve_environment;
+use orchestrator_config::workflow_config::{resolve_environment, Workspace, WorkspaceRepo};
 use orchestrator_core::EnvironmentClient;
 use orchestrator_plugin_host::HostError;
 use serde_json::Value;
@@ -80,9 +82,10 @@ fn is_local_environment(environment_id: &str) -> bool {
     LOCAL_ENVIRONMENT_IDS.contains(&normalized.as_str())
 }
 
-/// A resolved non-local environment for a phase: the plugin id, the repos the
-/// matched routing rule declared (materialized into [`EnvironmentSpec::repos`]),
-/// plus any opaque `spec` overrides that rule carried.
+/// A resolved non-local environment for a phase: the plugin id, the repos to
+/// materialize into [`EnvironmentSpec::repos`] (from the referenced `workspace:`
+/// or the matched routing rule), plus any opaque `spec` overrides the matched
+/// rule carried.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ResolvedEnvironment {
     pub(crate) id: String,
@@ -90,12 +93,29 @@ pub(crate) struct ResolvedEnvironment {
     pub(crate) spec_overrides: Option<BTreeMap<String, Value>>,
 }
 
+/// The phase/workflow-level routing context threaded from the dispatch site into
+/// [`resolve_exec_environment`]: the phase's subject kind, the phase- and
+/// workflow-level `environment:` overrides, and the resolved `workspace:`
+/// reference (`phase.workspace` falling back to `workflow.workspace`). All
+/// `None` reproduces the pre-override behavior (routing-table-only resolution).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct PhaseRouting<'a> {
+    pub(crate) subject_kind: Option<&'a str>,
+    pub(crate) phase_env: Option<&'a str>,
+    pub(crate) workflow_env: Option<&'a str>,
+    pub(crate) workspace: Option<&'a str>,
+}
+
 /// Resolve the NON-LOCAL environment (if any) that should execute this phase's
 /// harness. Returns `None` for the default local path — see the module docs for
 /// the full gate semantics. A resolved environment with no repos to materialize
 /// also returns `None` (falls through to local) rather than sending a local
 /// path a remote plugin would reject.
-pub(crate) fn resolve_exec_environment(project_root: &Path, harness: &str) -> Option<ResolvedEnvironment> {
+pub(crate) fn resolve_exec_environment(
+    project_root: &Path,
+    harness: &str,
+    routing_ctx: PhaseRouting,
+) -> Option<ResolvedEnvironment> {
     let resolved = match std::env::var("ANIMUS_ENVIRONMENT_EXEC") {
         Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
             "" | "0" | "false" | "no" | "off" => return None,
@@ -104,36 +124,58 @@ pub(crate) fn resolve_exec_environment(project_root: &Path, harness: &str) -> Op
         Err(_) => {
             let config = orchestrator_core::load_workflow_config_or_default(project_root).config;
             let routing = config.environment_routing.as_ref();
-            // TODO(codex-p2): this seam passes subject-kind `None` and no
-            // phase/workflow `environment:` override, matching the kernel's
-            // ad-hoc `agent run` seam. Phases whose route depends on
-            // `match.kind` (task/requirement) or a phase/workflow-level
-            // `environment:` override are therefore not honored yet — threading
-            // those inputs (the phase's subject kind + `phase.environment` /
-            // `workflow.environment`) into this call is a follow-up.
-            let id = resolve_environment(None, Some(harness), None, None, routing)?;
-            // Re-find the first matching kind-None rule (an ad-hoc phase run has
-            // no subject kind in this seam, mirroring the kernel), so its
-            // repos + opaque spec overrides ride the prepared EnvironmentSpec.
-            let rule_spec = routing.and_then(|routing| {
-                routing
-                    .rules
-                    .iter()
-                    .find(|rule| {
-                        rule.match_on.kind.is_none()
-                            && rule.match_on.harness.as_deref().is_none_or(|rule_harness| rule_harness == harness)
-                    })
-                    .filter(|rule| rule.environment == id)
-                    .and_then(|rule| rule.spec.clone())
-            });
-            // TODO(codex-p2): repos are sourced only from the matched rule's
-            // `spec.repos`. The first-class `workspaces:` config (a named
-            // `Workspace` repo set referenced by `phase.workspace` /
-            // `workflow.workspace`) is not resolved here yet, so a route that
-            // relies on `workspaces:` instead of an inline `spec.repos` yields
-            // no repos and falls through to local — a follow-up should resolve
-            // the selected `Workspace` into `EnvironmentSpec.repos`.
-            let repos = rule_spec.as_ref().map(repos_from_spec).unwrap_or_default();
+            // Precedence (see `resolve_environment`): phase `environment:` >
+            // first matching routing rule > workflow `environment:` > routing
+            // default. So a WorkflowDefinition `environment:` routes every phase,
+            // and a phase-level `environment:` wins for that phase.
+            let id = resolve_environment(
+                routing_ctx.subject_kind,
+                Some(harness),
+                routing_ctx.phase_env,
+                routing_ctx.workflow_env,
+                routing,
+            )?;
+            // Re-find the routing rule that SELECTED this id so its repos +
+            // opaque `spec` overrides ride the prepared EnvironmentSpec. A
+            // phase-level `environment:` override wins BEFORE rules are consulted
+            // (see `resolve_environment`), so when `phase_env` is set the id did
+            // NOT come from a rule — attaching a coincidental same-id rule's
+            // repos/spec would contradict the documented "override + no workspace
+            // -> local" behavior. Otherwise the FIRST rule matching this phase's
+            // (kind, harness) is exactly the one `resolve_environment` returned,
+            // so its spec is the selected rule's. When no rule matches (id came
+            // from `workflow_env` / the routing default), repos come from the
+            // `workspace:` ref alone.
+            let rule_spec = if routing_ctx.phase_env.is_some() {
+                None
+            } else {
+                routing.and_then(|routing| {
+                    routing
+                        .rules
+                        .iter()
+                        .find(|rule| {
+                            rule.match_on
+                                .kind
+                                .as_deref()
+                                .is_none_or(|rule_kind| routing_ctx.subject_kind == Some(rule_kind))
+                                && rule.match_on.harness.as_deref().is_none_or(|rule_harness| rule_harness == harness)
+                        })
+                        .filter(|rule| rule.environment == id)
+                        .and_then(|rule| rule.spec.clone())
+                })
+            };
+            // Repo precedence: a referenced `workspace:` (named repo set) wins;
+            // else the matched routing rule's inline `spec.repos`.
+            let workspace_repos = routing_ctx
+                .workspace
+                .and_then(|name| config.workspaces.get(name))
+                .map(repos_from_workspace)
+                .unwrap_or_default();
+            let repos = if workspace_repos.is_empty() {
+                rule_spec.as_ref().map(repos_from_spec).unwrap_or_default()
+            } else {
+                workspace_repos
+            };
             ResolvedEnvironment { id, repos, spec_overrides: rule_spec }
         }
     };
@@ -141,6 +183,28 @@ pub(crate) fn resolve_exec_environment(project_root: &Path, harness: &str) -> Op
         return None;
     }
     Some(resolved)
+}
+
+/// Build the `repos` list from a named [`Workspace`] (repo set) referenced by
+/// `phase.workspace` / `workflow.workspace`. Entries without a non-empty `url`
+/// are skipped (a remote environment plugin can only clone from a url).
+fn repos_from_workspace(workspace: &Workspace) -> Vec<RepoRef> {
+    workspace.repos.iter().filter_map(repo_ref_from_workspace_repo).collect()
+}
+
+/// Convert a config [`WorkspaceRepo`] into the wire [`RepoRef`]. Returns `None`
+/// when the entry carries no non-empty `url`.
+fn repo_ref_from_workspace_repo(repo: &WorkspaceRepo) -> Option<RepoRef> {
+    let url = repo.url.trim();
+    if url.is_empty() {
+        return None;
+    }
+    Some(RepoRef {
+        url: url.to_string(),
+        name: repo.name.as_deref().map(str::trim).filter(|name| !name.is_empty()).map(ToOwned::to_owned),
+        git_ref: repo.git_ref.as_deref().map(str::trim).filter(|git_ref| !git_ref.is_empty()).map(ToOwned::to_owned),
+        primary: repo.primary,
+    })
 }
 
 /// Build the `repos` list from a routing rule's `spec.repos` entry: a JSON array
@@ -724,7 +788,7 @@ mod tests {
         let _lock = crate::test_env::scoped_state_serializer();
         let _gate = EnvVarGuard::set("ANIMUS_ENVIRONMENT_EXEC", None);
         let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(resolve_exec_environment(tmp.path(), "claude"), None);
+        assert_eq!(resolve_exec_environment(tmp.path(), "claude", PhaseRouting::default()), None);
     }
 
     #[test]
@@ -733,7 +797,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         for token in ["", "0", "false", "no", "off", "False", "OFF", "No"] {
             let _gate = EnvVarGuard::set("ANIMUS_ENVIRONMENT_EXEC", Some(token));
-            assert_eq!(resolve_exec_environment(tmp.path(), "claude"), None, "token {token:?} must disable");
+            assert_eq!(
+                resolve_exec_environment(tmp.path(), "claude", PhaseRouting::default()),
+                None,
+                "token {token:?} must disable"
+            );
         }
     }
 
@@ -744,10 +812,14 @@ mod tests {
         let _lock = crate::test_env::scoped_state_serializer();
         let tmp = tempfile::tempdir().unwrap();
         let _gate = EnvVarGuard::set("ANIMUS_ENVIRONMENT_EXEC", Some("container"));
-        assert_eq!(resolve_exec_environment(tmp.path(), "claude"), None, "no repos -> local");
+        assert_eq!(resolve_exec_environment(tmp.path(), "claude", PhaseRouting::default()), None, "no repos -> local");
         for local in ["local", "worktree", "Worktree", " local "] {
             let _gate = EnvVarGuard::set("ANIMUS_ENVIRONMENT_EXEC", Some(local));
-            assert_eq!(resolve_exec_environment(tmp.path(), "claude"), None, "id {local:?} is local");
+            assert_eq!(
+                resolve_exec_environment(tmp.path(), "claude", PhaseRouting::default()),
+                None,
+                "id {local:?} is local"
+            );
         }
     }
 
@@ -777,14 +849,14 @@ environment_routing:
         let _config_source_seam =
             orchestrator_config::workflow_config::config_source_client::install_yaml_config_source_base(&root);
 
-        let resolved = resolve_exec_environment(&root, "codex").expect("rule routes");
+        let resolved = resolve_exec_environment(&root, "codex", PhaseRouting::default()).expect("rule routes");
         assert_eq!(resolved.id, "sandbox-env");
         assert_eq!(resolved.repos.len(), 1);
         assert_eq!(resolved.repos[0].url, "https://github.com/acme/app.git");
         assert_eq!(resolved.repos[0].git_ref.as_deref(), Some("main"));
         assert!(resolved.repos[0].primary);
         // Non-matching harness, no default -> local path.
-        assert_eq!(resolve_exec_environment(&root, "claude"), None);
+        assert_eq!(resolve_exec_environment(&root, "claude", PhaseRouting::default()), None);
     }
 
     /// A routing rule that selects a non-local environment but declares NO repos
@@ -810,7 +882,11 @@ environment_routing:
         let _config_source_seam =
             orchestrator_config::workflow_config::config_source_client::install_yaml_config_source_base(&root);
 
-        assert_eq!(resolve_exec_environment(&root, "codex"), None, "a rule with no repos must not route");
+        assert_eq!(
+            resolve_exec_environment(&root, "codex", PhaseRouting::default()),
+            None,
+            "a rule with no repos must not route"
+        );
     }
 
     #[test]
@@ -831,7 +907,204 @@ environment_routing:
         let _config_source_seam =
             orchestrator_config::workflow_config::config_source_client::install_yaml_config_source_base(&root);
 
-        assert_eq!(resolve_exec_environment(&root, "claude"), None, "the documented `default: local` stays local");
+        assert_eq!(
+            resolve_exec_environment(&root, "claude", PhaseRouting::default()),
+            None,
+            "the documented `default: local` stays local"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Gate: phase/workflow `environment:` overrides + `workspace:` repos
+    // -----------------------------------------------------------------
+
+    /// Write a config whose only routing input is a named `workspaces:` repo set
+    /// (`app-set` with two repos, plus an empty `empty-set`). Environment routing
+    /// then rides the phase/workflow `environment:` overrides passed via
+    /// [`PhaseRouting`], NOT an `environment_routing:` rule.
+    fn write_workspace_config(root: &Path) {
+        std::fs::create_dir_all(root.join(".animus")).unwrap();
+        std::fs::write(
+            root.join(".animus").join("workflows.yaml"),
+            r#"
+workspaces:
+  app-set:
+    repos:
+      - url: https://github.com/acme/app.git
+        name: app
+        git_ref: main
+        primary: true
+      - url: https://github.com/acme/lib.git
+  empty-set:
+    repos: []
+"#,
+        )
+        .unwrap();
+    }
+
+    /// A WorkflowDefinition-level `environment:` routes every phase: with no
+    /// routing rule, the workflow env id is resolved and the referenced
+    /// `workspace:` supplies the repos.
+    #[test]
+    fn workflow_level_environment_routes_with_workspace_repos() {
+        let _lock = crate::test_env::scoped_state_serializer();
+        let _gate = EnvVarGuard::set("ANIMUS_ENVIRONMENT_EXEC", None);
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        write_workspace_config(&root);
+        let _config_source_seam =
+            orchestrator_config::workflow_config::config_source_client::install_yaml_config_source_base(&root);
+
+        let routing =
+            PhaseRouting { workflow_env: Some("railway-env-123"), workspace: Some("app-set"), ..Default::default() };
+        let resolved = resolve_exec_environment(&root, "claude", routing).expect("workflow env routes");
+        assert_eq!(resolved.id, "railway-env-123");
+        assert_eq!(resolved.repos.len(), 2, "the referenced workspace's repos populate the spec");
+        assert_eq!(resolved.repos[0].url, "https://github.com/acme/app.git");
+        assert!(resolved.repos[0].primary);
+        assert_eq!(resolved.repos[1].url, "https://github.com/acme/lib.git");
+    }
+
+    /// A phase-level `environment:` wins over the workflow-level one for that
+    /// phase (precedence: phase_env > rule > workflow_env > default).
+    #[test]
+    fn phase_level_environment_overrides_the_workflow_environment() {
+        let _lock = crate::test_env::scoped_state_serializer();
+        let _gate = EnvVarGuard::set("ANIMUS_ENVIRONMENT_EXEC", None);
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        write_workspace_config(&root);
+        let _config_source_seam =
+            orchestrator_config::workflow_config::config_source_client::install_yaml_config_source_base(&root);
+
+        let routing = PhaseRouting {
+            phase_env: Some("phase-env"),
+            workflow_env: Some("workflow-env"),
+            workspace: Some("app-set"),
+            ..Default::default()
+        };
+        let resolved = resolve_exec_environment(&root, "claude", routing).expect("phase env wins");
+        assert_eq!(resolved.id, "phase-env", "phase-level environment overrides the workflow's");
+        assert_eq!(resolved.repos.len(), 2);
+    }
+
+    /// A phase-level `environment:` override wins BEFORE routing rules are
+    /// consulted, so a coincidental same-id rule must NOT lend its repos/spec to
+    /// the override. With no `workspace:`, the override then has no repos and
+    /// falls through to local — whereas the SAME rule DOES route when it (not a
+    /// phase override) is what selected the environment.
+    #[test]
+    fn phase_override_does_not_inherit_a_coincidental_rules_repos() {
+        let _lock = crate::test_env::scoped_state_serializer();
+        let _gate = EnvVarGuard::set("ANIMUS_ENVIRONMENT_EXEC", None);
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join(".animus")).unwrap();
+        std::fs::write(
+            root.join(".animus").join("workflows.yaml"),
+            r#"
+environment_routing:
+  rules:
+    - match:
+        harness: claude
+      environment: sandbox-env
+      spec:
+        repos:
+          - url: https://github.com/acme/app.git
+            primary: true
+"#,
+        )
+        .unwrap();
+        let _config_source_seam =
+            orchestrator_config::workflow_config::config_source_client::install_yaml_config_source_base(&root);
+
+        // Phase override to the SAME id, no workspace: the rule's repos must not
+        // be borrowed -> no repos -> local execution.
+        let routing = PhaseRouting { phase_env: Some("sandbox-env"), ..Default::default() };
+        assert_eq!(
+            resolve_exec_environment(&root, "claude", routing),
+            None,
+            "a phase override must not inherit a same-id routing rule's repos"
+        );
+
+        // The very same rule DOES route when it is the selector (no phase override).
+        let resolved =
+            resolve_exec_environment(&root, "claude", PhaseRouting::default()).expect("the rule itself still routes");
+        assert_eq!(resolved.id, "sandbox-env");
+        assert_eq!(resolved.repos.len(), 1);
+    }
+
+    /// The `workspace:` repos flow all the way into the built `EnvironmentSpec`,
+    /// with no local path leaking into the repo list.
+    #[test]
+    fn workspace_repos_populate_the_environment_spec() {
+        let _lock = crate::test_env::scoped_state_serializer();
+        let _gate = EnvVarGuard::set("ANIMUS_ENVIRONMENT_EXEC", None);
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        write_workspace_config(&root);
+        let _config_source_seam =
+            orchestrator_config::workflow_config::config_source_client::install_yaml_config_source_base(&root);
+
+        let routing =
+            PhaseRouting { workflow_env: Some("railway-env"), workspace: Some("app-set"), ..Default::default() };
+        let resolved = resolve_exec_environment(&root, "claude", routing).expect("routes");
+        let spec = environment_spec_for_run(&resolved.id, resolved.repos.clone(), &sample_request("claude"));
+        assert_eq!(spec.repos.len(), 2);
+        assert_eq!(spec.repos[0].name.as_deref(), Some("app"));
+        assert_eq!(spec.repos[0].git_ref.as_deref(), Some("main"));
+        assert!(spec.repos[0].primary);
+        assert!(!spec.repos[1].primary, "primary defaults to false");
+        assert!(!spec.repos.iter().any(|repo| repo.url.starts_with('/')), "no local path leaks into repos");
+    }
+
+    /// A phase/workflow `environment:` that is non-local but has NO repos —
+    /// because the `workspace:` is missing/empty and no routing rule matches —
+    /// falls through to local rather than sending a local path a plugin rejects.
+    #[test]
+    fn non_local_environment_without_repos_falls_through_to_local() {
+        let _lock = crate::test_env::scoped_state_serializer();
+        let _gate = EnvVarGuard::set("ANIMUS_ENVIRONMENT_EXEC", None);
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        write_workspace_config(&root);
+        let _config_source_seam =
+            orchestrator_config::workflow_config::config_source_client::install_yaml_config_source_base(&root);
+
+        // No workspace ref at all -> no repos -> local.
+        assert_eq!(
+            resolve_exec_environment(
+                &root,
+                "claude",
+                PhaseRouting { workflow_env: Some("railway-env"), ..Default::default() }
+            ),
+            None,
+            "a non-local env with no workspace and no rule repos must not route"
+        );
+        // Unknown workspace name -> no repos -> local.
+        assert_eq!(
+            resolve_exec_environment(
+                &root,
+                "claude",
+                PhaseRouting {
+                    workflow_env: Some("railway-env"),
+                    workspace: Some("does-not-exist"),
+                    ..Default::default()
+                }
+            ),
+            None,
+            "an unresolvable workspace ref must not route"
+        );
+        // Defined-but-empty workspace -> no repos -> local.
+        assert_eq!(
+            resolve_exec_environment(
+                &root,
+                "claude",
+                PhaseRouting { workflow_env: Some("railway-env"), workspace: Some("empty-set"), ..Default::default() }
+            ),
+            None,
+            "an empty workspace repo set must not route"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -870,7 +1143,7 @@ environment_routing:
         let _config_source_seam =
             orchestrator_config::workflow_config::config_source_client::install_yaml_config_source_base(&root);
 
-        let resolved = resolve_exec_environment(&root, "claude").expect("rule routes");
+        let resolved = resolve_exec_environment(&root, "claude", PhaseRouting::default()).expect("rule routes");
         assert_eq!(resolved.id, "container-env");
 
         let mut spec = environment_spec_for_run(&resolved.id, resolved.repos.clone(), &sample_request("claude"));

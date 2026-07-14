@@ -697,10 +697,52 @@ fn extract_token_usage(metadata: &Value) -> Option<TokenUsage> {
     Some(TokenUsage { input, output, reasoning, cache_read, cache_write })
 }
 
+/// Extract the phase- and workflow-level `environment:` overrides plus the
+/// resolved `workspace:` reference for a phase from the compiled workflow config.
+///
+/// Returns `(phase_env, workflow_env, workspace)`, where `workspace` is the
+/// phase's `workspace:` falling back to the workflow's. The workflow is resolved
+/// from `workflow_ref` using the SAME semantics the rest of the runner applies
+/// (case-insensitive id match, then the `standard` / `default_workflow_ref`
+/// fallback the phase planner uses) so an alias/casing that still plans phases
+/// also picks up that workflow's `environment:` / `workspace:`. The phase
+/// override is read from its rich [`WorkflowPhaseEntry`] entry (`id == phase_id`).
+/// Any of the three is `None` when unset, which leaves the routing-table path
+/// unchanged.
+fn phase_environment_overrides(
+    config: &orchestrator_config::workflow_config::WorkflowConfig,
+    workflow_ref: &str,
+    phase_id: &str,
+) -> (Option<String>, Option<String>, Option<String>) {
+    use orchestrator_config::workflow_config::WorkflowPhaseEntry;
+    let Some(workflow) = config
+        .workflows
+        .iter()
+        .find(|workflow| workflow.id.eq_ignore_ascii_case(workflow_ref))
+        .or_else(|| config.workflows.iter().find(|workflow| workflow.id.eq_ignore_ascii_case("standard")))
+        .or_else(|| {
+            config.workflows.iter().find(|workflow| workflow.id.eq_ignore_ascii_case(&config.default_workflow_ref))
+        })
+    else {
+        return (None, None, None);
+    };
+    let workflow_env = workflow.environment.clone();
+    let workflow_workspace = workflow.workspace.clone();
+    let phase_config = workflow.phases.iter().find_map(|entry| match entry {
+        WorkflowPhaseEntry::Rich(phase) if phase.id == phase_id => Some(phase),
+        _ => None,
+    });
+    let phase_env = phase_config.and_then(|phase| phase.environment.clone());
+    let phase_workspace = phase_config.and_then(|phase| phase.workspace.clone());
+    (phase_env, workflow_env, phase_workspace.or(workflow_workspace))
+}
+
 pub async fn run_workflow_phase_attempt(
     project_root: &str,
     workflow_id: &str,
+    workflow_ref: &str,
     phase_id: &str,
+    subject_kind: Option<&str>,
     request: &AgentRunRequest,
     actor: Option<&Actor>,
 ) -> Result<PhaseExecutionOutcome> {
@@ -815,9 +857,25 @@ pub async fn run_workflow_phase_attempt(
     // byte-for-byte — non-env workflows are 100% unaffected. Both branches are
     // normalized to `Result<SessionRun, String>` so the dispatch-failure block
     // (checkpoint + retryable error) stays a single arm.
+    //
+    // Resolve the phase/workflow-level `environment:` + `workspace:` overrides
+    // from the compiled workflow config so a WorkflowDefinition `environment:`
+    // routes all its phases, a PhaseDefinition `environment:` wins for its phase,
+    // and the referenced `workspace:` supplies the repos. `None`/empty leaves the
+    // routing-table path unchanged.
+    let (phase_env, workflow_env, phase_workspace) =
+        phase_environment_overrides(&ctx.workflow_config.config, workflow_ref, phase_id);
+    let subject_kind = subject_kind.map(str::trim).filter(|kind| !kind.is_empty());
+    let phase_routing = crate::phase_environment::PhaseRouting {
+        subject_kind,
+        phase_env: phase_env.as_deref(),
+        workflow_env: workflow_env.as_deref(),
+        workspace: phase_workspace.as_deref(),
+    };
     let start_result: std::result::Result<SessionRun, String> = match crate::phase_environment::resolve_exec_environment(
         Path::new(project_root),
         session_request.tool.as_str(),
+        phase_routing,
     ) {
         Some(environment) => {
             info!(
@@ -1605,7 +1663,14 @@ struct PhaseAgentParams<'a> {
     project_root: &'a str,
     execution_cwd: &'a str,
     workflow_id: &'a str,
+    /// Workflow DEFINITION id (`workflow_ref`), used to look up the
+    /// WorkflowDefinition's `environment:` / `workspace:` for phase env routing.
+    /// Distinct from `workflow_id`, which is the run-scoped instance id.
+    workflow_ref: &'a str,
     subject_id: &'a str,
+    /// Bound subject kind (e.g. `task` / `requirement`), threaded into
+    /// environment routing so `match.kind` rules resolve. Empty when unknown.
+    subject_kind: &'a str,
     subject_title: &'a str,
     subject_description: &'a str,
     task_complexity: Option<orchestrator_core::Complexity>,
@@ -1770,7 +1835,9 @@ async fn run_workflow_phase_with_agent(params: PhaseAgentParams<'_>) -> Result<A
     let project_root = params.project_root;
     let execution_cwd = params.execution_cwd;
     let workflow_id = params.workflow_id;
+    let workflow_ref = params.workflow_ref;
     let subject_id = params.subject_id;
+    let subject_kind = params.subject_kind;
     let subject_title = params.subject_title;
     let subject_description = params.subject_description;
     let phase_id = params.phase_id;
@@ -2106,7 +2173,18 @@ async fn run_workflow_phase_with_agent(params: PhaseAgentParams<'_>) -> Result<A
                     "Dispatching workflow phase attempt to agent runner"
                 );
 
-                match run_workflow_phase_attempt(project_root, workflow_id, phase_id, &request, actor).await {
+                let subject_kind_arg = (!subject_kind.is_empty()).then_some(subject_kind);
+                match run_workflow_phase_attempt(
+                    project_root,
+                    workflow_id,
+                    workflow_ref,
+                    phase_id,
+                    subject_kind_arg,
+                    &request,
+                    actor,
+                )
+                .await
+                {
                     Ok(mut outcome) => {
                         if phase_requires_commit_message_with_ctx(ctx, phase_id) {
                             if let PhaseExecutionOutcome::Completed { commit_message, .. } = &mut outcome {
@@ -2522,7 +2600,9 @@ async fn run_workflow_phase_inner(params: &PhaseRunParams<'_>) -> Result<PhaseRu
                 project_root,
                 execution_cwd,
                 workflow_id,
+                workflow_ref,
                 subject_id,
+                subject_kind,
                 subject_title,
                 subject_description,
                 task_complexity,
@@ -2898,6 +2978,64 @@ mod tests {
     use crate::runtime_support::{inject_cli_launch_env, WorkflowPhaseRuntimeSettings};
 
     use std::collections::BTreeMap;
+
+    // ---- REQUIREMENT-048 Phase B: workflow/phase environment + workspace overrides ----
+
+    #[test]
+    fn phase_environment_overrides_resolves_alias_casing_and_precedence() {
+        use orchestrator_config::workflow_config::{
+            WorkflowConfig, WorkflowDefinition, WorkflowPhaseConfig, WorkflowPhaseEntry,
+        };
+        let mut config = WorkflowConfig {
+            default_workflow_ref: "standard-workflow".to_string(),
+            workflows: vec![WorkflowDefinition {
+                id: "Standard-Workflow".to_string(),
+                name: "Standard".to_string(),
+                description: String::new(),
+                phases: vec![
+                    WorkflowPhaseEntry::Simple("plan".to_string()),
+                    WorkflowPhaseEntry::Rich(WorkflowPhaseConfig {
+                        id: "implementation".to_string(),
+                        max_rework_attempts: 3,
+                        on_verdict: Default::default(),
+                        skip_if: Vec::new(),
+                        budget: None,
+                        environment: Some("phase-env".to_string()),
+                        workspace: Some("phase-ws".to_string()),
+                    }),
+                ],
+                variables: Vec::new(),
+                worktree: None,
+                budget: None,
+                environment: Some("workflow-env".to_string()),
+                workspace: Some("workflow-ws".to_string()),
+            }],
+            ..WorkflowConfig::default()
+        };
+
+        // Case-insensitive workflow-ref match; the phase-level override wins for
+        // the rich phase (phase workspace beats the workflow workspace).
+        let (phase_env, workflow_env, workspace) =
+            super::phase_environment_overrides(&config, "standard-workflow", "implementation");
+        assert_eq!(phase_env.as_deref(), Some("phase-env"));
+        assert_eq!(workflow_env.as_deref(), Some("workflow-env"));
+        assert_eq!(workspace.as_deref(), Some("phase-ws"), "phase workspace wins over the workflow's");
+
+        // A simple (non-rich) phase inherits only the workflow-level overrides.
+        let (phase_env, workflow_env, workspace) =
+            super::phase_environment_overrides(&config, "standard-workflow", "plan");
+        assert_eq!(phase_env, None);
+        assert_eq!(workflow_env.as_deref(), Some("workflow-env"));
+        assert_eq!(workspace.as_deref(), Some("workflow-ws"), "falls back to the workflow workspace");
+
+        // An unknown ref falls back to `default_workflow_ref` (mirrors the planner).
+        let (_, workflow_env, _) = super::phase_environment_overrides(&config, "totally-unknown", "plan");
+        assert_eq!(workflow_env.as_deref(), Some("workflow-env"), "unknown ref falls back to the default workflow");
+
+        // A ref with no workflow definition at all (and no default match) yields no overrides.
+        config.workflows.clear();
+        assert_eq!(super::phase_environment_overrides(&config, "whatever", "plan"), (None, None, None));
+    }
 
     // ---- TASK-293: custom verdict routing (mirrors agent-phase semantics) ----
 
@@ -3846,7 +3984,16 @@ mod tests {
             let request = make_request();
             let _guard = FaultGuard::arm(FaultOp::Pending);
 
-            let result = run_workflow_phase_attempt(&project_root, "wf-fault-pending", "impl", &request, None).await;
+            let result = run_workflow_phase_attempt(
+                &project_root,
+                "wf-fault-pending",
+                "wf-fault-pending",
+                "impl",
+                None,
+                &request,
+                None,
+            )
+            .await;
             let err = result.expect_err("pending checkpoint failure must propagate");
             let msg = format!("{err:#}");
             assert!(
