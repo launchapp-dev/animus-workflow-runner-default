@@ -21,6 +21,7 @@ pub mod metrics_hook;
 pub mod notification_log;
 pub mod payload_traversal;
 pub mod phase_command;
+pub mod phase_environment;
 pub mod phase_evals;
 pub mod phase_event_recorder;
 pub mod phase_executor;

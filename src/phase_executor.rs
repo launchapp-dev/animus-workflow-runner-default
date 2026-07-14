@@ -49,7 +49,7 @@ use protocol::{
 };
 
 use animus_actor::Actor;
-use animus_session_backend::session::{SessionEvent, SessionRequest};
+use animus_session_backend::session::{SessionEvent, SessionRequest, SessionRun};
 use orchestrator_plugin_host::session::SessionBackendResolver;
 
 #[derive(Debug, Clone, Default)]
@@ -805,10 +805,37 @@ pub async fn run_workflow_phase_attempt(
     // the backend's `SessionEvent` stream into the same `AgentRunEvent`
     // consumer (`process_phase_event_stream`) the socket path used.
     let session_request = session_request_from_agent_request(project_root, request, actor);
-    let mut session_run = match SessionBackendResolver::with_plugin_discovery(Path::new(project_root))
-        .start_session(session_request)
-        .await
-    {
+    // REQUIREMENT-048 Phase B: when this phase's harness resolves to a non-local
+    // `environment` plugin (a container / remote sandbox), prepare + exec the
+    // harness command INSIDE that environment instead of spawning it on the
+    // host. The environment path yields a `SessionRun` with the identical
+    // `SessionEvent` stream shape, so the translator + `process_phase_event_stream`
+    // consumer below are unchanged. `None` (no routing, a local id, or a rule
+    // with no repos) keeps the pre-existing local `start_session` path
+    // byte-for-byte — non-env workflows are 100% unaffected. Both branches are
+    // normalized to `Result<SessionRun, String>` so the dispatch-failure block
+    // (checkpoint + retryable error) stays a single arm.
+    let start_result: std::result::Result<SessionRun, String> = match crate::phase_environment::resolve_exec_environment(
+        Path::new(project_root),
+        session_request.tool.as_str(),
+    ) {
+        Some(environment) => {
+            info!(
+                workflow_id = %workflow_id,
+                phase_id = %phase_id,
+                run_id = %request.run_id.0,
+                environment = %environment.id,
+                "Routing workflow phase execution through environment plugin"
+            );
+            crate::phase_environment::start_environment_session(Path::new(project_root), &environment, &session_request)
+                .map_err(|err| err.to_string())
+        }
+        None => SessionBackendResolver::with_plugin_discovery(Path::new(project_root))
+            .start_session(session_request)
+            .await
+            .map_err(|err| err.to_string()),
+    };
+    let mut session_run = match start_result {
         Ok(run) => run,
         Err(err) => {
             // The provider plugin failed to start BEFORE any side-effecting
