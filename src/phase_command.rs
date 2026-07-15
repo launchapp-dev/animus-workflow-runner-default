@@ -473,6 +473,48 @@ async fn fetch_subject_record(project_root: &str, kind: &str, native_id: &str) -
     None
 }
 
+/// Best-effort fetch of the bound subject's `git_repo` custom field — the SAME
+/// value a command phase renders as `{{git_repo}}` (case-insensitive, mirroring
+/// [`build_command_template_vars`]'s lowercased custom-field keys). Used to
+/// repo-scope the per-run environment node's GitHub App installation token (see
+/// [`crate::phase_environment`]). Reuses the same bounded `subject/get` fetch the
+/// command path uses; a fetch failure / missing field degrades to `None` (a bare
+/// node, no repo scoping).
+pub(crate) async fn subject_git_repo(project_root: &str, kind: &str, subject_id: &str) -> Option<String> {
+    // The brokered per-phase entry supplies no explicit kind and a possibly
+    // kind-QUALIFIED id (`task:TASK-1`); the owned path supplies the real kind
+    // and a BARE native id. Derive `(kind, native_id)` for the `subject/get`
+    // fetch from whichever form arrived.
+    let (kind, native_id) = resolve_kind_and_native(kind, subject_id);
+    let record = tokio::time::timeout(
+        std::time::Duration::from_secs(SUBJECT_FETCH_TIMEOUT_SECS),
+        fetch_subject_record(project_root, kind, native_id),
+    )
+    .await
+    .ok()
+    .flatten();
+    subject_custom_fields(record.as_ref())
+        .into_iter()
+        .find(|(key, value)| key.eq_ignore_ascii_case("git_repo") && !value.trim().is_empty())
+        .map(|(_, value)| value)
+}
+
+/// Derive the `(kind, native_id)` pair the `subject/get` fetch needs from a
+/// caller-supplied kind (possibly empty) plus a subject id that may be BARE
+/// (`TASK-1`) or kind-QUALIFIED (`task:TASK-1`). An explicit kind wins; when it
+/// is empty the prefix of a qualified id supplies it. A bare id with no kind
+/// yields an empty kind (the fetch then degrades to `None`).
+fn resolve_kind_and_native<'a>(kind: &'a str, subject_id: &'a str) -> (&'a str, &'a str) {
+    let kind = kind.trim();
+    let id = subject_id.trim();
+    match id.split_once(':') {
+        Some((prefix, native)) if !prefix.is_empty() && !native.is_empty() => {
+            (if kind.is_empty() { prefix } else { kind }, native)
+        }
+        _ => (kind, id),
+    }
+}
+
 /// Extract the bound subject's CUSTOM fields from a raw `subject/get` record as
 /// string values, preferring the explicit `data` object then the backend
 /// `attributes` bag (the same precedence [`build_command_context_json`] uses).
