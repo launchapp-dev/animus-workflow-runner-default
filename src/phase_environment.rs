@@ -600,7 +600,20 @@ fn harness_command_for_request(
         args.push(system.to_string());
     }
     let args = plain_text_launch_args(&request.tool, args);
-    let args = apply_permission_mode(&request.tool, args, request.permission_mode.as_deref());
+    // Default claude to `bypassPermissions` for in-environment execution when no
+    // explicit mode is set — the local path injects the same default via
+    // `runtime_support::inject_claude_permission_mode`, but the env-exec path did
+    // not, so claude launched in its interactive "ask" mode where `-p` runs cannot
+    // edit files and the agent degrades to only DESCRIBING the change. An
+    // ephemeral per-run node is an isolated sandbox, so bypass is the correct
+    // default; an explicit `permission_mode` (e.g. `plan`) still wins.
+    let effective_permission_mode = request
+        .permission_mode
+        .as_deref()
+        .map(str::trim)
+        .filter(|mode| !mode.is_empty())
+        .or(if is_claude { Some("bypassPermissions") } else { None });
+    let args = apply_permission_mode(&request.tool, args, effective_permission_mode);
     let args = apply_reasoning_effort(
         &request.tool,
         args,
@@ -1702,7 +1715,16 @@ environment_routing:
         request.env_vars = vec![("SHARED".to_string(), "request".to_string())];
         let (command, _stdin) = harness_command_for_request(Path::new("."), &request).expect("contract launch builds");
         assert_eq!(command.program, "custom-claude");
-        assert_eq!(command.args, vec!["--flag".to_string(), "value".to_string()]);
+        // claude env-exec defaults to bypassPermissions (inserted after the program).
+        assert_eq!(
+            command.args,
+            vec![
+                "--flag".to_string(),
+                "--permission-mode".to_string(),
+                "bypassPermissions".to_string(),
+                "value".to_string()
+            ]
+        );
         assert_eq!(command.env.get("FROM_LAUNCH").map(String::as_str), Some("launch"));
         assert_eq!(command.env.get("SHARED").map(String::as_str), Some("request"), "request env wins on collision");
     }
@@ -1722,7 +1744,15 @@ environment_routing:
             }
         });
         let (command, _stdin) = harness_command_for_request(Path::new("."), &request).expect("contract launch builds");
-        assert_eq!(command.args, vec!["--print".to_string(), "prompt".to_string()]);
+        assert_eq!(
+            command.args,
+            vec![
+                "--print".to_string(),
+                "--permission-mode".to_string(),
+                "bypassPermissions".to_string(),
+                "prompt".to_string()
+            ]
+        );
     }
 
     #[test]
