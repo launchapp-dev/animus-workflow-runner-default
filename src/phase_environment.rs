@@ -54,7 +54,8 @@
 //! is safe because METHOD_NOT_SUPPORTED means the command never started.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -63,9 +64,12 @@ use animus_environment_protocol::{EnvironmentHandle, EnvironmentSpec, ExecRespon
 use animus_plugin_protocol::error_codes::METHOD_NOT_SUPPORTED;
 use animus_session_backend::session::{SessionEvent, SessionRequest, SessionRun};
 use anyhow::{anyhow, Context, Result};
+use interprocess::local_socket::prelude::*;
+use interprocess::local_socket::{GenericFilePath, Stream as LocalSocketStream};
 use orchestrator_config::workflow_config::resolve_environment;
 use orchestrator_core::EnvironmentClient;
 use orchestrator_plugin_host::HostError;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
@@ -189,6 +193,27 @@ pub(crate) fn resolve_workflow_environment(
         "",
         PhaseRouting { subject_kind, phase_env: None, workflow_env: workflow_env.as_deref() },
     )
+}
+
+/// What a phase needs from the per-run environment node, abstracted over WHO
+/// owns the node. Two implementations exist:
+///
+/// - [`PreparedEnvironment`] — the RUNNER owns the node (standalone CLI / the
+///   non-brokered daemon path): it prepares ONE node at the start of the run,
+///   holds it across every phase, and tears it down at the end.
+/// - [`BrokeredEnvironment`] — the DAEMON owns ONE node per workflow RUN and
+///   exposes it over a private local socket; the runner only ACQUIREs a handle
+///   and EXECs through it (no prepare, no teardown — see REQUIREMENT-048).
+///
+/// Both yield a [`SessionRun`] whose event stream mirrors the local provider
+/// path, so `phase_executor`'s `process_phase_event_stream` consumer is
+/// identical for either owner.
+pub trait HeldEnvironment: Send + Sync {
+    /// The resolved environment plugin id (for logging / diagnostics).
+    fn id(&self) -> &str;
+    /// Execute a phase's harness command INSIDE the held node, returning a
+    /// [`SessionRun`] whose event stream mirrors the local provider path.
+    fn exec_session(&self, project_root: &Path, request: &SessionRequest) -> Result<SessionRun>;
 }
 
 /// A prepared, per-workflow-run environment: ONE resident host + ONE plugin
@@ -351,6 +376,17 @@ impl Drop for PreparedEnvironment {
         if let Some(runtime) = self.runtime.take() {
             runtime.shutdown_background();
         }
+    }
+}
+
+impl HeldEnvironment for PreparedEnvironment {
+    fn id(&self) -> &str {
+        // Inherent `id` wins method resolution, so this delegates (no recursion).
+        PreparedEnvironment::id(self)
+    }
+
+    fn exec_session(&self, project_root: &Path, request: &SessionRequest) -> Result<SessionRun> {
+        PreparedEnvironment::exec_session(self, project_root, request)
     }
 }
 
@@ -799,6 +835,376 @@ fn is_method_not_supported(err: &anyhow::Error) -> bool {
             Some(HostError::Rpc(rpc)) if rpc.code == METHOD_NOT_SUPPORTED
         )
     })
+}
+
+// ---------------------------------------------------------------------------
+// REQUIREMENT-048 cross-phase broker (runner client)
+// ---------------------------------------------------------------------------
+//
+// The daemon dispatches ONE runner subprocess per phase, so a runner-owned
+// `PreparedEnvironment` cannot share a workspace between phases. The daemon
+// broker owns ONE node per workflow RUN and exposes it over a private local
+// socket. When all four broker env vars are set the runner ACQUIREs a handle to
+// that node and EXECs each phase through it — no prepare, no teardown (the
+// daemon owns the node lifecycle). This is a PRIVATE daemon<->runner IPC (NOT
+// animus-protocol); the frame structs below are defined independently here per
+// the wire contract.
+
+/// Local socket path the runner dials to reach the daemon's per-run broker.
+pub(crate) const BROKER_SOCKET_ENV: &str = "ANIMUS_ENVIRONMENT_BROKER_SOCKET";
+/// Per-daemon bearer capability echoed on every broker frame.
+pub(crate) const BROKER_TOKEN_ENV: &str = "ANIMUS_ENVIRONMENT_BROKER_TOKEN";
+/// The workflow run id this dispatch belongs to (the broker's single-flight key).
+pub(crate) const BROKER_RUN_ID_ENV: &str = "ANIMUS_ENVIRONMENT_BROKER_RUN_ID";
+/// The resolved environment plugin id (e.g. `animus-environment-railway`).
+pub(crate) const BROKER_ENVIRONMENT_ID_ENV: &str = "ANIMUS_ENVIRONMENT_BROKER_ENVIRONMENT_ID";
+
+/// The four broker connection parameters, read together from the environment.
+/// `None` from [`broker_env`] means "not brokered" — the runner keeps its owned
+/// [`PreparedEnvironment`] path (standalone CLI / non-daemon).
+#[derive(Debug, Clone)]
+struct BrokerEnv {
+    socket_path: PathBuf,
+    token: String,
+    run_id: String,
+    environment_id: String,
+}
+
+/// Read the four broker env vars. Returns `None` unless ALL are present and
+/// non-empty (partial presence is treated as absent — the owned path).
+fn broker_env() -> Option<BrokerEnv> {
+    let read =
+        |key: &str| std::env::var(key).ok().map(|value| value.trim().to_string()).filter(|value| !value.is_empty());
+    Some(BrokerEnv {
+        socket_path: PathBuf::from(read(BROKER_SOCKET_ENV)?),
+        token: read(BROKER_TOKEN_ENV)?,
+        run_id: read(BROKER_RUN_ID_ENV)?,
+        environment_id: read(BROKER_ENVIRONMENT_ID_ENV)?,
+    })
+}
+
+/// Acquire frame (runner -> daemon): one request, one terminal response.
+#[derive(Serialize)]
+struct AcquireRequest<'a> {
+    op: &'a str,
+    token: &'a str,
+    run_id: &'a str,
+    environment_id: &'a str,
+    spec: EnvironmentSpec,
+}
+
+#[derive(Deserialize)]
+struct AcquireResponse {
+    ok: bool,
+    #[serde(default)]
+    workspace_root: Option<String>,
+    #[serde(default)]
+    handle_id: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+/// Exec frame (runner -> daemon): one request, then a stream of `{"out",...}`
+/// lines terminated by exactly one `{"done":ExecResponse}` or `{"error"}`.
+#[derive(Serialize)]
+struct ExecRequest<'a> {
+    op: &'a str,
+    token: &'a str,
+    run_id: &'a str,
+    handle_id: &'a str,
+    command: HarnessCommand,
+    stdin: Option<String>,
+    timeout_secs: Option<u64>,
+}
+
+/// The connection coordinates the exec pipeline dials with — cloned per phase so
+/// each exec opens its own short-lived connection (one connection per RPC).
+#[derive(Clone)]
+struct BrokerExecTarget {
+    socket_path: PathBuf,
+    token: String,
+    run_id: String,
+    handle_id: String,
+}
+
+/// A per-workflow-run environment node OWNED BY THE DAEMON, reached over the
+/// broker socket. Constructed by [`BrokeredEnvironment::acquire_from_env`],
+/// which dials the socket and sends the `acquire` frame to obtain the shared
+/// `workspace_root` + `handle_id`. It NEVER prepares or tears down a node.
+#[derive(Debug)]
+pub struct BrokeredEnvironment {
+    socket_path: PathBuf,
+    token: String,
+    run_id: String,
+    environment_id: String,
+    #[allow(dead_code)]
+    workspace_root: String,
+    handle_id: String,
+    backend_label: String,
+}
+
+impl BrokeredEnvironment {
+    /// If the four broker env vars are present, dial the broker and ACQUIRE the
+    /// run's shared node (single-flighted by the daemon on `run_id`). Returns:
+    /// - `None` — not brokered (env vars absent): the caller keeps the owned path.
+    /// - `Some(Ok(env))` — a brokered handle to the shared node.
+    /// - `Some(Err(_))` — brokered mode was expected but acquire failed: the
+    ///   caller MUST fail the phase (never fall back to an owned prepare).
+    ///
+    /// The blocking socket dial runs on a blocking thread so it never stalls the
+    /// async runtime's worker.
+    pub(crate) async fn acquire_from_env() -> Option<Result<Self>> {
+        let env = broker_env()?;
+        let joined = tokio::task::spawn_blocking(move || Self::acquire(env)).await;
+        Some(joined.map_err(|err| anyhow!("environment broker acquire task panicked: {err}")).and_then(|res| res))
+    }
+
+    /// Dial the broker socket and perform the `acquire` handshake.
+    fn acquire(env: BrokerEnv) -> Result<Self> {
+        // Bare spec (no repos), carrying `metadata.animus_run_id` so the plugin
+        // names the node deterministically per run.
+        let spec = EnvironmentSpec {
+            kind: env.environment_id.clone(),
+            repos: Vec::new(),
+            image: None,
+            resources: None,
+            env: BTreeMap::new(),
+            metadata: serde_json::json!({ "animus_run_id": env.run_id }),
+        };
+        let request = AcquireRequest {
+            op: "acquire",
+            token: &env.token,
+            run_id: &env.run_id,
+            environment_id: &env.environment_id,
+            spec,
+        };
+        let line = serde_json::to_string(&request).context("serializing environment broker acquire frame")?;
+
+        let mut stream = dial(&env.socket_path)
+            .with_context(|| format!("dialing environment broker socket at {}", env.socket_path.display()))?;
+        write_frame(&mut stream, &line).context("sending environment broker acquire frame")?;
+
+        let mut reader = BufReader::new(stream);
+        let mut response_line = String::new();
+        if reader.read_line(&mut response_line).context("reading environment broker acquire response")? == 0 {
+            return Err(anyhow!(
+                "environment broker at {} closed the connection before answering acquire",
+                env.socket_path.display()
+            ));
+        }
+        let response: AcquireResponse = serde_json::from_str(response_line.trim())
+            .with_context(|| format!("parsing environment broker acquire response: {}", response_line.trim()))?;
+        if !response.ok {
+            return Err(anyhow!(
+                "environment broker refused to acquire run '{}' for environment '{}': {}",
+                env.run_id,
+                env.environment_id,
+                response.error.unwrap_or_else(|| "no reason given".to_string())
+            ));
+        }
+        let workspace_root = response
+            .workspace_root
+            .ok_or_else(|| anyhow!("environment broker acquire succeeded but returned no workspace_root"))?;
+        let handle_id = response
+            .handle_id
+            .ok_or_else(|| anyhow!("environment broker acquire succeeded but returned no handle_id"))?;
+
+        let backend_label = format!("environment-broker:{}", env.environment_id);
+        Ok(Self {
+            socket_path: env.socket_path,
+            token: env.token,
+            run_id: env.run_id,
+            environment_id: env.environment_id,
+            workspace_root,
+            handle_id,
+            backend_label,
+        })
+    }
+}
+
+impl HeldEnvironment for BrokeredEnvironment {
+    fn id(&self) -> &str {
+        &self.environment_id
+    }
+
+    fn exec_session(&self, project_root: &Path, request: &SessionRequest) -> Result<SessionRun> {
+        let (command, stdin) = harness_command_for_request(project_root, request)?;
+        // Mirror the owned path's default run cap so an un-timed brokered exec is
+        // not unbounded.
+        let timeout_secs = request.timeout_secs.unwrap_or(DEFAULT_ENVIRONMENT_RUN_TIMEOUT_SECS);
+        Ok(spawn_brokered_exec(
+            BrokerExecTarget {
+                socket_path: self.socket_path.clone(),
+                token: self.token.clone(),
+                run_id: self.run_id.clone(),
+                handle_id: self.handle_id.clone(),
+            },
+            command,
+            stdin,
+            timeout_secs,
+            self.backend_label.clone(),
+        ))
+    }
+}
+
+/// Dial a local socket at `socket_path` (newline-JSON transport). Same
+/// `interprocess` local-socket idiom as the reattach back-channel.
+fn dial(socket_path: &Path) -> std::io::Result<LocalSocketStream> {
+    let name = socket_path.to_fs_name::<GenericFilePath>()?;
+    LocalSocketStream::connect(name)
+}
+
+/// Write one newline-delimited JSON frame and flush.
+fn write_frame<W: Write>(writer: &mut W, line: &str) -> std::io::Result<()> {
+    writer.write_all(line.as_bytes())?;
+    writer.write_all(b"\n")?;
+    writer.flush()
+}
+
+/// stdout/stderr discriminator on the broker's `{"out",...}` frame — a local
+/// mirror of [`ExecStream`] so the wire parse does not depend on that type's
+/// serde representation.
+#[derive(Clone, Copy)]
+enum BrokerStream {
+    Stdout,
+    Stderr,
+}
+
+/// Spawn the per-phase brokered exec pipeline: it opens one connection to the
+/// broker, sends the `exec` frame, and streams the `{"out",...}` output frames
+/// into a [`SessionRun`] whose event grammar MIRRORS
+/// [`spawn_environment_exec`], so the caller's consumer is unchanged. Must be
+/// called from within a tokio runtime (the forwarder task bridges the pipeline's
+/// unbounded sends onto the bounded `SessionRun` channel).
+fn spawn_brokered_exec(
+    target: BrokerExecTarget,
+    command: HarnessCommand,
+    stdin: Option<String>,
+    timeout_secs: u64,
+    backend_label: String,
+) -> SessionRun {
+    let (events_tx, events_rx) = mpsc::channel::<SessionEvent>(256);
+    // The pipeline thread sends through an unbounded channel; the async forwarder
+    // applies the bounded `SessionRun` channel's backpressure. Mirrors
+    // `spawn_environment_exec`.
+    let (pipeline_tx, mut pipeline_rx) = mpsc::unbounded_channel::<SessionEvent>();
+    tokio::spawn(async move {
+        while let Some(event) = pipeline_rx.recv().await {
+            if events_tx.send(event).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let selected_backend = backend_label.clone();
+    std::thread::spawn(move || {
+        run_brokered_exec_pipeline(&target, command, stdin, timeout_secs, &backend_label, &pipeline_tx);
+    });
+
+    SessionRun { session_id: None, events: events_rx, selected_backend, fallback_reason: None, pid: None }
+}
+
+/// The blocking brokered exec pipeline. Emits the same event grammar the owned
+/// path does: `Started`, stdout deltas as `TextDelta`, stderr deltas as
+/// recoverable `Error` frames, then a terminal `Finished` (or an unrecoverable
+/// `Error`). There is NO METHOD_NOT_SUPPORTED fallback — brokered exec is the
+/// daemon's job and has no buffered-exec twin on this socket.
+fn run_brokered_exec_pipeline(
+    target: &BrokerExecTarget,
+    command: HarnessCommand,
+    stdin: Option<String>,
+    timeout_secs: u64,
+    backend_label: &str,
+    events: &mpsc::UnboundedSender<SessionEvent>,
+) {
+    let send = |event: SessionEvent| {
+        let _ = events.send(event);
+    };
+    send(SessionEvent::Started { backend: backend_label.to_string(), session_id: None, pid: None });
+
+    let stream_events = events.clone();
+    let on_output = move |stream: BrokerStream, text: &str| {
+        let event = match stream {
+            BrokerStream::Stdout => SessionEvent::TextDelta { text: text.to_string() },
+            BrokerStream::Stderr => SessionEvent::Error { message: text.to_string(), recoverable: true },
+        };
+        let _ = stream_events.send(event);
+    };
+
+    match brokered_exec_stream(target, command, stdin, timeout_secs, &on_output) {
+        Ok(response) if response.timed_out => send(SessionEvent::Error {
+            message: format!("environment exec timed out in {backend_label} after {timeout_secs}s"),
+            recoverable: false,
+        }),
+        // A finished command with NO exit code was signal-killed / OOM-killed;
+        // surface it as a terminal error (downstream treats `None` as success).
+        Ok(ExecResponse { exit_code: None, .. }) => send(SessionEvent::Error {
+            message: format!(
+                "environment exec in {backend_label} ended without an exit code (terminated by a signal?)"
+            ),
+            recoverable: false,
+        }),
+        Ok(response) => send(SessionEvent::Finished { exit_code: response.exit_code }),
+        Err(err) => send(SessionEvent::Error {
+            message: format!("environment exec failed in {backend_label}: {err:#}"),
+            recoverable: false,
+        }),
+    }
+}
+
+/// Open a connection, send the `exec` frame, and drive the response stream,
+/// forwarding `{"out",...}` frames through `on_output` and returning the
+/// terminal [`ExecResponse`] (`{"done"}`) or an error (`{"error"}` / a dropped
+/// connection before a terminal frame).
+fn brokered_exec_stream(
+    target: &BrokerExecTarget,
+    command: HarnessCommand,
+    stdin: Option<String>,
+    timeout_secs: u64,
+    on_output: &(dyn Fn(BrokerStream, &str) + Send + Sync),
+) -> Result<ExecResponse> {
+    let request = ExecRequest {
+        op: "exec",
+        token: &target.token,
+        run_id: &target.run_id,
+        handle_id: &target.handle_id,
+        command,
+        stdin,
+        timeout_secs: Some(timeout_secs),
+    };
+    let line = serde_json::to_string(&request).context("serializing environment broker exec frame")?;
+
+    let mut stream = dial(&target.socket_path)
+        .with_context(|| format!("dialing environment broker socket at {}", target.socket_path.display()))?;
+    write_frame(&mut stream, &line).context("sending environment broker exec frame")?;
+
+    let mut reader = BufReader::new(stream);
+    let mut buf = String::new();
+    loop {
+        buf.clear();
+        if reader.read_line(&mut buf).context("reading environment broker exec frame")? == 0 {
+            return Err(anyhow!("environment broker closed the connection before a terminal exec frame"));
+        }
+        let trimmed = buf.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let frame: Value = serde_json::from_str(trimmed)
+            .with_context(|| format!("parsing environment broker exec frame: {trimmed}"))?;
+        if let Some(out) = frame.get("out").and_then(Value::as_str) {
+            let text = frame.get("text").and_then(Value::as_str).unwrap_or_default();
+            match out {
+                "stdout" => on_output(BrokerStream::Stdout, text),
+                "stderr" => on_output(BrokerStream::Stderr, text),
+                other => return Err(anyhow!("environment broker sent an unknown output stream '{other}'")),
+            }
+        } else if let Some(done) = frame.get("done") {
+            return serde_json::from_value(done.clone()).context("parsing environment broker exec ExecResponse");
+        } else if let Some(error) = frame.get("error") {
+            return Err(anyhow!("environment broker exec error: {}", error.as_str().unwrap_or("unknown error")));
+        }
+        // Unknown frame shape: ignore forward-compatibly and keep reading.
+    }
 }
 
 #[cfg(test)]
@@ -1608,6 +2014,219 @@ environment_routing:
                 Some(SessionEvent::Error { message, recoverable: false }) if message.contains("timed out")
             ),
             "timeout is terminal: {events:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Broker client framing (fake in-process socket server)
+    // -----------------------------------------------------------------
+
+    use interprocess::local_socket::{GenericFilePath as TestGenericFilePath, ListenerOptions};
+
+    fn socket_path() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broker.sock");
+        (dir, path)
+    }
+
+    /// Bind a fake broker socket and, on the FIRST connection, read one request
+    /// line and hand it (plus the writable stream) to `handler`. The listener is
+    /// bound before this returns, so a client can connect immediately with no race.
+    fn serve_once(
+        path: PathBuf,
+        handler: impl FnOnce(String, &mut dyn Write) + Send + 'static,
+    ) -> std::thread::JoinHandle<()> {
+        let name = path.to_fs_name::<TestGenericFilePath>().unwrap();
+        let listener = ListenerOptions::new().name(name).create_sync().unwrap();
+        std::thread::spawn(move || {
+            let conn = listener.accept().unwrap();
+            let mut reader = BufReader::new(conn);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let mut conn = reader.into_inner();
+            handler(line, &mut conn);
+        })
+    }
+
+    #[test]
+    fn broker_env_requires_all_four_vars() {
+        let _lock = crate::test_env::scoped_state_serializer();
+        let _s = EnvVarGuard::set(BROKER_SOCKET_ENV, Some("/tmp/broker.sock"));
+        let _t = EnvVarGuard::set(BROKER_TOKEN_ENV, Some("tok"));
+        let _r = EnvVarGuard::set(BROKER_RUN_ID_ENV, Some("run-1"));
+        {
+            // Missing environment_id -> not brokered.
+            let _e = EnvVarGuard::set(BROKER_ENVIRONMENT_ID_ENV, None);
+            assert!(broker_env().is_none(), "partial broker env is treated as absent");
+        }
+        let _e = EnvVarGuard::set(BROKER_ENVIRONMENT_ID_ENV, Some("railway"));
+        let env = broker_env().expect("all four present");
+        assert_eq!(env.token, "tok");
+        assert_eq!(env.run_id, "run-1");
+        assert_eq!(env.environment_id, "railway");
+        assert_eq!(env.socket_path, PathBuf::from("/tmp/broker.sock"));
+    }
+
+    #[test]
+    fn brokered_acquire_sends_bare_spec_and_parses_workspace_and_handle() {
+        let (_dir, path) = socket_path();
+        let server = serve_once(path.clone(), |req_line, out| {
+            let v: Value = serde_json::from_str(req_line.trim()).unwrap();
+            assert_eq!(v["op"], "acquire");
+            assert_eq!(v["token"], "tok");
+            assert_eq!(v["run_id"], "run-1");
+            assert_eq!(v["environment_id"], "railway");
+            // Bare spec: empty repos are skipped on the wire; run id is stamped
+            // on metadata for deterministic per-run node naming.
+            assert!(v["spec"].get("repos").is_none(), "bare node carries no repos: {v}");
+            assert_eq!(v["spec"]["metadata"]["animus_run_id"], "run-1");
+            writeln!(out, r#"{{"ok":true,"workspace_root":"/workspace","handle_id":"h-1"}}"#).unwrap();
+            out.flush().unwrap();
+        });
+        let env = BrokerEnv {
+            socket_path: path,
+            token: "tok".to_string(),
+            run_id: "run-1".to_string(),
+            environment_id: "railway".to_string(),
+        };
+        let brokered = BrokeredEnvironment::acquire(env).expect("acquire succeeds");
+        assert_eq!(brokered.id(), "railway");
+        assert_eq!(brokered.handle_id, "h-1");
+        assert_eq!(brokered.workspace_root, "/workspace");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn brokered_acquire_failure_is_an_error() {
+        let (_dir, path) = socket_path();
+        let server = serve_once(path.clone(), |_req, out| {
+            writeln!(out, r#"{{"ok":false,"error":"no capacity"}}"#).unwrap();
+            out.flush().unwrap();
+        });
+        let env = BrokerEnv {
+            socket_path: path,
+            token: "tok".to_string(),
+            run_id: "run-1".to_string(),
+            environment_id: "railway".to_string(),
+        };
+        let err = BrokeredEnvironment::acquire(env).expect_err("ok:false must fail");
+        assert!(format!("{err:#}").contains("no capacity"), "error surfaces the broker reason: {err:#}");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn brokered_exec_streams_out_frames_then_terminal_done() {
+        let (_dir, path) = socket_path();
+        let server = serve_once(path.clone(), |req_line, out| {
+            let v: Value = serde_json::from_str(req_line.trim()).unwrap();
+            assert_eq!(v["op"], "exec");
+            assert_eq!(v["handle_id"], "h-1");
+            assert_eq!(v["command"]["program"], "claude");
+            writeln!(out, r#"{{"out":"stdout","text":"hello "}}"#).unwrap();
+            writeln!(out, r#"{{"out":"stderr","text":"warn"}}"#).unwrap();
+            writeln!(out, r#"{{"out":"stdout","text":"world"}}"#).unwrap();
+            writeln!(out, r#"{{"done":{{"exit_code":0,"stdout":"","stderr":"","timed_out":false}}}}"#).unwrap();
+            out.flush().unwrap();
+        });
+        let target = BrokerExecTarget {
+            socket_path: path,
+            token: "tok".to_string(),
+            run_id: "run-1".to_string(),
+            handle_id: "h-1".to_string(),
+        };
+        let collected = Mutex::new(Vec::<(String, String)>::new());
+        let response = brokered_exec_stream(&target, command_for_test(), None, 60, &|stream, text| {
+            let kind = match stream {
+                BrokerStream::Stdout => "out",
+                BrokerStream::Stderr => "err",
+            };
+            collected.lock().unwrap().push((kind.to_string(), text.to_string()));
+        })
+        .expect("exec succeeds");
+        assert_eq!(response.exit_code, Some(0));
+        assert_eq!(
+            collected.into_inner().unwrap(),
+            vec![
+                ("out".to_string(), "hello ".to_string()),
+                ("err".to_string(), "warn".to_string()),
+                ("out".to_string(), "world".to_string()),
+            ]
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn brokered_exec_error_frame_is_a_terminal_error() {
+        let (_dir, path) = socket_path();
+        let server = serve_once(path.clone(), |_req, out| {
+            writeln!(out, r#"{{"error":"boom inside the node"}}"#).unwrap();
+            out.flush().unwrap();
+        });
+        let target = BrokerExecTarget {
+            socket_path: path,
+            token: "tok".to_string(),
+            run_id: "run-1".to_string(),
+            handle_id: "h-1".to_string(),
+        };
+        let err =
+            brokered_exec_stream(&target, command_for_test(), None, 60, &|_, _| {}).expect_err("error frame fails");
+        assert!(format!("{err:#}").contains("boom inside the node"), "error surfaces the broker message: {err:#}");
+        server.join().unwrap();
+    }
+
+    /// The full brokered pipeline yields a `SessionRun` whose event grammar
+    /// MIRRORS the owned path: `Started`, stdout `TextDelta`, terminal `Finished`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn brokered_exec_session_mirrors_the_session_event_grammar() {
+        let (_dir, path) = socket_path();
+        let server = serve_once(path.clone(), |_req, out| {
+            writeln!(out, r#"{{"out":"stdout","text":"delta"}}"#).unwrap();
+            writeln!(out, r#"{{"done":{{"exit_code":3,"stdout":"","stderr":"","timed_out":false}}}}"#).unwrap();
+            out.flush().unwrap();
+        });
+        let target = BrokerExecTarget {
+            socket_path: path,
+            token: "tok".to_string(),
+            run_id: "run-1".to_string(),
+            handle_id: "h-1".to_string(),
+        };
+        let run = spawn_brokered_exec(target, command_for_test(), None, 60, "environment-broker:railway".to_string());
+        assert_eq!(run.selected_backend, "environment-broker:railway");
+        let events = drain(run).await;
+        assert!(
+            matches!(&events[0], SessionEvent::Started { backend, .. } if backend == "environment-broker:railway"),
+            "first frame is Started: {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(e, SessionEvent::TextDelta { text } if text == "delta")),
+            "stdout rides TextDelta (same channel as the owned path): {events:?}"
+        );
+        assert!(
+            matches!(events.last(), Some(SessionEvent::Finished { exit_code: Some(3) })),
+            "terminal frame carries the exec exit code: {events:?}"
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn brokered_exec_session_fails_closed_when_the_socket_is_unreachable() {
+        // No server bound at this path: a dial failure must surface as a terminal
+        // error (fail closed), never a silent fallback.
+        let (_dir, path) = socket_path();
+        let target = BrokerExecTarget {
+            socket_path: path,
+            token: "tok".to_string(),
+            run_id: "run-1".to_string(),
+            handle_id: "h-1".to_string(),
+        };
+        let run = spawn_brokered_exec(target, command_for_test(), None, 60, "environment-broker:railway".to_string());
+        let events = drain(run).await;
+        assert!(
+            matches!(
+                events.last(),
+                Some(SessionEvent::Error { message, recoverable: false }) if message.contains("exec failed")
+            ),
+            "an unreachable broker fails the phase: {events:?}"
         );
     }
 }

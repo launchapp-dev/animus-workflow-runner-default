@@ -748,7 +748,7 @@ pub async fn run_workflow_phase_attempt(
     subject_kind: Option<&str>,
     request: &AgentRunRequest,
     actor: Option<&Actor>,
-    held_environment: Option<&crate::phase_environment::PreparedEnvironment>,
+    held_environment: Option<&dyn crate::phase_environment::HeldEnvironment>,
 ) -> Result<PhaseExecutionOutcome> {
     // REQUIREMENT-048: environment routing is resolved ONCE per workflow run and
     // the prepared node is threaded in as `held_environment`. `workflow_ref` /
@@ -1677,10 +1677,11 @@ struct PhaseAgentParams<'a> {
     /// Transport-asserted caller identity relayed verbatim into the phase's
     /// `SessionRequest`. `None` for system-initiated runs.
     actor: Option<&'a Actor>,
-    /// The per-workflow-run environment node (REQUIREMENT-048), prepared once in
-    /// `workflow_execute` and shared across every phase. `None` for local
-    /// workflows (the phase spawns its harness on the host).
-    held_environment: Option<&'a crate::phase_environment::PreparedEnvironment>,
+    /// The per-workflow-run environment node (REQUIREMENT-048), shared across
+    /// every phase — either runner-owned (`PreparedEnvironment`) or daemon-owned
+    /// over the broker (`BrokeredEnvironment`). `None` for local workflows (the
+    /// phase spawns its harness on the host).
+    held_environment: Option<&'a dyn crate::phase_environment::HeldEnvironment>,
 }
 
 struct AgentPhaseRunOutcome {
@@ -2444,12 +2445,13 @@ pub struct PhaseRunParams<'a> {
     /// the stdio command / endpoint / transport per call. When `None`,
     /// callers fall back to `McpRuntimeConfig::default()`.
     pub mcp_config: Option<&'a protocol::McpRuntimeConfig>,
-    /// The per-workflow-run environment node (REQUIREMENT-048), prepared once by
-    /// `workflow_execute` and shared across every phase of the run. `None` for a
-    /// local workflow (each phase spawns its harness on the host). Threaded
-    /// through to [`run_workflow_phase_attempt`], where an agent phase execs
-    /// inside it instead of starting a local session.
-    pub held_environment: Option<&'a crate::phase_environment::PreparedEnvironment>,
+    /// The per-workflow-run environment node (REQUIREMENT-048), shared across
+    /// every phase of the run — either runner-owned (`PreparedEnvironment`) or
+    /// daemon-owned over the broker (`BrokeredEnvironment`). `None` for a local
+    /// workflow (each phase spawns its harness on the host). Threaded through to
+    /// [`run_workflow_phase_attempt`], where an agent phase execs inside it
+    /// instead of starting a local session.
+    pub held_environment: Option<&'a dyn crate::phase_environment::HeldEnvironment>,
 }
 
 pub async fn run_workflow_phase(params: &PhaseRunParams<'_>) -> Result<PhaseRunResult> {
