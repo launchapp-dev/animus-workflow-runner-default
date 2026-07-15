@@ -62,7 +62,7 @@ use std::time::Duration;
 use animus_environment_protocol::{EnvironmentHandle, EnvironmentSpec, ExecResponse, ExecStream, HarnessCommand};
 use animus_plugin_protocol::error_codes::METHOD_NOT_SUPPORTED;
 use animus_session_backend::session::{SessionEvent, SessionRequest, SessionRun};
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use orchestrator_config::workflow_config::resolve_environment;
 use orchestrator_core::EnvironmentClient;
 use orchestrator_plugin_host::HostError;
@@ -201,6 +201,16 @@ pub struct PreparedEnvironment {
     id: String,
     backend_label: String,
     torn_down: AtomicBool,
+    /// A DEDICATED tokio runtime that owns the resident host's stdio I/O driver
+    /// for the whole environment lifetime. The lease's driver is spawned (via
+    /// `tokio::spawn`) onto whatever runtime is current when the host is first
+    /// leased; if that were a per-call throwaway runtime it would be dropped the
+    /// instant `prepare` returned, killing the driver and orphaning the node so
+    /// the next `exec` fails with "plugin connection lost". Holding this runtime
+    /// for the struct's lifetime keeps the driver alive across prepare → exec →
+    /// teardown. `None` only for test-injected backends (no real host). Shut down
+    /// via `shutdown_background()` in `Drop` (safe from any context).
+    runtime: Option<tokio::runtime::Runtime>,
 }
 
 impl PreparedEnvironment {
@@ -241,19 +251,45 @@ impl PreparedEnvironment {
         }
         let handle =
             backend.prepare(spec).map_err(|err| anyhow!("environment prepare failed for {backend_label}: {err:#}"))?;
-        Ok(Self { backend, handle, id: environment.id.clone(), backend_label, torn_down: AtomicBool::new(false) })
+        Ok(Self {
+            backend,
+            handle,
+            id: environment.id.clone(),
+            backend_label,
+            torn_down: AtomicBool::new(false),
+            runtime: None,
+        })
     }
 
-    /// Prepare the node on a dedicated OS thread so the blocking
-    /// [`EnvironmentClient`] runs OFF the async runtime (its internal
-    /// `run_blocking` builds its own runtime when no handle is current), then
-    /// bridge the result back without stalling the caller's runtime worker.
+    /// Prepare the node on a DEDICATED, long-lived runtime and hand that runtime
+    /// back inside the [`PreparedEnvironment`] so the resident host's stdio I/O
+    /// driver — spawned during lease acquisition — outlives `prepare` and stays
+    /// reachable for every later `exec`/`teardown` RPC (which drive the host's
+    /// channels from their own throwaway runtimes; cross-runtime channel comms
+    /// are fine as long as the driver's runtime is alive).
+    ///
+    /// The runtime is built and `block_on` is entered from a bare OS thread (a
+    /// runtime cannot be created from within another runtime's worker), then the
+    /// idle runtime — whose own worker threads keep the driver parked and live —
+    /// is moved back to the async caller and stored on the struct.
     pub(crate) async fn prepare_off_runtime(project_root: &Path, environment: &ResolvedEnvironment) -> Result<Self> {
         let project_root = project_root.to_path_buf();
         let environment = environment.clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(Self::prepare(&project_root, &environment));
+            let result = (|| {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+                    .context("building dedicated runtime for the environment host")?;
+                // Lease + prepare INSIDE this runtime so the host's I/O driver
+                // binds here (not to a per-call throwaway that would die on return).
+                let mut prepared = runtime.block_on(async { Self::prepare(&project_root, &environment) })?;
+                prepared.runtime = Some(runtime);
+                Ok::<_, anyhow::Error>(prepared)
+            })();
+            let _ = tx.send(result);
         });
         rx.await.map_err(|_| anyhow!("environment prepare thread terminated unexpectedly"))?
     }
@@ -300,6 +336,21 @@ impl PreparedEnvironment {
             }
         })
         .join();
+    }
+}
+
+impl Drop for PreparedEnvironment {
+    /// Shut the dedicated host runtime down WITHOUT blocking. `teardown()` (the
+    /// RPC that deletes the node) has already run via the end-of-run call or the
+    /// [`PreparedEnvironmentGuard`](crate::workflow_execute) backstop, and it
+    /// needs this runtime's I/O driver alive — so tearing the node down is NOT
+    /// done here. `shutdown_background` is used instead of an implicit drop
+    /// because dropping a runtime inline panics when the surrounding thread is
+    /// itself inside an async runtime (this `Drop` can fire on any thread).
+    fn drop(&mut self) {
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
+        }
     }
 }
 
