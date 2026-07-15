@@ -768,6 +768,15 @@ pub async fn execute_workflow_with_hub(
                     // runtime emitter so it lands in `phase_events` + the
                     // durable workflow-events JSONL. The recorder maps this
                     // back into a protocol-shaped `PhaseEvent::Decision`.
+                    // Carry the decision `reason` (truncated) into the journal
+                    // event. For a COMMAND phase this reason is the failure
+                    // summary — exit code + stdout + stderr — so a failing
+                    // command's actual output becomes visible in `journal_events`
+                    // instead of only a bare `{verdict}`. Without it, command
+                    // phase failures (code-open-pr push/PR errors) were
+                    // undiagnosable from the run log. TASK-447.
+                    const DECISION_REASON_MAX: usize = 4000;
+                    let reason_excerpt: String = decision.reason.chars().take(DECISION_REASON_MAX).collect();
                     emit_runtime(
                         RuntimeWorkflowEventKind::PhaseCompleted,
                         serde_json::json!({
@@ -775,6 +784,7 @@ pub async fn execute_workflow_with_hub(
                             "phase_status": "decision",
                             "verdict": format!("{:?}", decision.verdict).to_ascii_lowercase(),
                             "confidence": decision.confidence,
+                            "reason": reason_excerpt,
                         }),
                     );
                 }
