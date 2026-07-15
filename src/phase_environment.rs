@@ -783,26 +783,25 @@ fn apply_reasoning_effort(tool: &str, args: Vec<String>, reasoning_effort: Optio
 /// inside a nested per-run node container ("bwrap: Creating new namespace failed:
 /// Permission denied") — so codex can't exec ANY command (even a read-only
 /// `git diff`) in the node, and every codex node phase fails to inspect the
-/// workspace. The node is ALREADY an isolated sandbox, so for the env-exec path
-/// force codex's `sandbox_mode` to full access and `approval_policy` to never so
-/// it can run commands — the codex analogue of claude's `bypassPermissions`
-/// default. `ensure_codex_config_override` upserts, so this wins over any earlier
-/// `approval_policy` set from a permission mode.
-fn apply_codex_node_sandbox(tool: &str, args: Vec<String>) -> Vec<String> {
+/// workspace. A `-c sandbox_mode=...` config override does NOT change `codex
+/// exec`'s effective sandbox; the documented flag for an externally-sandboxed
+/// host is `--dangerously-bypass-approvals-and-sandbox`, which skips both the
+/// inner sandbox and approval prompts. The per-run node IS that external
+/// sandbox, so add the flag for the env-exec path — the codex analogue of
+/// claude's `bypassPermissions` default.
+fn apply_codex_node_sandbox(tool: &str, mut args: Vec<String>) -> Vec<String> {
     if !tool.trim().eq_ignore_ascii_case("codex") {
         return args;
     }
-    let mut contract = serde_json::json!({ "cli": { "launch": { "args": args } } });
-    animus_runtime_shared::inject_codex_config_overrides_list(
-        &mut contract,
-        "codex",
-        &["sandbox_mode=\"danger-full-access\"".to_string(), "approval_policy=\"never\"".to_string()],
-    );
-    contract
-        .pointer("/cli/launch/args")
-        .and_then(Value::as_array)
-        .map(|args| args.iter().filter_map(Value::as_str).map(ToOwned::to_owned).collect())
-        .unwrap_or_default()
+    const BYPASS: &str = "--dangerously-bypass-approvals-and-sandbox";
+    if args.iter().any(|arg| arg == BYPASS) {
+        return args;
+    }
+    // Place it right after the `exec` subcommand so codex parses it as an exec
+    // flag; fall back to the front when there is no explicit subcommand.
+    let insert_at = args.iter().position(|arg| arg == "exec").map(|index| index + 1).unwrap_or(0);
+    args.insert(insert_at, BYPASS.to_string());
+    args
 }
 
 /// Strip the machine-output flags from a launch argv so the command emits plain
@@ -1953,22 +1952,19 @@ environment_routing:
         // can't exec any shell (even a read-only `git diff`).
         let request = sample_request("codex");
         let (command, _stdin) = harness_command_for_request(Path::new("."), &request).expect("codex builds");
-        let joined = command.args.join(" ");
         assert!(
-            joined.contains("sandbox_mode=\"danger-full-access\""),
+            command.args.iter().any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox"),
             "codex node argv disables the inner sandbox: {:?}",
-            command.args
-        );
-        assert!(
-            joined.contains("approval_policy=\"never\""),
-            "codex node argv auto-approves: {:?}",
             command.args
         );
 
         // A non-codex tool is untouched.
         let claude = sample_request("claude");
         let (claude_cmd, _s) = harness_command_for_request(Path::new("."), &claude).expect("claude builds");
-        assert!(!claude_cmd.args.join(" ").contains("sandbox_mode"), "claude gets no codex sandbox flag");
+        assert!(
+            !claude_cmd.args.iter().any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox"),
+            "claude gets no codex sandbox flag"
+        );
     }
 
     #[test]
