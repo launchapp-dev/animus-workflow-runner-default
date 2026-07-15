@@ -600,19 +600,30 @@ fn harness_command_for_request(
         args.push(system.to_string());
     }
     let args = plain_text_launch_args(&request.tool, args);
-    // Default claude to `bypassPermissions` for in-environment execution when no
-    // explicit mode is set — the local path injects the same default via
-    // `runtime_support::inject_claude_permission_mode`, but the env-exec path did
-    // not, so claude launched in its interactive "ask" mode where `-p` runs cannot
-    // edit files and the agent degrades to only DESCRIBING the change. An
-    // ephemeral per-run node is an isolated sandbox, so bypass is the correct
-    // default; an explicit `permission_mode` (e.g. `plan`) still wins.
+    // Launch a WRITE-CAPABLE phase in the tool's edit-permitting mode when no
+    // explicit `permission_mode` is set — driven by the phase CAPABILITY (which
+    // rides `extras.phase_capabilities`), not by `tool == "claude"` alone. Today
+    // the local path injects the same default via
+    // `runtime_contract::apply_phase_capability_launch_flags`; the env-exec path
+    // did not, so a write-capable claude phase launched in its interactive "ask"
+    // mode where `-p` runs cannot edit files and the agent degrades to only
+    // DESCRIBING the change. An ephemeral per-run node is an isolated sandbox, so
+    // bypass is the correct default for a write-capable claude phase; codex
+    // launches edit-capable by default so it needs no flag; an explicit
+    // `permission_mode` (e.g. `plan`) still wins; a READ-ONLY phase is NOT forced
+    // into an edit-permitting mode.
+    let writes_files = request
+        .extras
+        .pointer("/phase_capabilities")
+        .and_then(|caps| serde_json::from_value::<protocol::PhaseCapabilities>(caps.clone()).ok())
+        .map(|caps| caps.writes_files)
+        .unwrap_or(false);
     let effective_permission_mode = request
         .permission_mode
         .as_deref()
         .map(str::trim)
         .filter(|mode| !mode.is_empty())
-        .or(if is_claude { Some("bypassPermissions") } else { None });
+        .or(if writes_files && is_claude { Some("bypassPermissions") } else { None });
     let args = apply_permission_mode(&request.tool, args, effective_permission_mode);
     let args = apply_reasoning_effort(
         &request.tool,
@@ -1701,6 +1712,7 @@ environment_routing:
     fn harness_command_prefers_the_assembled_contract_launch() {
         let mut request = sample_request("claude");
         request.extras = serde_json::json!({
+            "phase_capabilities": { "writes_files": true },
             "runtime_contract": {
                 "cli": {
                     "name": "claude",
@@ -1733,6 +1745,7 @@ environment_routing:
     fn harness_command_strips_machine_output_from_a_contract_launch_too() {
         let mut request = sample_request("claude");
         request.extras = serde_json::json!({
+            "phase_capabilities": { "writes_files": true },
             "runtime_contract": {
                 "cli": {
                     "name": "claude",
@@ -1794,6 +1807,32 @@ environment_routing:
             .position(|arg| arg == "--permission-mode")
             .expect("permission mode flag applied to the env launch");
         assert_eq!(command.args.get(pos + 1).map(String::as_str), Some("plan"));
+    }
+
+    #[test]
+    fn harness_command_defaults_bypass_only_for_write_capable_claude_phases() {
+        // Write-capable claude phase with no explicit mode -> bypassPermissions.
+        let mut write_request = sample_request("claude");
+        write_request.extras = serde_json::json!({ "phase_capabilities": { "writes_files": true } });
+        let (command, _stdin) =
+            harness_command_for_request(Path::new("."), &write_request).expect("write-capable builds");
+        assert!(
+            command.args.iter().any(|arg| arg == "bypassPermissions"),
+            "a write-capable claude phase launches in bypassPermissions: {:?}",
+            command.args
+        );
+
+        // Read-only claude phase (no write capability) is NOT forced into an
+        // edit-permitting mode.
+        let mut read_only_request = sample_request("claude");
+        read_only_request.extras = serde_json::json!({ "phase_capabilities": { "writes_files": false } });
+        let (command, _stdin) =
+            harness_command_for_request(Path::new("."), &read_only_request).expect("read-only builds");
+        assert!(
+            !command.args.iter().any(|arg| arg == "bypassPermissions"),
+            "a read-only claude phase is not forced into an edit-permitting mode: {:?}",
+            command.args
+        );
     }
 
     #[test]

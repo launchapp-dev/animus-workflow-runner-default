@@ -344,6 +344,20 @@ pub fn inject_claude_permission_mode(runtime_contract: &mut Value, tool_id: &str
     }
 }
 
+/// Launch a WRITE-CAPABLE phase in the tool's edit-permitting mode, driven by
+/// the phase CAPABILITY (not a `tool == "claude"` env flag). claude gains
+/// `--permission-mode bypassPermissions` when no explicit `--permission-mode`
+/// is already present; codex launches edit-capable by default inside its
+/// sandbox, so it (and every other tool) is a no-op here. Idempotent.
+pub fn apply_write_capable_permission_mode(runtime_contract: &mut Value, tool_id: &str) {
+    if !tool_id.eq_ignore_ascii_case("claude") {
+        return;
+    }
+    if let Some(args) = runtime_contract.pointer_mut("/cli/launch/args").and_then(Value::as_array_mut) {
+        ensure_flag_value_if_missing(args, "--permission-mode", "bypassPermissions", 0);
+    }
+}
+
 pub fn inject_cli_launch_overrides(
     runtime_contract: &mut Value,
     tool_id: &str,
