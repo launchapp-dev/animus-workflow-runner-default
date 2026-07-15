@@ -156,6 +156,18 @@ impl Drop for WorkflowRunnerPidGuard {
     }
 }
 
+/// Guarantees the per-run environment node (REQUIREMENT-048) is torn down ONCE
+/// when the workflow run ends — success, failure, or ANY early return. Teardown
+/// is idempotent, so an explicit end-of-run teardown and this Drop backstop
+/// coexist safely.
+struct PreparedEnvironmentGuard(std::sync::Arc<crate::phase_environment::PreparedEnvironment>);
+
+impl Drop for PreparedEnvironmentGuard {
+    fn drop(&mut self) {
+        self.0.teardown();
+    }
+}
+
 fn ensure_workflow_pack_execution_requirements(
     pack_registry: &orchestrator_config::ResolvedPackRegistry,
     workflow_config: &orchestrator_config::WorkflowConfig,
@@ -311,6 +323,37 @@ pub async fn execute_workflow_with_hub(
     let mut results = Vec::new();
     let workflow_start = Instant::now();
 
+    // REQUIREMENT-048: resolve the workflow-run-level environment ONCE. When the
+    // run routes to a non-local `environment` plugin, prepare a single BARE node
+    // and hold it for the whole run — every phase execs inside it (so a clone in
+    // one phase is visible to the next), and it is torn down ONCE at the end
+    // (success, failure, or early exit) via `_prepared_environment_guard`. A
+    // local workflow resolves to `None` and every phase keeps the byte-for-byte
+    // local path. Preparation runs OFF the async runtime (the `EnvironmentClient`
+    // surface is blocking); a prepare failure fails the run up front rather than
+    // silently executing locally.
+    let prepared_environment: Option<std::sync::Arc<crate::phase_environment::PreparedEnvironment>> =
+        match crate::phase_environment::resolve_workflow_environment(
+            Path::new(&params.project_root),
+            &workflow_ref,
+            Some(&subject_kind_str),
+        ) {
+            Some(environment) => {
+                let prepared = crate::phase_environment::PreparedEnvironment::prepare_off_runtime(
+                    Path::new(&params.project_root),
+                    &environment,
+                )
+                .await
+                .with_context(|| {
+                    format!("failed to prepare per-run environment '{}' for workflow {}", environment.id, workflow.id)
+                })?;
+                Some(std::sync::Arc::new(prepared))
+            }
+            None => None,
+        };
+    let _prepared_environment_guard = prepared_environment.clone().map(PreparedEnvironmentGuard);
+    let held_environment = prepared_environment.as_deref();
+
     // v0.5: PhaseEventCallback was removed. The protocol-shaped PhaseEvents
     // are recorded inside the `event_emitter` (`PhaseEventRecorder`) via
     // `emit_runtime`. We retain the no-op `emit` shim so the lifted call
@@ -375,6 +418,7 @@ pub async fn execute_workflow_with_hub(
             phase_timeout_secs,
             mcp_config: mcp_config.as_ref(),
             actor: params.actor.as_ref(),
+            held_environment,
         })
         .await;
 
@@ -603,6 +647,7 @@ pub async fn execute_workflow_with_hub(
             phase_timeout_secs,
             mcp_config: mcp_config.as_ref(),
             actor: params.actor.as_ref(),
+            held_environment,
         })
         .await;
 

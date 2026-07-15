@@ -473,6 +473,11 @@ pub async fn handle_workflow_run_phase(request: WorkflowPhaseRunRequest) -> Resu
         // Relay the transport-asserted actor verbatim from the inbound
         // phase-run request. The runner never synthesizes or interprets it.
         actor: request.actor.as_ref(),
+        // The single-phase IPC entrypoint (`workflow/run_phase`) runs one phase
+        // per call, so it cannot hold an environment node across phases — the
+        // per-run node lifecycle (REQUIREMENT-048) is owned by the whole-workflow
+        // `workflow/execute` path (`execute_workflow_with_hub`).
+        held_environment: None,
     })
     .await;
     let elapsed: Duration = started.elapsed();

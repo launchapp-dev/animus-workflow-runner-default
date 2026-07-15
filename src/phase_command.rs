@@ -30,6 +30,13 @@ pub(crate) struct CommandExecutionContext<'a> {
     pub pipeline_vars: Option<&'a HashMap<String, String>>,
     pub dispatch_input: Option<&'a str>,
     pub schedule_input: Option<&'a str>,
+    /// The bound subject's CUSTOM fields (e.g. a portal subject's `git_repo`),
+    /// exposed as bare, lowercased `{{name}}` template variables so a command
+    /// like `git clone {{git_repo}} .` renders (REQUIREMENT-048). Populated in
+    /// [`run_workflow_phase_with_command`] from the raw `subject/get` record,
+    /// since the in-tree `OrchestratorTask` value carries no arbitrary custom-
+    /// field map. `None` when no subject record was resolved.
+    pub custom_fields: Option<&'a HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -271,6 +278,15 @@ pub(crate) fn build_command_template_vars(context: &CommandExecutionContext<'_>)
         }
     }
 
+    // The bound subject's custom fields (e.g. `git_repo`) as bare, lowercased
+    // template vars. Merged last with `or_insert` so a built-in var or an
+    // explicit pipeline var is never shadowed by a same-named custom field.
+    if let Some(custom_fields) = context.custom_fields {
+        for (key, value) in custom_fields {
+            vars.entry(key.to_ascii_lowercase()).or_insert_with(|| value.clone());
+        }
+    }
+
     if let Some(dispatch_input) = context.dispatch_input.filter(|value| !value.is_empty()) {
         vars.entry("dispatch_input".to_string()).or_insert_with(|| dispatch_input.to_string());
         if context.subject_id.starts_with("schedule:") {
@@ -455,6 +471,33 @@ async fn fetch_subject_record(project_root: &str, kind: &str, native_id: &str) -
         }
     }
     None
+}
+
+/// Extract the bound subject's CUSTOM fields from a raw `subject/get` record as
+/// string values, preferring the explicit `data` object then the backend
+/// `attributes` bag (the same precedence [`build_command_context_json`] uses).
+/// String values pass through and other scalars stringify; `null` and nested
+/// object/array values are skipped (they are not sensible template scalars).
+/// These become bare, lowercased `{{name}}` template vars so a command like
+/// `git clone {{git_repo}} .` renders (REQUIREMENT-048).
+fn subject_custom_fields(record: Option<&Value>) -> HashMap<String, String> {
+    let mut fields = HashMap::new();
+    let Some(bag) = record.and_then(|record| {
+        record.get("data").and_then(Value::as_object).or_else(|| record.get("attributes").and_then(Value::as_object))
+    }) else {
+        return fields;
+    };
+    for (key, value) in bag {
+        let rendered = match value {
+            Value::String(text) => Some(text.clone()),
+            Value::Bool(_) | Value::Number(_) => Some(value.to_string()),
+            Value::Null | Value::Array(_) | Value::Object(_) => None,
+        };
+        if let Some(rendered) = rendered {
+            fields.insert(key.clone(), rendered);
+        }
+    }
+    fields
 }
 
 fn resolve_command_cwd(
@@ -768,6 +811,47 @@ pub(crate) async fn run_workflow_phase_with_command(
         return Err(anyhow!("phase '{}' command '{}' is not in tools_allowlist", context.phase_id, command.program));
     }
 
+    // TASK-292 + REQUIREMENT-048: best-effort fetch of the FULL subject record
+    // via the subject_backend's generic `subject/get` BEFORE templating, so the
+    // subject's custom fields (e.g. `git_repo`) can be exposed as `{{name}}`
+    // template vars AND the context blob carries status/priority/data/labels the
+    // runner does not otherwise track. A fetch failure must NOT crash the phase —
+    // degrade to the scalar env + minimal context file. Bounded because it
+    // spawns/connects a subject_backend plugin host on EVERY command phase (incl.
+    // trivial mark-running/mark-done); a slow/hung backend must not stall it.
+    let subject_record = match tokio::time::timeout(
+        std::time::Duration::from_secs(SUBJECT_FETCH_TIMEOUT_SECS),
+        fetch_subject_record(context.project_root, context.subject_kind, context.subject_id),
+    )
+    .await
+    {
+        Ok(record) => record,
+        Err(_) => {
+            tracing::warn!(
+                phase_id = context.phase_id,
+                subject_id = context.subject_id,
+                timeout_secs = SUBJECT_FETCH_TIMEOUT_SECS,
+                "command-phase context: subject/get timed out; degrading to scalar context"
+            );
+            None
+        }
+    };
+    if subject_record.is_none() && !context.subject_id.trim().is_empty() {
+        tracing::debug!(
+            phase_id = context.phase_id,
+            subject_id = context.subject_id,
+            subject_kind = context.subject_kind,
+            "command-phase context: subject/get returned no record; degrading to scalar context"
+        );
+    }
+
+    // Expose the subject's custom fields (from the raw record's `data` /
+    // `attributes` bag) as bare `{{name}}` template vars — the in-tree
+    // `OrchestratorTask` value carries no arbitrary custom-field map, so the raw
+    // subject fetch above is the source.
+    let custom_fields = subject_custom_fields(subject_record.as_ref());
+    let context = &CommandExecutionContext { custom_fields: Some(&custom_fields), ..*context };
+
     let template_vars = build_command_template_vars(context);
 
     // Fail-fast (TASK-205): a required binding like `{{subject_id}}` that
@@ -809,39 +893,6 @@ pub(crate) async fn run_workflow_phase_with_command(
         .collect::<BTreeMap<_, _>>();
     let cwd = resolve_command_cwd(context, command, &template_vars)?;
 
-    // TASK-292: rich context injection. Best-effort fetch of the FULL subject
-    // record via the subject_backend's generic `subject/get` so the context
-    // blob carries status/priority/data/labels/dependencies the runner does not
-    // otherwise track. A fetch failure must NOT crash the phase — degrade to
-    // the scalar env + a minimal context file.
-    // Bound the fetch: it spawns/connects a subject_backend plugin host and runs
-    // on EVERY command phase (incl. trivial mark-running/mark-done). A slow or
-    // hung backend must not stall the phase — cap it and degrade to scalar context.
-    let subject_record = match tokio::time::timeout(
-        std::time::Duration::from_secs(SUBJECT_FETCH_TIMEOUT_SECS),
-        fetch_subject_record(context.project_root, context.subject_kind, context.subject_id),
-    )
-    .await
-    {
-        Ok(record) => record,
-        Err(_) => {
-            tracing::warn!(
-                phase_id = context.phase_id,
-                subject_id = context.subject_id,
-                timeout_secs = SUBJECT_FETCH_TIMEOUT_SECS,
-                "command-phase context: subject/get timed out; degrading to scalar context"
-            );
-            None
-        }
-    };
-    if subject_record.is_none() && !context.subject_id.trim().is_empty() {
-        tracing::debug!(
-            phase_id = context.phase_id,
-            subject_id = context.subject_id,
-            subject_kind = context.subject_kind,
-            "command-phase context: subject/get returned no record; degrading to scalar context"
-        );
-    }
     let prior_phases =
         crate::phase_output::list_prior_phase_outputs(context.project_root, context.workflow_id, context.phase_id);
     let context_json = build_command_context_json(context, &template_vars, subject_record.as_ref(), &prior_phases);
@@ -1076,6 +1127,7 @@ mod tests {
             pipeline_vars: None,
             dispatch_input: None,
             schedule_input: None,
+            custom_fields: None,
         }
     }
 
@@ -1210,6 +1262,59 @@ mod tests {
         let task_vars = build_command_template_vars(&task_ctx);
         assert_eq!(task_vars.get("subject_id").map(String::as_str), Some("task:TASK-254"));
         assert_eq!(task_vars.get("subject_native_id").map(String::as_str), Some("TASK-254"));
+    }
+
+    #[test]
+    fn build_command_template_vars_exposes_subject_custom_fields() {
+        // REQUIREMENT-048: a subject custom field like `git_repo` renders as a
+        // bare `{{git_repo}}` template var so `git clone {{git_repo}} .` works.
+        let custom = HashMap::from([
+            ("git_repo".to_string(), "https://github.com/acme/app.git".to_string()),
+            ("GitRef".to_string(), "main".to_string()),
+        ]);
+        let mut ctx = bound_context();
+        ctx.custom_fields = Some(&custom);
+        let vars = build_command_template_vars(&ctx);
+        assert_eq!(vars.get("git_repo").map(String::as_str), Some("https://github.com/acme/app.git"));
+        // Keys are lowercased at merge time.
+        assert_eq!(vars.get("gitref").map(String::as_str), Some("main"));
+
+        // A custom field NEVER shadows a built-in var (e.g. subject_id).
+        let shadow = HashMap::from([("subject_id".to_string(), "HACKED".to_string())]);
+        ctx.custom_fields = Some(&shadow);
+        let vars = build_command_template_vars(&ctx);
+        assert_eq!(vars.get("subject_id").map(String::as_str), Some("task:TASK-1"), "built-in subject_id wins");
+    }
+
+    #[test]
+    fn subject_custom_fields_extracts_from_data_then_attributes() {
+        // `data` object is preferred; string values pass through, other scalars
+        // stringify, and null / nested containers are skipped.
+        let record = serde_json::json!({
+            "data": {
+                "git_repo": "https://github.com/acme/app.git",
+                "count": 3,
+                "flag": true,
+                "nothing": null,
+                "nested": { "a": 1 },
+                "list": [1, 2]
+            }
+        });
+        let fields = subject_custom_fields(Some(&record));
+        assert_eq!(fields.get("git_repo").map(String::as_str), Some("https://github.com/acme/app.git"));
+        assert_eq!(fields.get("count").map(String::as_str), Some("3"));
+        assert_eq!(fields.get("flag").map(String::as_str), Some("true"));
+        assert!(!fields.contains_key("nothing"), "null skipped");
+        assert!(!fields.contains_key("nested"), "nested object skipped");
+        assert!(!fields.contains_key("list"), "array skipped");
+
+        // Falls back to the backend `attributes` bag when there is no `data`.
+        let attrs = serde_json::json!({ "attributes": { "git_repo": "git@x:y.git" } });
+        assert_eq!(subject_custom_fields(Some(&attrs)).get("git_repo").map(String::as_str), Some("git@x:y.git"));
+
+        // No record / no bag -> empty.
+        assert!(subject_custom_fields(None).is_empty());
+        assert!(subject_custom_fields(Some(&serde_json::json!({ "status": "open" }))).is_empty());
     }
 
     #[tokio::test]
