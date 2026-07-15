@@ -80,6 +80,14 @@ fn try_parse_decision(value: &Value, phase_id: &str) -> Option<orchestrator_core
 
     let verdict_str = value.get("verdict").and_then(Value::as_str)?;
     let verdict_trimmed = verdict_str.trim();
+    // A verdict containing '|' is the injected prompt's placeholder template
+    // (e.g. `"verdict":"advance|rework|fail|skip"`) — some CLIs (codex) reprint
+    // their prompt to stdout, so that example would otherwise be captured as an
+    // `Unknown` decision BEFORE the agent's real decision line. A real verdict is
+    // a single token and never contains '|', so skip it and keep scanning.
+    if verdict_trimmed.contains('|') {
+        return None;
+    }
     // A built-in verdict maps to its enum variant with no `verdict_key`; a
     // non-empty NON-builtin verdict is carried as `Unknown` + the raw key so
     // the workflow executor can route it through the phase's `on_verdict` map
@@ -203,6 +211,18 @@ mod tests {
         let decision = parse_phase_decision_from_text(text, "implementation").unwrap();
         assert_eq!(decision.verdict, orchestrator_core::PhaseDecisionVerdict::Advance);
         assert!((decision.confidence - 0.95).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn skips_placeholder_template_verdict() {
+        // The injected prompt's example (echoed by codex) must NOT be captured as
+        // a decision — a real verdict never contains '|'.
+        let template = r#"{"kind":"phase_decision","phase_id":"code-check","verdict":"advance|rework|fail|skip","confidence":0.95}"#;
+        assert!(parse_phase_decision_from_text(template, "code-check").is_none());
+        // A real decision alongside it is still captured.
+        let real = r#"{"kind":"phase_decision","phase_id":"code-check","verdict":"advance","confidence":0.99,"risk":"low","reason":"ok","evidence":[]}"#;
+        let decision = parse_phase_decision_from_text(real, "code-check").unwrap();
+        assert_eq!(decision.verdict, orchestrator_core::PhaseDecisionVerdict::Advance);
     }
 
     #[test]
