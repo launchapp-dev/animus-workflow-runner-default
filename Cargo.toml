@@ -1,6 +1,6 @@
 [package]
 name = "animus-workflow-runner-default"
-version = "0.4.31"
+version = "0.4.32"
 edition = "2021"
 description = "Reference workflow_runner plugin for Animus v0.5 (stdio JSON-RPC + direct-execute CLI; replaces in-tree workflow-runner-v2)"
 license = "Elastic-2.0"
@@ -63,6 +63,12 @@ animus-runtime-shared      = { git = "https://github.com/launchapp-dev/animus-cl
 # --- stdlib-ish deps (move with the crate) ----------------------------------
 anyhow = "1.0"
 async-trait = "0.1"
+# REQUIREMENT-048 cross-phase environment broker (runner client). The daemon
+# owns ONE environment node per workflow RUN and exposes it over a private local
+# socket; when the broker env vars are set the runner dials that socket (newline
+# JSON, one connection per RPC) instead of preparing its own per-phase node.
+# Same `interprocess` local-socket idiom as the reattach back-channel.
+interprocess = "2.4"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
 dirs = "5"

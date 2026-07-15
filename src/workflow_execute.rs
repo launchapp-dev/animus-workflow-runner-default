@@ -323,36 +323,64 @@ pub async fn execute_workflow_with_hub(
     let mut results = Vec::new();
     let workflow_start = Instant::now();
 
-    // REQUIREMENT-048: resolve the workflow-run-level environment ONCE. When the
-    // run routes to a non-local `environment` plugin, prepare a single BARE node
-    // and hold it for the whole run — every phase execs inside it (so a clone in
-    // one phase is visible to the next), and it is torn down ONCE at the end
-    // (success, failure, or early exit) via `_prepared_environment_guard`. A
-    // local workflow resolves to `None` and every phase keeps the byte-for-byte
-    // local path. Preparation runs OFF the async runtime (the `EnvironmentClient`
-    // surface is blocking); a prepare failure fails the run up front rather than
-    // silently executing locally.
-    let prepared_environment: Option<std::sync::Arc<crate::phase_environment::PreparedEnvironment>> =
-        match crate::phase_environment::resolve_workflow_environment(
-            Path::new(&params.project_root),
-            &workflow_ref,
-            Some(&subject_kind_str),
-        ) {
-            Some(environment) => {
-                let prepared = crate::phase_environment::PreparedEnvironment::prepare_off_runtime(
-                    Path::new(&params.project_root),
-                    &environment,
-                )
-                .await
-                .with_context(|| {
-                    format!("failed to prepare per-run environment '{}' for workflow {}", environment.id, workflow.id)
-                })?;
-                Some(std::sync::Arc::new(prepared))
-            }
+    // REQUIREMENT-048: resolve the per-workflow-run environment node ONCE, shared
+    // across every phase (so a clone in one phase is visible to the next).
+    //
+    // Brokered mode takes PRECEDENCE: when the daemon sets the broker env vars it
+    // owns ONE node per run behind a private socket, and the runner only ACQUIREs
+    // a handle to it — NO prepare, NO teardown (the daemon owns the lifecycle, so
+    // no `PreparedEnvironmentGuard` is built). A broker acquire failure fails the
+    // run up front and NEVER falls back to an owned prepare.
+    //
+    // Otherwise the runner OWNS the node (standalone CLI / non-brokered daemon):
+    // it prepares a single BARE node and tears it down ONCE at the end (success,
+    // failure, or early exit) via `_prepared_environment_guard`. A local workflow
+    // resolves to `None` and every phase keeps the byte-for-byte local path.
+    // Preparation runs OFF the async runtime (the `EnvironmentClient` surface is
+    // blocking); a prepare failure fails the run up front rather than executing
+    // locally.
+    let brokered_environment: Option<std::sync::Arc<crate::phase_environment::BrokeredEnvironment>> =
+        match crate::phase_environment::BrokeredEnvironment::acquire_from_env().await {
+            Some(result) => Some(std::sync::Arc::new(
+                result
+                    .with_context(|| format!("failed to acquire brokered environment for workflow {}", workflow.id))?,
+            )),
             None => None,
         };
+    let prepared_environment: Option<std::sync::Arc<crate::phase_environment::PreparedEnvironment>> =
+        if brokered_environment.is_some() {
+            None
+        } else {
+            match crate::phase_environment::resolve_workflow_environment(
+                Path::new(&params.project_root),
+                &workflow_ref,
+                Some(&subject_kind_str),
+            ) {
+                Some(environment) => {
+                    let prepared = crate::phase_environment::PreparedEnvironment::prepare_off_runtime(
+                        Path::new(&params.project_root),
+                        &environment,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to prepare per-run environment '{}' for workflow {}",
+                            environment.id, workflow.id
+                        )
+                    })?;
+                    Some(std::sync::Arc::new(prepared))
+                }
+                None => None,
+            }
+        };
+    // Only the runner-owned node needs a teardown guard; the broker owns its own.
     let _prepared_environment_guard = prepared_environment.clone().map(PreparedEnvironmentGuard);
-    let held_environment = prepared_environment.as_deref();
+    let held_environment: Option<&dyn crate::phase_environment::HeldEnvironment> = match &brokered_environment {
+        Some(brokered) => Some(brokered.as_ref() as &dyn crate::phase_environment::HeldEnvironment),
+        None => {
+            prepared_environment.as_deref().map(|prepared| prepared as &dyn crate::phase_environment::HeldEnvironment)
+        }
+    };
 
     // v0.5: PhaseEventCallback was removed. The protocol-shaped PhaseEvents
     // are recorded inside the `event_emitter` (`PhaseEventRecorder`) via

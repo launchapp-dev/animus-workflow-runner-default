@@ -23,7 +23,7 @@ use animus_workflow_runner_protocol::{
     error_codes, phase_status, workflow_status, PhaseResultSnapshot, WorkflowExecuteRequest, WorkflowExecuteResult,
     WorkflowPhaseRunRequest, WorkflowPhaseRunResult, KIND as WORKFLOW_RUNNER_KIND,
 };
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use orchestrator_core::{services::ServiceHub, FileServiceHub, WorkflowStatus};
 use serde_json::Value;
 
@@ -446,6 +446,24 @@ pub async fn handle_workflow_run_phase(request: WorkflowPhaseRunRequest) -> Resu
     let mcp_config: Option<protocol::McpRuntimeConfig> =
         request.mcp_config.clone().and_then(|value| serde_json::from_value(value).ok());
 
+    // REQUIREMENT-048 cross-phase broker: the daemon dispatches ONE runner
+    // subprocess per phase, so a runner-owned per-phase node cannot share a
+    // workspace across phases. When the daemon sets the broker env vars it owns
+    // ONE node per workflow RUN behind a private socket; this per-phase entry
+    // ACQUIREs a handle to that shared node and execs through it (no prepare, no
+    // teardown — the daemon owns the lifecycle). Absent the broker env vars this
+    // stays `None` (the byte-for-byte local path). A broker acquire failure fails
+    // the phase and NEVER falls back to an owned prepare.
+    let brokered_environment: Option<std::sync::Arc<crate::phase_environment::BrokeredEnvironment>> =
+        match crate::phase_environment::BrokeredEnvironment::acquire_from_env().await {
+            Some(result) => Some(std::sync::Arc::new(result.with_context(|| {
+                format!("failed to acquire brokered environment for phase '{}'", request.phase_id)
+            })?)),
+            None => None,
+        };
+    let held_environment: Option<&dyn crate::phase_environment::HeldEnvironment> =
+        brokered_environment.as_deref().map(|brokered| brokered as &dyn crate::phase_environment::HeldEnvironment);
+
     let started = std::time::Instant::now();
     let run_result = crate::phase_executor::run_workflow_phase(&crate::phase_executor::PhaseRunParams {
         project_root: &project_root,
@@ -473,11 +491,10 @@ pub async fn handle_workflow_run_phase(request: WorkflowPhaseRunRequest) -> Resu
         // Relay the transport-asserted actor verbatim from the inbound
         // phase-run request. The runner never synthesizes or interprets it.
         actor: request.actor.as_ref(),
-        // The single-phase IPC entrypoint (`workflow/run_phase`) runs one phase
-        // per call, so it cannot hold an environment node across phases — the
-        // per-run node lifecycle (REQUIREMENT-048) is owned by the whole-workflow
-        // `workflow/execute` path (`execute_workflow_with_hub`).
-        held_environment: None,
+        // The per-run environment node is owned by the daemon broker and reached
+        // over a private socket (REQUIREMENT-048); `held_environment` is the
+        // acquired handle when the broker env vars are set, else `None` (local).
+        held_environment,
     })
     .await;
     let elapsed: Duration = started.elapsed();
