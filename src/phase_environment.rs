@@ -1,67 +1,69 @@
-//! REQUIREMENT-048 Phase B: route a workflow PHASE's harness execution through
-//! a resolved `environment` plugin instead of running it on the local host.
+//! REQUIREMENT-048: route a workflow RUN's harness execution through a resolved
+//! `environment` plugin instead of running it on the local host, preparing ONE
+//! node per workflow run that is shared across every phase.
 //!
 //! This is the runner-side twin of the kernel's ad-hoc `animus agent run`
 //! environment seam (`orchestrator-cli` `environment_exec.rs`, TASK-166 Phase
-//! 2). When a phase's harness resolves to a NON-LOCAL environment (a container
-//! / remote sandbox plugin), the harness command that would have been spawned
-//! on the host is instead prepared + executed inside that environment via
-//! [`EnvironmentClient`] (`prepare` → `exec_stream` → `teardown`), with the
-//! streamed stdout/stderr surfaced through the SAME [`SessionEvent`] channel a
-//! local [`SessionRun`] yields — so the runner's existing
-//! `process_phase_event_stream` consumer drives it UNCHANGED.
+//! 2). When a workflow routes to a NON-LOCAL environment (a container / remote
+//! sandbox plugin), [`workflow_execute`](crate::workflow_execute) resolves it
+//! ONCE at the start of the run and prepares a single bare node
+//! ([`PreparedEnvironment::prepare`]). Each phase's harness command is then
+//! executed INSIDE that held node via [`PreparedEnvironment::exec_session`]
+//! (`exec_stream` on the SAME pinned [`EnvironmentClient`] + [`EnvironmentHandle`]),
+//! with the streamed stdout/stderr surfaced through the SAME [`SessionEvent`]
+//! channel a local [`SessionRun`] yields — so the runner's existing
+//! `process_phase_event_stream` consumer drives it UNCHANGED. The node is torn
+//! down ONCE when the run finishes (success, failure, or early exit).
+//!
+//! Because the [`EnvironmentClient`] pins one resident host for its lifetime,
+//! holding it across the run keeps ONE node + ONE plugin process for every phase
+//! — so a clone performed in one phase is visible to the next.
 //!
 //! ## Gate (default = byte-for-byte the current local path)
 //!
-//! [`resolve_exec_environment`] decides whether a phase is env-routed:
+//! [`resolve_workflow_environment`] / [`resolve_exec_environment`] decide whether
+//! a run is env-routed:
 //!
 //! - `ANIMUS_ENVIRONMENT_EXEC` unset → consult the compiled config via
 //!   [`orchestrator_config::workflow_config::resolve_environment`], honoring the
-//!   phase/workflow-level `environment:` overrides plus the phase's subject kind
-//!   and harness against the `environment_routing:` table.
+//!   workflow-level `environment:` override plus the subject kind against the
+//!   `environment_routing:` table.
 //! - `ANIMUS_ENVIRONMENT_EXEC` set to a falsy token (`0` / `false` / `no` /
 //!   `off` / empty) → hard kill-switch: local execution even when config routes.
 //! - `ANIMUS_ENVIRONMENT_EXEC` set to any other value → that value is the
 //!   environment plugin id (dev/test override).
 //!
-//! A resolution of `None`, a LOCAL environment id (`local` / `worktree`), or a
-//! resolved environment that declares NO repos to materialize leaves the
-//! existing local path untouched.
+//! A resolution of `None` or a LOCAL environment id (`local` / `worktree`)
+//! leaves the existing local path untouched.
 //!
-//! ## Adaptation vs. the kernel seam (the railway-plugin constraint)
+//! ## Bare node, no auto-clone
 //!
-//! The kernel seam hardcodes the run's repo to `[project_root]` (a LOCAL path).
-//! A remote environment plugin (e.g. railway) REJECTS a local path — it can
-//! only clone remote urls. So here the [`EnvironmentSpec::repos`] are resolved
-//! from (in precedence order): a referenced `workspace:` (a named [`Workspace`]
-//! repo set from `phase.workspace` / `workflow.workspace`), else the matched
-//! routing rule's inline `spec.repos` — each a list of `{url, git_ref?, name?,
-//! primary?}`. An environment with no repos from either source is treated as
-//! "not routable" and falls through to local execution rather than sending a
-//! local path the plugin rejects.
+//! The prepared node is EMPTY: the [`EnvironmentSpec`] carries no `repos` (the
+//! workflow clones what it needs via a command phase that renders the subject's
+//! `git_repo` custom field, e.g. `git clone {{git_repo}} .`). Only a matched
+//! routing rule's opaque `spec` overrides (`image` / `resources` / `env` /
+//! metadata) ride the prepared spec.
 //!
 //! ## Failure posture
 //!
-//! Once a non-local environment IS resolved, the phase never silently falls
-//! back to local execution — a missing plugin, a failed `prepare`, or a failed
-//! exec fails the phase with an actionable error. The single transparent
-//! fallback is protocol-level: a plugin that does not implement
-//! `environment/exec_stream` (METHOD_NOT_SUPPORTED) is retried with the buffered
-//! `environment/exec`, which is safe because METHOD_NOT_SUPPORTED means the
-//! command never started.
+//! Once a non-local environment IS resolved, the run never silently falls back
+//! to local execution — a missing plugin, a failed `prepare`, or a failed exec
+//! fails with an actionable error. The single transparent fallback is
+//! protocol-level: a plugin that does not implement `environment/exec_stream`
+//! (METHOD_NOT_SUPPORTED) is retried with the buffered `environment/exec`, which
+//! is safe because METHOD_NOT_SUPPORTED means the command never started.
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use animus_environment_protocol::{
-    EnvironmentHandle, EnvironmentSpec, ExecResponse, ExecStream, HarnessCommand, RepoRef,
-};
+use animus_environment_protocol::{EnvironmentHandle, EnvironmentSpec, ExecResponse, ExecStream, HarnessCommand};
 use animus_plugin_protocol::error_codes::METHOD_NOT_SUPPORTED;
 use animus_session_backend::session::{SessionEvent, SessionRequest, SessionRun};
 use anyhow::{anyhow, Result};
-use orchestrator_config::workflow_config::{resolve_environment, Workspace, WorkspaceRepo};
+use orchestrator_config::workflow_config::resolve_environment;
 use orchestrator_core::EnvironmentClient;
 use orchestrator_plugin_host::HostError;
 use serde_json::Value;
@@ -82,35 +84,31 @@ fn is_local_environment(environment_id: &str) -> bool {
     LOCAL_ENVIRONMENT_IDS.contains(&normalized.as_str())
 }
 
-/// A resolved non-local environment for a phase: the plugin id, the repos to
-/// materialize into [`EnvironmentSpec::repos`] (from the referenced `workspace:`
-/// or the matched routing rule), plus any opaque `spec` overrides the matched
-/// rule carried.
+/// A resolved non-local environment for a workflow run: the plugin id plus any
+/// opaque `spec` overrides the matched routing rule carried. The node is
+/// prepared BARE (no repos) — the workflow clones what it needs via a command
+/// phase (see the module docs).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ResolvedEnvironment {
     pub(crate) id: String,
-    pub(crate) repos: Vec<RepoRef>,
     pub(crate) spec_overrides: Option<BTreeMap<String, Value>>,
 }
 
-/// The phase/workflow-level routing context threaded from the dispatch site into
-/// [`resolve_exec_environment`]: the phase's subject kind, the phase- and
-/// workflow-level `environment:` overrides, and the resolved `workspace:`
-/// reference (`phase.workspace` falling back to `workflow.workspace`). All
-/// `None` reproduces the pre-override behavior (routing-table-only resolution).
+/// The routing context threaded into [`resolve_exec_environment`]: the subject
+/// kind, plus the phase- and workflow-level `environment:` overrides. All `None`
+/// reproduces routing-table-only resolution. Workflow-run-level resolution sets
+/// only `subject_kind` + `workflow_env` (see [`resolve_workflow_environment`]).
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct PhaseRouting<'a> {
     pub(crate) subject_kind: Option<&'a str>,
     pub(crate) phase_env: Option<&'a str>,
     pub(crate) workflow_env: Option<&'a str>,
-    pub(crate) workspace: Option<&'a str>,
 }
 
-/// Resolve the NON-LOCAL environment (if any) that should execute this phase's
+/// Resolve the NON-LOCAL environment (if any) that should execute a run's
 /// harness. Returns `None` for the default local path — see the module docs for
-/// the full gate semantics. A resolved environment with no repos to materialize
-/// also returns `None` (falls through to local) rather than sending a local
-/// path a remote plugin would reject.
+/// the full gate semantics. A non-local id routes a BARE node regardless of
+/// repos (the workflow clones via a command).
 pub(crate) fn resolve_exec_environment(
     project_root: &Path,
     harness: &str,
@@ -119,15 +117,15 @@ pub(crate) fn resolve_exec_environment(
     let resolved = match std::env::var("ANIMUS_ENVIRONMENT_EXEC") {
         Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
             "" | "0" | "false" | "no" | "off" => return None,
-            _ => ResolvedEnvironment { id: raw.trim().to_string(), repos: Vec::new(), spec_overrides: None },
+            _ => ResolvedEnvironment { id: raw.trim().to_string(), spec_overrides: None },
         },
         Err(_) => {
             let config = orchestrator_core::load_workflow_config_or_default(project_root).config;
             let routing = config.environment_routing.as_ref();
             // Precedence (see `resolve_environment`): phase `environment:` >
             // first matching routing rule > workflow `environment:` > routing
-            // default. So a WorkflowDefinition `environment:` routes every phase,
-            // and a phase-level `environment:` wins for that phase.
+            // default. So a WorkflowDefinition `environment:` routes the whole
+            // run, and a phase-level `environment:` wins for that phase.
             let id = resolve_environment(
                 routing_ctx.subject_kind,
                 Some(harness),
@@ -135,17 +133,11 @@ pub(crate) fn resolve_exec_environment(
                 routing_ctx.workflow_env,
                 routing,
             )?;
-            // Re-find the routing rule that SELECTED this id so its repos +
-            // opaque `spec` overrides ride the prepared EnvironmentSpec. A
-            // phase-level `environment:` override wins BEFORE rules are consulted
-            // (see `resolve_environment`), so when `phase_env` is set the id did
-            // NOT come from a rule — attaching a coincidental same-id rule's
-            // repos/spec would contradict the documented "override + no workspace
-            // -> local" behavior. Otherwise the FIRST rule matching this phase's
-            // (kind, harness) is exactly the one `resolve_environment` returned,
-            // so its spec is the selected rule's. When no rule matches (id came
-            // from `workflow_env` / the routing default), repos come from the
-            // `workspace:` ref alone.
+            // Re-find the routing rule that SELECTED this id so its opaque `spec`
+            // overrides (image / resources / env / metadata) ride the prepared
+            // EnvironmentSpec. A phase-level `environment:` override wins BEFORE
+            // rules are consulted, so when `phase_env` is set the id did NOT come
+            // from a rule — a coincidental same-id rule must not lend its spec.
             let rule_spec = if routing_ctx.phase_env.is_some() {
                 None
             } else {
@@ -164,121 +156,164 @@ pub(crate) fn resolve_exec_environment(
                         .and_then(|rule| rule.spec.clone())
                 })
             };
-            // Repo precedence: a referenced `workspace:` (named repo set) wins;
-            // else the matched routing rule's inline `spec.repos`.
-            let workspace_repos = routing_ctx
-                .workspace
-                .and_then(|name| config.workspaces.get(name))
-                .map(repos_from_workspace)
-                .unwrap_or_default();
-            let repos = if workspace_repos.is_empty() {
-                rule_spec.as_ref().map(repos_from_spec).unwrap_or_default()
-            } else {
-                workspace_repos
-            };
-            ResolvedEnvironment { id, repos, spec_overrides: rule_spec }
+            ResolvedEnvironment { id, spec_overrides: rule_spec }
         }
     };
-    if is_local_environment(&resolved.id) || resolved.repos.is_empty() {
+    if is_local_environment(&resolved.id) {
         return None;
     }
     Some(resolved)
 }
 
-/// Build the `repos` list from a named [`Workspace`] (repo set) referenced by
-/// `phase.workspace` / `workflow.workspace`. Entries without a non-empty `url`
-/// are skipped (a remote environment plugin can only clone from a url).
-fn repos_from_workspace(workspace: &Workspace) -> Vec<RepoRef> {
-    workspace.repos.iter().filter_map(repo_ref_from_workspace_repo).collect()
-}
-
-/// Convert a config [`WorkspaceRepo`] into the wire [`RepoRef`]. Returns `None`
-/// when the entry carries no non-empty `url`.
-fn repo_ref_from_workspace_repo(repo: &WorkspaceRepo) -> Option<RepoRef> {
-    let url = repo.url.trim();
-    if url.is_empty() {
-        return None;
-    }
-    Some(RepoRef {
-        url: url.to_string(),
-        name: repo.name.as_deref().map(str::trim).filter(|name| !name.is_empty()).map(ToOwned::to_owned),
-        git_ref: repo.git_ref.as_deref().map(str::trim).filter(|git_ref| !git_ref.is_empty()).map(ToOwned::to_owned),
-        primary: repo.primary,
-    })
-}
-
-/// Build the `repos` list from a routing rule's `spec.repos` entry: a JSON array
-/// of `{url, git_ref?, name?, primary?}` objects. Entries without a non-empty
-/// `url` are skipped (a remote environment plugin can only clone from a url).
-fn repos_from_spec(spec: &BTreeMap<String, Value>) -> Vec<RepoRef> {
-    let Some(entries) = spec.get("repos").and_then(Value::as_array) else {
-        return Vec::new();
-    };
-    entries.iter().filter_map(repo_ref_from_value).collect()
-}
-
-/// Parse a single `{url, git_ref?, name?, primary?}` object into a [`RepoRef`].
-/// Returns `None` when the entry carries no non-empty `url`.
-fn repo_ref_from_value(value: &Value) -> Option<RepoRef> {
-    let url = value.get("url").and_then(Value::as_str).map(str::trim).filter(|url| !url.is_empty())?;
-    Some(RepoRef {
-        url: url.to_string(),
-        name: value
-            .get("name")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-            .map(ToOwned::to_owned),
-        git_ref: value
-            .get("git_ref")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|git_ref| !git_ref.is_empty())
-            .map(ToOwned::to_owned),
-        primary: value.get("primary").and_then(Value::as_bool).unwrap_or(false),
-    })
-}
-
-/// Start the phase inside the resolved non-local environment: resolve the
-/// plugin, build the harness command + spec, and hand the pipeline to a
-/// background thread that streams [`SessionEvent`]s into the returned
-/// [`SessionRun`] — the same handle shape `start_session` produces, so the
-/// runner's event loop is unchanged.
-pub(crate) fn start_environment_session(
+/// Resolve the workflow-run-level environment: the WorkflowDefinition's
+/// `environment:` (if any) plus the subject kind, honoring the
+/// `ANIMUS_ENVIRONMENT_EXEC` override and the `environment_routing:` table. A
+/// non-local resolution means the run prepares ONE shared node; `None` keeps the
+/// local per-phase path. Harness is left empty here — a workflow-level
+/// `environment:` override and kind-only routing rules do not depend on it.
+pub(crate) fn resolve_workflow_environment(
     project_root: &Path,
-    environment: &ResolvedEnvironment,
-    request: &SessionRequest,
-) -> Result<SessionRun> {
-    let environment_id = environment.id.as_str();
-    let client = EnvironmentClient::resolve(project_root, environment_id).map_err(|err| {
-        anyhow!(
-            "workflow phase is routed to environment '{environment_id}' but no usable environment plugin was resolved \
-             (the phase is NOT executed locally when an environment is requested): {err}"
-        )
-    })?;
-    let (command, stdin) = harness_command_for_request(project_root, request)?;
-    let mut spec = environment_spec_for_run(environment_id, environment.repos.clone(), request);
-    if let Some(overrides) = environment.spec_overrides.clone() {
-        apply_spec_overrides(&mut spec, overrides);
+    workflow_ref: &str,
+    subject_kind: Option<&str>,
+) -> Option<ResolvedEnvironment> {
+    // The `ANIMUS_ENVIRONMENT_EXEC` override short-circuits without needing the
+    // workflow's `environment:`, so only look it up for the config path.
+    let workflow_env = if std::env::var_os("ANIMUS_ENVIRONMENT_EXEC").is_some() {
+        None
+    } else {
+        let config = orchestrator_core::load_workflow_config_or_default(project_root).config;
+        crate::phase_executor::phase_environment_overrides(&config, workflow_ref, "").1
+    };
+    resolve_exec_environment(
+        project_root,
+        "",
+        PhaseRouting { subject_kind, phase_env: None, workflow_env: workflow_env.as_deref() },
+    )
+}
+
+/// A prepared, per-workflow-run environment: ONE resident host + ONE plugin
+/// process, shared across every phase. Prepared once at the start of the run and
+/// torn down once at the end (guaranteed via a [`Drop`] guard in
+/// [`workflow_execute`](crate::workflow_execute)).
+pub struct PreparedEnvironment {
+    backend: Arc<dyn EnvironmentExecBackend>,
+    handle: EnvironmentHandle,
+    id: String,
+    backend_label: String,
+    torn_down: AtomicBool,
+}
+
+impl PreparedEnvironment {
+    /// Resolve the environment plugin and prepare a BARE node for the whole run.
+    /// Blocking (the [`EnvironmentClient`] surface is blocking) — call via
+    /// [`Self::prepare_off_runtime`] from an async context.
+    pub(crate) fn prepare(project_root: &Path, environment: &ResolvedEnvironment) -> Result<Self> {
+        let environment_id = environment.id.as_str();
+        let client = EnvironmentClient::resolve(project_root, environment_id).map_err(|err| {
+            anyhow!(
+                "workflow run is routed to environment '{environment_id}' but no usable environment plugin was \
+                 resolved (the run is NOT executed locally when an environment is requested): {err}"
+            )
+        })?;
+        let backend_label = format!("environment:{}", client.plugin_name());
+        Self::prepare_with_backend(Arc::new(client), backend_label, environment)
     }
-    // Mirror the local path's default run cap: an un-timed env exec would
-    // otherwise be unbounded, so a hung provider command inside the environment
-    // would drain forever.
-    let timeout = Some(Duration::from_secs(request.timeout_secs.unwrap_or(DEFAULT_ENVIRONMENT_RUN_TIMEOUT_SECS)));
-    let backend_label = format!("environment:{}", client.plugin_name());
-    Ok(spawn_environment_run(Arc::new(client), spec, command, stdin, timeout, backend_label))
+
+    /// Prepare against an already-resolved backend (production wraps an
+    /// [`EnvironmentClient`]; tests inject a fake). Builds a BARE
+    /// [`EnvironmentSpec`] (no repos) and applies any routing-rule `spec`
+    /// overrides.
+    fn prepare_with_backend(
+        backend: Arc<dyn EnvironmentExecBackend>,
+        backend_label: String,
+        environment: &ResolvedEnvironment,
+    ) -> Result<Self> {
+        let mut spec = EnvironmentSpec {
+            kind: environment.id.clone(),
+            repos: Vec::new(),
+            image: None,
+            resources: None,
+            env: BTreeMap::new(),
+            metadata: Value::Null,
+        };
+        if let Some(overrides) = environment.spec_overrides.clone() {
+            apply_spec_overrides(&mut spec, overrides);
+        }
+        let handle =
+            backend.prepare(spec).map_err(|err| anyhow!("environment prepare failed for {backend_label}: {err:#}"))?;
+        Ok(Self { backend, handle, id: environment.id.clone(), backend_label, torn_down: AtomicBool::new(false) })
+    }
+
+    /// Prepare the node on a dedicated OS thread so the blocking
+    /// [`EnvironmentClient`] runs OFF the async runtime (its internal
+    /// `run_blocking` builds its own runtime when no handle is current), then
+    /// bridge the result back without stalling the caller's runtime worker.
+    pub(crate) async fn prepare_off_runtime(project_root: &Path, environment: &ResolvedEnvironment) -> Result<Self> {
+        let project_root = project_root.to_path_buf();
+        let environment = environment.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(Self::prepare(&project_root, &environment));
+        });
+        rx.await.map_err(|_| anyhow!("environment prepare thread terminated unexpectedly"))?
+    }
+
+    /// The resolved environment plugin id.
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Execute a phase's harness command INSIDE the held node — `exec_stream` on
+    /// the SAME pinned client + handle, with NO prepare and NO teardown (those
+    /// bracket the whole run). Returns a [`SessionRun`] whose event stream
+    /// mirrors the local provider path, so the caller's consumer is unchanged.
+    pub(crate) fn exec_session(&self, project_root: &Path, request: &SessionRequest) -> Result<SessionRun> {
+        let (command, stdin) = harness_command_for_request(project_root, request)?;
+        // Mirror the local path's default run cap: an un-timed env exec would
+        // otherwise be unbounded, so a hung provider command inside the
+        // environment would drain forever.
+        let timeout = Some(Duration::from_secs(request.timeout_secs.unwrap_or(DEFAULT_ENVIRONMENT_RUN_TIMEOUT_SECS)));
+        Ok(spawn_environment_exec(
+            self.backend.clone(),
+            self.handle.clone(),
+            command,
+            stdin,
+            timeout,
+            self.backend_label.clone(),
+        ))
+    }
+
+    /// Teardown the node ONCE (idempotent across the explicit end-of-run call and
+    /// the [`Drop`] backstop). Runs on a dedicated OS thread and joins it so the
+    /// blocking teardown RPC does not require the async runtime and cannot panic
+    /// from a nested runtime.
+    pub(crate) fn teardown(&self) {
+        if self.torn_down.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let backend = self.backend.clone();
+        let handle = self.handle.clone();
+        let backend_label = self.backend_label.clone();
+        let _ = std::thread::spawn(move || {
+            if let Err(err) = backend.teardown(&handle) {
+                eprintln!("warning: environment teardown failed for {backend_label} (handle {}): {err:#}", handle.id);
+            }
+        })
+        .join();
+    }
 }
 
 /// Merge a routing rule's opaque `spec` overrides into the compiled
 /// [`EnvironmentSpec`]: the wire-typed keys (`image`, `resources`, `env`) land
-/// on their typed fields; `repos` is already consumed into
-/// [`EnvironmentSpec::repos`] (skipped here); everything else is carried
-/// opaquely on `metadata`.
+/// on their typed fields; everything else is carried opaquely on `metadata`. The
+/// node is prepared BARE, so a rule's `repos` key is deliberately IGNORED (the
+/// workflow clones what it needs via a command phase) and never leaks onto
+/// `metadata`.
 fn apply_spec_overrides(spec: &mut EnvironmentSpec, overrides: BTreeMap<String, Value>) {
     let mut metadata = serde_json::Map::new();
     for (key, value) in overrides {
         match key.as_str() {
-            // Consumed into the typed `repos` field by `repos_from_spec`.
+            // Ignored: the per-run node is bare (no auto-clone).
             "repos" => {}
             "image" => spec.image = value.as_str().map(ToOwned::to_owned),
             "resources" => spec.resources = Some(value),
@@ -541,24 +576,6 @@ fn launch_program_args(launch: &Value) -> Option<(String, Vec<String>)> {
     Some((program.to_string(), args))
 }
 
-/// Build the [`EnvironmentSpec`] for a phase run. `repos` come from the matched
-/// routing rule (see the module docs); image/resources/metadata are left to the
-/// plugin's defaults unless a rule `spec` override sets them.
-fn environment_spec_for_run(environment_id: &str, repos: Vec<RepoRef>, request: &SessionRequest) -> EnvironmentSpec {
-    let mut env = BTreeMap::new();
-    for (key, value) in &request.env_vars {
-        env.insert(key.clone(), value.clone());
-    }
-    EnvironmentSpec {
-        kind: environment_id.to_string(),
-        repos,
-        image: None,
-        resources: None,
-        env,
-        metadata: Value::Null,
-    }
-}
-
 /// The prepare/exec/teardown surface the pipeline drives. Production wraps
 /// [`EnvironmentClient`]; tests inject a fake so the pipeline's event sequencing
 /// and teardown guarantees are exercised without a plugin binary.
@@ -613,14 +630,16 @@ impl EnvironmentExecBackend for EnvironmentClient {
     }
 }
 
-/// Spawn the environment pipeline on a dedicated OS thread (the
-/// [`EnvironmentClient`] surface is blocking) and return a [`SessionRun`] whose
-/// event stream mirrors the local provider path. Must be called from within a
-/// tokio runtime (the forwarder task bridges the pipeline's unbounded sends onto
-/// the bounded `SessionRun` channel).
-pub(crate) fn spawn_environment_run(
+/// Spawn the per-phase exec pipeline on a dedicated OS thread (the
+/// [`EnvironmentClient`] surface is blocking) against an ALREADY-PREPARED handle,
+/// returning a [`SessionRun`] whose event stream mirrors the local provider
+/// path. NO prepare and NO teardown happen here — those bracket the whole
+/// workflow run in [`PreparedEnvironment`]. Must be called from within a tokio
+/// runtime (the forwarder task bridges the pipeline's unbounded sends onto the
+/// bounded `SessionRun` channel).
+pub(crate) fn spawn_environment_exec(
     backend: Arc<dyn EnvironmentExecBackend>,
-    spec: EnvironmentSpec,
+    handle: EnvironmentHandle,
     command: HarnessCommand,
     stdin: Option<String>,
     timeout: Option<Duration>,
@@ -642,19 +661,20 @@ pub(crate) fn spawn_environment_run(
 
     let selected_backend = backend_label.clone();
     std::thread::spawn(move || {
-        run_environment_pipeline(backend.as_ref(), spec, command, stdin, timeout, &backend_label, &pipeline_tx);
+        run_environment_exec_pipeline(backend.as_ref(), &handle, command, stdin, timeout, &backend_label, &pipeline_tx);
     });
 
     SessionRun { session_id: None, events: events_rx, selected_backend, fallback_reason: None, pid: None }
 }
 
-/// The blocking prepare → exec_stream → teardown pipeline. Emits the same event
-/// grammar the provider path does: `Started`, stdout deltas as `TextDelta`,
-/// stderr deltas as recoverable `Error` frames, then a terminal `Finished` (or
-/// an unrecoverable `Error`). Teardown always runs once a handle exists.
-fn run_environment_pipeline(
+/// The blocking exec_stream pipeline against a prepared `handle`. Emits the same
+/// event grammar the provider path does: `Started`, stdout deltas as
+/// `TextDelta`, stderr deltas as recoverable `Error` frames, then a terminal
+/// `Finished` (or an unrecoverable `Error`). Teardown is NOT performed here (the
+/// node is shared across phases and torn down once per run).
+fn run_environment_exec_pipeline(
     backend: &dyn EnvironmentExecBackend,
-    spec: EnvironmentSpec,
+    handle: &EnvironmentHandle,
     command: HarnessCommand,
     stdin: Option<String>,
     timeout: Option<Duration>,
@@ -666,17 +686,6 @@ fn run_environment_pipeline(
     };
     send(SessionEvent::Started { backend: backend_label.to_string(), session_id: None, pid: None });
 
-    let handle = match backend.prepare(spec) {
-        Ok(handle) => handle,
-        Err(err) => {
-            send(SessionEvent::Error {
-                message: format!("environment prepare failed for {backend_label}: {err:#}"),
-                recoverable: false,
-            });
-            return;
-        }
-    };
-
     let stream_events = events.clone();
     let on_output = move |stream: ExecStream, text: &str| {
         let event = match stream {
@@ -686,13 +695,13 @@ fn run_environment_pipeline(
         let _ = stream_events.send(event);
     };
 
-    let result = match backend.exec_stream(&handle, command.clone(), stdin.clone(), timeout, &on_output) {
+    let result = match backend.exec_stream(handle, command.clone(), stdin.clone(), timeout, &on_output) {
         // A plugin without exec_stream support answers METHOD_NOT_SUPPORTED
         // before the command ever starts, so retrying with the buffered exec is
         // safe (no double-execution risk). The aggregated output is emitted
         // once, post-hoc — deltas were never streamed.
         Err(err) if is_method_not_supported(&err) => {
-            backend.exec(&handle, command, stdin, timeout).inspect(|response| {
+            backend.exec(handle, command, stdin, timeout).inspect(|response| {
                 if !response.stdout.is_empty() {
                     send(SessionEvent::FinalText { text: response.stdout.clone() });
                 }
@@ -703,15 +712,6 @@ fn run_environment_pipeline(
         }
         result => result,
     };
-
-    // Teardown regardless of exec outcome; a teardown failure is surfaced as a
-    // recoverable frame (the run's verdict is the exec result, not cleanup).
-    if let Err(err) = backend.teardown(&handle) {
-        send(SessionEvent::Error {
-            message: format!("environment teardown failed for {backend_label} (handle {}): {err:#}", handle.id),
-            recoverable: true,
-        });
-    }
 
     match result {
         Ok(response) if response.timed_out => send(SessionEvent::Error {
@@ -753,7 +753,7 @@ fn is_method_not_supported(err: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     use animus_plugin_protocol::RpcError;
@@ -805,14 +805,18 @@ mod tests {
         }
     }
 
-    /// The bare `ANIMUS_ENVIRONMENT_EXEC=<id>` override carries no repos, so the
-    /// adapted gate falls through to local rather than sending a local path.
+    /// The bare `ANIMUS_ENVIRONMENT_EXEC=<id>` override routes a non-local id as
+    /// a BARE node (no repos needed — the workflow clones via a command).
     #[test]
-    fn env_var_explicit_id_without_repos_falls_through_to_local() {
+    fn env_var_explicit_id_routes_a_bare_node() {
         let _lock = crate::test_env::scoped_state_serializer();
         let tmp = tempfile::tempdir().unwrap();
         let _gate = EnvVarGuard::set("ANIMUS_ENVIRONMENT_EXEC", Some("container"));
-        assert_eq!(resolve_exec_environment(tmp.path(), "claude", PhaseRouting::default()), None, "no repos -> local");
+        let resolved =
+            resolve_exec_environment(tmp.path(), "claude", PhaseRouting::default()).expect("non-local routes");
+        assert_eq!(resolved.id, "container");
+        assert!(resolved.spec_overrides.is_none(), "the bare env-var override carries no rule spec");
+        // A LOCAL id stays local even via the override.
         for local in ["local", "worktree", "Worktree", " local "] {
             let _gate = EnvVarGuard::set("ANIMUS_ENVIRONMENT_EXEC", Some(local));
             assert_eq!(
@@ -824,7 +828,7 @@ mod tests {
     }
 
     #[test]
-    fn config_routing_selects_the_environment_and_carries_repos() {
+    fn config_routing_selects_the_environment() {
         let _lock = crate::test_env::scoped_state_serializer();
         let _gate = EnvVarGuard::set("ANIMUS_ENVIRONMENT_EXEC", None);
         let tmp = tempfile::tempdir().unwrap();
@@ -838,55 +842,17 @@ environment_routing:
     - match:
         harness: codex
       environment: sandbox-env
-      spec:
-        repos:
-          - url: https://github.com/acme/app.git
-            git_ref: main
-            primary: true
 "#,
         )
         .unwrap();
         let _config_source_seam =
             orchestrator_config::workflow_config::config_source_client::install_yaml_config_source_base(&root);
 
+        // A non-local id routes a bare node — no repos required.
         let resolved = resolve_exec_environment(&root, "codex", PhaseRouting::default()).expect("rule routes");
         assert_eq!(resolved.id, "sandbox-env");
-        assert_eq!(resolved.repos.len(), 1);
-        assert_eq!(resolved.repos[0].url, "https://github.com/acme/app.git");
-        assert_eq!(resolved.repos[0].git_ref.as_deref(), Some("main"));
-        assert!(resolved.repos[0].primary);
         // Non-matching harness, no default -> local path.
         assert_eq!(resolve_exec_environment(&root, "claude", PhaseRouting::default()), None);
-    }
-
-    /// A routing rule that selects a non-local environment but declares NO repos
-    /// falls through to local — a remote plugin would reject a local path.
-    #[test]
-    fn config_routing_without_repos_falls_through_to_local() {
-        let _lock = crate::test_env::scoped_state_serializer();
-        let _gate = EnvVarGuard::set("ANIMUS_ENVIRONMENT_EXEC", None);
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
-        std::fs::create_dir_all(root.join(".animus")).unwrap();
-        std::fs::write(
-            root.join(".animus").join("workflows.yaml"),
-            r#"
-environment_routing:
-  rules:
-    - match:
-        harness: codex
-      environment: sandbox-env
-"#,
-        )
-        .unwrap();
-        let _config_source_seam =
-            orchestrator_config::workflow_config::config_source_client::install_yaml_config_source_base(&root);
-
-        assert_eq!(
-            resolve_exec_environment(&root, "codex", PhaseRouting::default()),
-            None,
-            "a rule with no repos must not route"
-        );
     }
 
     #[test]
@@ -915,88 +881,66 @@ environment_routing:
     }
 
     // -----------------------------------------------------------------
-    // Gate: phase/workflow `environment:` overrides + `workspace:` repos
+    // Gate: workflow-level `environment:` override (bare node)
     // -----------------------------------------------------------------
 
-    /// Write a config whose only routing input is a named `workspaces:` repo set
-    /// (`app-set` with two repos, plus an empty `empty-set`). Environment routing
-    /// then rides the phase/workflow `environment:` overrides passed via
-    /// [`PhaseRouting`], NOT an `environment_routing:` rule.
-    fn write_workspace_config(root: &Path) {
-        std::fs::create_dir_all(root.join(".animus")).unwrap();
-        std::fs::write(
-            root.join(".animus").join("workflows.yaml"),
-            r#"
-workspaces:
-  app-set:
-    repos:
-      - url: https://github.com/acme/app.git
-        name: app
-        git_ref: main
-        primary: true
-      - url: https://github.com/acme/lib.git
-  empty-set:
-    repos: []
-"#,
-        )
-        .unwrap();
-    }
-
-    /// A WorkflowDefinition-level `environment:` routes every phase: with no
-    /// routing rule, the workflow env id is resolved and the referenced
-    /// `workspace:` supplies the repos.
+    /// A WorkflowDefinition-level `environment:` routes the whole run to a BARE
+    /// node — no repos, no workspace (the workflow clones via a command phase).
     #[test]
-    fn workflow_level_environment_routes_with_workspace_repos() {
+    fn workflow_level_environment_routes_a_bare_node() {
         let _lock = crate::test_env::scoped_state_serializer();
         let _gate = EnvVarGuard::set("ANIMUS_ENVIRONMENT_EXEC", None);
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
-        write_workspace_config(&root);
-        let _config_source_seam =
-            orchestrator_config::workflow_config::config_source_client::install_yaml_config_source_base(&root);
-
-        let routing =
-            PhaseRouting { workflow_env: Some("railway-env-123"), workspace: Some("app-set"), ..Default::default() };
-        let resolved = resolve_exec_environment(&root, "claude", routing).expect("workflow env routes");
+        let resolved = resolve_exec_environment(
+            tmp.path(),
+            "claude",
+            PhaseRouting { workflow_env: Some("railway-env-123"), ..Default::default() },
+        )
+        .expect("workflow env routes");
         assert_eq!(resolved.id, "railway-env-123");
-        assert_eq!(resolved.repos.len(), 2, "the referenced workspace's repos populate the spec");
-        assert_eq!(resolved.repos[0].url, "https://github.com/acme/app.git");
-        assert!(resolved.repos[0].primary);
-        assert_eq!(resolved.repos[1].url, "https://github.com/acme/lib.git");
+        assert!(resolved.spec_overrides.is_none(), "a bare workflow-level env carries no rule spec");
     }
 
-    /// A phase-level `environment:` wins over the workflow-level one for that
-    /// phase (precedence: phase_env > rule > workflow_env > default).
+    /// A phase-level `environment:` wins over the workflow-level one (precedence:
+    /// phase_env > rule > workflow_env > default).
     #[test]
     fn phase_level_environment_overrides_the_workflow_environment() {
         let _lock = crate::test_env::scoped_state_serializer();
         let _gate = EnvVarGuard::set("ANIMUS_ENVIRONMENT_EXEC", None);
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
-        write_workspace_config(&root);
-        let _config_source_seam =
-            orchestrator_config::workflow_config::config_source_client::install_yaml_config_source_base(&root);
-
-        let routing = PhaseRouting {
-            phase_env: Some("phase-env"),
-            workflow_env: Some("workflow-env"),
-            workspace: Some("app-set"),
-            ..Default::default()
-        };
-        let resolved = resolve_exec_environment(&root, "claude", routing).expect("phase env wins");
-        assert_eq!(resolved.id, "phase-env", "phase-level environment overrides the workflow's");
-        assert_eq!(resolved.repos.len(), 2);
+        let resolved = resolve_exec_environment(
+            tmp.path(),
+            "claude",
+            PhaseRouting { phase_env: Some("phase-env"), workflow_env: Some("workflow-env"), ..Default::default() },
+        )
+        .expect("phase env wins");
+        assert_eq!(resolved.id, "phase-env");
     }
 
-    /// A phase-level `environment:` override wins BEFORE routing rules are
-    /// consulted, so a coincidental same-id rule must NOT lend its repos/spec to
-    /// the override. With no `workspace:`, the override then has no repos and
-    /// falls through to local — whereas the SAME rule DOES route when it (not a
-    /// phase override) is what selected the environment.
+    /// A LOCAL workflow-level `environment:` id keeps the local path.
     #[test]
-    fn phase_override_does_not_inherit_a_coincidental_rules_repos() {
+    fn workflow_level_local_environment_stays_local() {
         let _lock = crate::test_env::scoped_state_serializer();
         let _gate = EnvVarGuard::set("ANIMUS_ENVIRONMENT_EXEC", None);
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve_exec_environment(
+                tmp.path(),
+                "claude",
+                PhaseRouting { workflow_env: Some("local"), ..Default::default() }
+            ),
+            None
+        );
+    }
+
+    /// `resolve_workflow_environment` loads the compiled config and routes the
+    /// whole run — via a subject-kind routing rule or the `ANIMUS_ENVIRONMENT_EXEC`
+    /// override. (Reading a WorkflowDefinition's `environment:` field is covered
+    /// by `phase_executor`'s `phase_environment_overrides` unit test, which this
+    /// helper delegates to for the workflow-level override.)
+    #[test]
+    fn resolve_workflow_environment_routes_via_config_and_override() {
+        let _lock = crate::test_env::scoped_state_serializer();
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
         std::fs::create_dir_all(root.join(".animus")).unwrap();
@@ -1006,113 +950,39 @@ workspaces:
 environment_routing:
   rules:
     - match:
-        harness: claude
-      environment: sandbox-env
-      spec:
-        repos:
-          - url: https://github.com/acme/app.git
-            primary: true
+        kind: task
+      environment: railway-env
 "#,
         )
         .unwrap();
         let _config_source_seam =
             orchestrator_config::workflow_config::config_source_client::install_yaml_config_source_base(&root);
 
-        // Phase override to the SAME id, no workspace: the rule's repos must not
-        // be borrowed -> no repos -> local execution.
-        let routing = PhaseRouting { phase_env: Some("sandbox-env"), ..Default::default() };
+        {
+            let _gate = EnvVarGuard::set("ANIMUS_ENVIRONMENT_EXEC", None);
+            // A subject-kind rule routes the whole run to a bare node.
+            let resolved = resolve_workflow_environment(&root, "standard", Some("task")).expect("kind rule routes");
+            assert_eq!(resolved.id, "railway-env");
+            // A subject kind with no matching rule stays local.
+            assert_eq!(resolve_workflow_environment(&root, "standard", Some("blog")), None);
+        }
+
+        // The dev/test override forces a bare node regardless of config.
+        let _gate = EnvVarGuard::set("ANIMUS_ENVIRONMENT_EXEC", Some("container"));
         assert_eq!(
-            resolve_exec_environment(&root, "claude", routing),
-            None,
-            "a phase override must not inherit a same-id routing rule's repos"
-        );
-
-        // The very same rule DOES route when it is the selector (no phase override).
-        let resolved =
-            resolve_exec_environment(&root, "claude", PhaseRouting::default()).expect("the rule itself still routes");
-        assert_eq!(resolved.id, "sandbox-env");
-        assert_eq!(resolved.repos.len(), 1);
-    }
-
-    /// The `workspace:` repos flow all the way into the built `EnvironmentSpec`,
-    /// with no local path leaking into the repo list.
-    #[test]
-    fn workspace_repos_populate_the_environment_spec() {
-        let _lock = crate::test_env::scoped_state_serializer();
-        let _gate = EnvVarGuard::set("ANIMUS_ENVIRONMENT_EXEC", None);
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
-        write_workspace_config(&root);
-        let _config_source_seam =
-            orchestrator_config::workflow_config::config_source_client::install_yaml_config_source_base(&root);
-
-        let routing =
-            PhaseRouting { workflow_env: Some("railway-env"), workspace: Some("app-set"), ..Default::default() };
-        let resolved = resolve_exec_environment(&root, "claude", routing).expect("routes");
-        let spec = environment_spec_for_run(&resolved.id, resolved.repos.clone(), &sample_request("claude"));
-        assert_eq!(spec.repos.len(), 2);
-        assert_eq!(spec.repos[0].name.as_deref(), Some("app"));
-        assert_eq!(spec.repos[0].git_ref.as_deref(), Some("main"));
-        assert!(spec.repos[0].primary);
-        assert!(!spec.repos[1].primary, "primary defaults to false");
-        assert!(!spec.repos.iter().any(|repo| repo.url.starts_with('/')), "no local path leaks into repos");
-    }
-
-    /// A phase/workflow `environment:` that is non-local but has NO repos —
-    /// because the `workspace:` is missing/empty and no routing rule matches —
-    /// falls through to local rather than sending a local path a plugin rejects.
-    #[test]
-    fn non_local_environment_without_repos_falls_through_to_local() {
-        let _lock = crate::test_env::scoped_state_serializer();
-        let _gate = EnvVarGuard::set("ANIMUS_ENVIRONMENT_EXEC", None);
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
-        write_workspace_config(&root);
-        let _config_source_seam =
-            orchestrator_config::workflow_config::config_source_client::install_yaml_config_source_base(&root);
-
-        // No workspace ref at all -> no repos -> local.
-        assert_eq!(
-            resolve_exec_environment(
-                &root,
-                "claude",
-                PhaseRouting { workflow_env: Some("railway-env"), ..Default::default() }
-            ),
-            None,
-            "a non-local env with no workspace and no rule repos must not route"
-        );
-        // Unknown workspace name -> no repos -> local.
-        assert_eq!(
-            resolve_exec_environment(
-                &root,
-                "claude",
-                PhaseRouting {
-                    workflow_env: Some("railway-env"),
-                    workspace: Some("does-not-exist"),
-                    ..Default::default()
-                }
-            ),
-            None,
-            "an unresolvable workspace ref must not route"
-        );
-        // Defined-but-empty workspace -> no repos -> local.
-        assert_eq!(
-            resolve_exec_environment(
-                &root,
-                "claude",
-                PhaseRouting { workflow_env: Some("railway-env"), workspace: Some("empty-set"), ..Default::default() }
-            ),
-            None,
-            "an empty workspace repo set must not route"
+            resolve_workflow_environment(&root, "standard", Some("task")).map(|env| env.id),
+            Some("container".to_string())
         );
     }
 
     // -----------------------------------------------------------------
-    // Spec builder: repos from the routing rule
+    // Spec builder: bare node + routing-rule spec overrides
     // -----------------------------------------------------------------
 
+    /// The prepared node is BARE (no repos) but a routing rule's opaque `spec`
+    /// overrides (image / env / metadata) still ride the prepared EnvironmentSpec.
     #[test]
-    fn routing_rule_repos_and_spec_overrides_reach_the_environment_spec() {
+    fn prepared_spec_is_bare_but_carries_rule_spec_overrides() {
         let _lock = crate::test_env::scoped_state_serializer();
         let _gate = EnvVarGuard::set("ANIMUS_ENVIRONMENT_EXEC", None);
         let tmp = tempfile::tempdir().unwrap();
@@ -1133,10 +1003,6 @@ environment_routing:
         network: none
         repos:
           - url: https://github.com/acme/app.git
-            name: app
-            git_ref: feature/x
-            primary: true
-          - url: https://github.com/acme/lib.git
 "#,
         )
         .unwrap();
@@ -1146,40 +1012,23 @@ environment_routing:
         let resolved = resolve_exec_environment(&root, "claude", PhaseRouting::default()).expect("rule routes");
         assert_eq!(resolved.id, "container-env");
 
-        let mut spec = environment_spec_for_run(&resolved.id, resolved.repos.clone(), &sample_request("claude"));
-        apply_spec_overrides(&mut spec, resolved.spec_overrides.clone().expect("rule spec carried"));
+        let backend = Arc::new(FakeBackend::new());
+        let prepared = PreparedEnvironment::prepare_with_backend(
+            backend.clone(),
+            "environment:container-env".to_string(),
+            &resolved,
+        )
+        .expect("prepare succeeds");
+        assert_eq!(prepared.id(), "container-env");
 
-        // Repos come from the RULE, not a local project path.
-        assert_eq!(spec.repos.len(), 2, "both rule repos reach the spec");
-        assert_eq!(spec.repos[0].url, "https://github.com/acme/app.git");
-        assert_eq!(spec.repos[0].name.as_deref(), Some("app"));
-        assert_eq!(spec.repos[0].git_ref.as_deref(), Some("feature/x"));
-        assert!(spec.repos[0].primary);
-        assert_eq!(spec.repos[1].url, "https://github.com/acme/lib.git");
-        assert!(!spec.repos[1].primary, "primary defaults to false");
-        assert!(!spec.repos.iter().any(|repo| repo.url.starts_with('/')), "no local path leaks into repos");
-
+        let spec = backend.last_spec.lock().unwrap().clone().expect("spec captured on prepare");
+        // BARE node: the rule's `repos` key is NOT materialized onto the spec.
+        assert!(spec.repos.is_empty(), "the prepared node carries no repos");
+        assert!(spec.metadata.pointer("/repos").is_none(), "repos must not leak onto metadata");
         // The rest of the rule spec still lands on its typed / opaque fields.
         assert_eq!(spec.image.as_deref(), Some("acme/dev:latest"));
         assert_eq!(spec.env.get("IN_CONTAINER").map(String::as_str), Some("1"));
         assert_eq!(spec.metadata.pointer("/network").and_then(Value::as_str), Some("none"));
-        // `repos` was consumed into the typed field, not echoed onto metadata.
-        assert!(spec.metadata.pointer("/repos").is_none(), "repos must not ride metadata opaquely");
-    }
-
-    #[test]
-    fn repo_ref_from_value_skips_entries_without_a_url() {
-        let spec: BTreeMap<String, Value> = serde_json::from_value(serde_json::json!({
-            "repos": [
-                { "git_ref": "main" },
-                { "url": "  " },
-                { "url": "https://github.com/acme/app.git" }
-            ]
-        }))
-        .unwrap();
-        let repos = repos_from_spec(&spec);
-        assert_eq!(repos.len(), 1, "only the entry with a non-empty url survives");
-        assert_eq!(repos[0].url, "https://github.com/acme/app.git");
     }
 
     // -----------------------------------------------------------------
@@ -1385,8 +1234,11 @@ environment_routing:
         prepare_result: Mutex<Option<Result<EnvironmentHandle>>>,
         exec_stream_outcome: Mutex<Option<StreamOutcome>>,
         exec_result: Mutex<Option<Result<ExecResponse>>>,
+        prepare_calls: AtomicUsize,
         exec_calls: AtomicUsize,
-        torn_down: AtomicBool,
+        exec_stream_calls: AtomicUsize,
+        teardown_calls: AtomicUsize,
+        last_spec: Mutex<Option<EnvironmentSpec>>,
         last_command: Mutex<Option<HarnessCommand>>,
         last_stdin: Mutex<Option<String>>,
     }
@@ -1399,11 +1251,14 @@ environment_routing:
     impl FakeBackend {
         fn new() -> Self {
             Self {
-                prepare_result: Mutex::new(Some(Ok(sample_handle()))),
+                prepare_result: Mutex::new(None),
                 exec_stream_outcome: Mutex::new(None),
                 exec_result: Mutex::new(None),
+                prepare_calls: AtomicUsize::new(0),
                 exec_calls: AtomicUsize::new(0),
-                torn_down: AtomicBool::new(false),
+                exec_stream_calls: AtomicUsize::new(0),
+                teardown_calls: AtomicUsize::new(0),
+                last_spec: Mutex::new(None),
                 last_command: Mutex::new(None),
                 last_stdin: Mutex::new(None),
             }
@@ -1419,8 +1274,13 @@ environment_routing:
     }
 
     impl EnvironmentExecBackend for FakeBackend {
-        fn prepare(&self, _spec: EnvironmentSpec) -> Result<EnvironmentHandle> {
-            self.prepare_result.lock().unwrap().take().expect("prepare stubbed")
+        fn prepare(&self, spec: EnvironmentSpec) -> Result<EnvironmentHandle> {
+            self.prepare_calls.fetch_add(1, Ordering::SeqCst);
+            *self.last_spec.lock().unwrap() = Some(spec);
+            // Default to a fresh handle so a `PreparedEnvironment` can be built
+            // without stubbing; an explicit `prepare_result` (e.g. a failure)
+            // wins when set.
+            self.prepare_result.lock().unwrap().take().unwrap_or_else(|| Ok(sample_handle()))
         }
 
         fn exec_stream(
@@ -1431,16 +1291,20 @@ environment_routing:
             _timeout: Option<Duration>,
             on_output: &(dyn Fn(ExecStream, &str) + Send + Sync),
         ) -> Result<ExecResponse> {
+            self.exec_stream_calls.fetch_add(1, Ordering::SeqCst);
             *self.last_command.lock().unwrap() = Some(command);
             *self.last_stdin.lock().unwrap() = stdin;
-            match self.exec_stream_outcome.lock().unwrap().take().expect("exec_stream stubbed") {
-                StreamOutcome::Deltas(deltas, result) => {
+            // Default to a clean exit-0 stream when unstubbed, so a multi-phase
+            // exec test does not have to re-stub before every call.
+            match self.exec_stream_outcome.lock().unwrap().take() {
+                Some(StreamOutcome::Deltas(deltas, result)) => {
                     for (stream, text) in deltas {
                         on_output(stream, &text);
                     }
                     result
                 }
-                StreamOutcome::Fail(err) => Err(err),
+                Some(StreamOutcome::Fail(err)) => Err(err),
+                None => Ok(ok_response(0)),
             }
         }
 
@@ -1456,7 +1320,7 @@ environment_routing:
         }
 
         fn teardown(&self, _handle: &EnvironmentHandle) -> Result<()> {
-            self.torn_down.store(true, Ordering::SeqCst);
+            self.teardown_calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
     }
@@ -1474,17 +1338,6 @@ environment_routing:
         events
     }
 
-    fn spec_for_test() -> EnvironmentSpec {
-        EnvironmentSpec {
-            kind: "container".to_string(),
-            repos: Vec::new(),
-            image: None,
-            resources: None,
-            env: BTreeMap::new(),
-            metadata: Value::Null,
-        }
-    }
-
     fn command_for_test() -> HarnessCommand {
         HarnessCommand {
             program: "claude".to_string(),
@@ -1494,17 +1347,22 @@ environment_routing:
         }
     }
 
+    /// A `ResolvedEnvironment` for a bare non-local node.
+    fn bare_env(id: &str) -> ResolvedEnvironment {
+        ResolvedEnvironment { id: id.to_string(), spec_overrides: None }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn env_routed_run_streams_deltas_through_the_session_channel_and_tears_down() {
+    async fn env_exec_streams_deltas_through_the_session_channel() {
         let backend = Arc::new(FakeBackend::new());
         *backend.exec_stream_outcome.lock().unwrap() = Some(StreamOutcome::Deltas(
             vec![(ExecStream::Stdout, "out-1".to_string()), (ExecStream::Stderr, "err-1".to_string())],
             Ok(ok_response(7)),
         ));
 
-        let run = spawn_environment_run(
+        let run = spawn_environment_exec(
             backend.clone(),
-            spec_for_test(),
+            sample_handle(),
             command_for_test(),
             None,
             None,
@@ -1531,44 +1389,70 @@ environment_routing:
             matches!(events.last(), Some(SessionEvent::Finished { exit_code: Some(7) })),
             "terminal frame carries the exec exit code: {events:?}"
         );
-        assert!(backend.torn_down.load(Ordering::SeqCst), "teardown runs after a successful exec");
+        // The per-phase exec pipeline NEVER prepares or tears down — those bracket
+        // the whole run in `PreparedEnvironment`.
+        assert_eq!(backend.prepare_calls.load(Ordering::SeqCst), 0, "exec pipeline does not prepare");
+        assert_eq!(backend.teardown_calls.load(Ordering::SeqCst), 0, "exec pipeline does not tear down");
         let command = backend.last_command.lock().unwrap().clone().expect("command routed to the backend");
         assert_eq!(command.program, "claude", "the HarnessCommand reaches EnvironmentExecBackend::exec_stream");
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn prepare_failure_fails_the_run_without_executing_locally() {
+    /// `PreparedEnvironment::prepare` propagates a `prepare` failure as an error —
+    /// the run is never silently executed locally.
+    #[test]
+    fn prepare_failure_is_an_error_never_a_silent_local_run() {
         let backend = Arc::new(FakeBackend::new());
         *backend.prepare_result.lock().unwrap() = Some(Err(anyhow!("no docker daemon")));
-
-        let run = spawn_environment_run(
+        let err = match PreparedEnvironment::prepare_with_backend(
             backend.clone(),
-            spec_for_test(),
-            command_for_test(),
-            None,
-            None,
             "environment:container".to_string(),
-        );
-        let events = drain(run).await;
-        assert!(
-            matches!(
-                events.last(),
-                Some(SessionEvent::Error { message, recoverable: false }) if message.contains("prepare failed")
-            ),
-            "prepare failure is a terminal error, never a silent local run: {events:?}"
-        );
+            &bare_env("container"),
+        ) {
+            Ok(_) => panic!("prepare failure must surface as an error"),
+            Err(err) => err,
+        };
+        assert!(format!("{err:#}").contains("prepare failed"), "error names the failed prepare: {err:#}");
         assert_eq!(backend.exec_calls.load(Ordering::SeqCst), 0, "nothing executed after a failed prepare");
-        assert!(!backend.torn_down.load(Ordering::SeqCst), "no handle -> no teardown");
+        assert_eq!(backend.teardown_calls.load(Ordering::SeqCst), 0, "no handle -> no teardown");
+    }
+
+    /// The per-workflow node is prepared ONCE, shared across every phase's exec,
+    /// and torn down ONCE (idempotent across the explicit call + Drop backstop).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn per_workflow_node_prepares_once_execs_many_and_tears_down_once() {
+        let backend = Arc::new(FakeBackend::new());
+        let prepared = PreparedEnvironment::prepare_with_backend(
+            backend.clone(),
+            "environment:container".to_string(),
+            &bare_env("container"),
+        )
+        .expect("prepare succeeds");
+        assert_eq!(backend.prepare_calls.load(Ordering::SeqCst), 1, "prepared exactly once");
+
+        // Two phases exec inside the SAME held node (default clean exit-0 stream).
+        for _ in 0..2 {
+            let run = prepared.exec_session(Path::new("."), &sample_request("claude")).expect("exec builds");
+            let events = drain(run).await;
+            assert!(matches!(events.last(), Some(SessionEvent::Finished { exit_code: Some(0) })), "events: {events:?}");
+        }
+        assert_eq!(backend.exec_stream_calls.load(Ordering::SeqCst), 2, "both phases exec on the shared handle");
+        assert_eq!(backend.prepare_calls.load(Ordering::SeqCst), 1, "no re-prepare between phases");
+        assert_eq!(backend.teardown_calls.load(Ordering::SeqCst), 0, "not torn down mid-run");
+
+        // Teardown twice -> the backend is disposed exactly once.
+        prepared.teardown();
+        prepared.teardown();
+        assert_eq!(backend.teardown_calls.load(Ordering::SeqCst), 1, "torn down exactly once (idempotent)");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn exec_failure_still_tears_down_and_fails_the_run() {
+    async fn exec_failure_fails_the_run() {
         let backend = Arc::new(FakeBackend::new());
         *backend.exec_stream_outcome.lock().unwrap() = Some(StreamOutcome::Fail(anyhow!("plugin died")));
 
-        let run = spawn_environment_run(
+        let run = spawn_environment_exec(
             backend.clone(),
-            spec_for_test(),
+            sample_handle(),
             command_for_test(),
             None,
             None,
@@ -1582,7 +1466,6 @@ environment_routing:
             ),
             "exec failure is terminal: {events:?}"
         );
-        assert!(backend.torn_down.load(Ordering::SeqCst), "teardown still runs after a failed exec");
         assert_eq!(backend.exec_calls.load(Ordering::SeqCst), 0, "a non-METHOD_NOT_SUPPORTED failure is not retried");
     }
 
@@ -1602,9 +1485,9 @@ environment_routing:
             timed_out: false,
         }));
 
-        let run = spawn_environment_run(
+        let run = spawn_environment_exec(
             backend.clone(),
-            spec_for_test(),
+            sample_handle(),
             command_for_test(),
             None,
             None,
@@ -1623,7 +1506,6 @@ environment_routing:
             "aggregated stderr emitted as a recoverable frame: {events:?}"
         );
         assert!(matches!(events.last(), Some(SessionEvent::Finished { exit_code: Some(0) })), "events: {events:?}");
-        assert!(backend.torn_down.load(Ordering::SeqCst));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1634,9 +1516,9 @@ environment_routing:
             Ok(ExecResponse { exit_code: None, stdout: String::new(), stderr: String::new(), timed_out: false }),
         ));
 
-        let run = spawn_environment_run(
+        let run = spawn_environment_exec(
             backend.clone(),
-            spec_for_test(),
+            sample_handle(),
             command_for_test(),
             None,
             None,
@@ -1650,7 +1532,6 @@ environment_routing:
             ),
             "a signal-killed command must not be reported as success: {events:?}"
         );
-        assert!(backend.torn_down.load(Ordering::SeqCst));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1661,9 +1542,9 @@ environment_routing:
             Ok(ExecResponse { exit_code: None, stdout: String::new(), stderr: String::new(), timed_out: true }),
         ));
 
-        let run = spawn_environment_run(
+        let run = spawn_environment_exec(
             backend.clone(),
-            spec_for_test(),
+            sample_handle(),
             command_for_test(),
             None,
             Some(Duration::from_secs(5)),
@@ -1677,6 +1558,5 @@ environment_routing:
             ),
             "timeout is terminal: {events:?}"
         );
-        assert!(backend.torn_down.load(Ordering::SeqCst));
     }
 }

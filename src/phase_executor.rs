@@ -138,6 +138,9 @@ impl orchestrator_core::PhaseExecutor for CliPhaseExecutor {
             // The `orchestrator_core::PhaseExecutor` trait carries no actor;
             // this entrypoint is system-initiated.
             actor: None,
+            // The direct `PhaseExecutor` trait path runs one phase in isolation
+            // with no per-workflow environment lifecycle.
+            held_environment: None,
         })
         .await;
 
@@ -709,7 +712,7 @@ fn extract_token_usage(metadata: &Value) -> Option<TokenUsage> {
 /// override is read from its rich [`WorkflowPhaseEntry`] entry (`id == phase_id`).
 /// Any of the three is `None` when unset, which leaves the routing-table path
 /// unchanged.
-fn phase_environment_overrides(
+pub(crate) fn phase_environment_overrides(
     config: &orchestrator_config::workflow_config::WorkflowConfig,
     workflow_ref: &str,
     phase_id: &str,
@@ -745,7 +748,13 @@ pub async fn run_workflow_phase_attempt(
     subject_kind: Option<&str>,
     request: &AgentRunRequest,
     actor: Option<&Actor>,
+    held_environment: Option<&crate::phase_environment::PreparedEnvironment>,
 ) -> Result<PhaseExecutionOutcome> {
+    // REQUIREMENT-048: environment routing is resolved ONCE per workflow run and
+    // the prepared node is threaded in as `held_environment`. `workflow_ref` /
+    // `subject_kind` are retained for logging + signature stability, but the
+    // per-phase env resolution that used them was lifted to `workflow_execute`.
+    let _ = (workflow_ref, subject_kind);
     let ctx = RuntimeConfigContext::load(project_root);
     let parse_commit_message = phase_requires_commit_message_with_ctx(&ctx, phase_id);
 
@@ -847,46 +856,27 @@ pub async fn run_workflow_phase_attempt(
     // the backend's `SessionEvent` stream into the same `AgentRunEvent`
     // consumer (`process_phase_event_stream`) the socket path used.
     let session_request = session_request_from_agent_request(project_root, request, actor);
-    // REQUIREMENT-048 Phase B: when this phase's harness resolves to a non-local
-    // `environment` plugin (a container / remote sandbox), prepare + exec the
-    // harness command INSIDE that environment instead of spawning it on the
-    // host. The environment path yields a `SessionRun` with the identical
+    // REQUIREMENT-048: when the workflow run routes to a non-local `environment`
+    // plugin, ONE bare node is prepared per run in `workflow_execute` and threaded
+    // in as `held_environment`. Each phase execs its harness command INSIDE that
+    // held node (`exec_stream` on the SAME pinned client + handle) instead of
+    // spawning it on the host — so a clone done in one phase is visible to the
+    // next. The environment path yields a `SessionRun` with the identical
     // `SessionEvent` stream shape, so the translator + `process_phase_event_stream`
-    // consumer below are unchanged. `None` (no routing, a local id, or a rule
-    // with no repos) keeps the pre-existing local `start_session` path
-    // byte-for-byte — non-env workflows are 100% unaffected. Both branches are
+    // consumer below are unchanged. `None` (a local workflow) keeps the
+    // pre-existing local `start_session` path byte-for-byte. Both branches are
     // normalized to `Result<SessionRun, String>` so the dispatch-failure block
     // (checkpoint + retryable error) stays a single arm.
-    //
-    // Resolve the phase/workflow-level `environment:` + `workspace:` overrides
-    // from the compiled workflow config so a WorkflowDefinition `environment:`
-    // routes all its phases, a PhaseDefinition `environment:` wins for its phase,
-    // and the referenced `workspace:` supplies the repos. `None`/empty leaves the
-    // routing-table path unchanged.
-    let (phase_env, workflow_env, phase_workspace) =
-        phase_environment_overrides(&ctx.workflow_config.config, workflow_ref, phase_id);
-    let subject_kind = subject_kind.map(str::trim).filter(|kind| !kind.is_empty());
-    let phase_routing = crate::phase_environment::PhaseRouting {
-        subject_kind,
-        phase_env: phase_env.as_deref(),
-        workflow_env: workflow_env.as_deref(),
-        workspace: phase_workspace.as_deref(),
-    };
-    let start_result: std::result::Result<SessionRun, String> = match crate::phase_environment::resolve_exec_environment(
-        Path::new(project_root),
-        session_request.tool.as_str(),
-        phase_routing,
-    ) {
+    let start_result: std::result::Result<SessionRun, String> = match held_environment {
         Some(environment) => {
             info!(
                 workflow_id = %workflow_id,
                 phase_id = %phase_id,
                 run_id = %request.run_id.0,
-                environment = %environment.id,
-                "Routing workflow phase execution through environment plugin"
+                environment = %environment.id(),
+                "Executing workflow phase inside the per-run environment node"
             );
-            crate::phase_environment::start_environment_session(Path::new(project_root), &environment, &session_request)
-                .map_err(|err| err.to_string())
+            environment.exec_session(Path::new(project_root), &session_request).map_err(|err| err.to_string())
         }
         None => SessionBackendResolver::with_plugin_discovery(Path::new(project_root))
             .start_session(session_request)
@@ -1687,6 +1677,10 @@ struct PhaseAgentParams<'a> {
     /// Transport-asserted caller identity relayed verbatim into the phase's
     /// `SessionRequest`. `None` for system-initiated runs.
     actor: Option<&'a Actor>,
+    /// The per-workflow-run environment node (REQUIREMENT-048), prepared once in
+    /// `workflow_execute` and shared across every phase. `None` for local
+    /// workflows (the phase spawns its harness on the host).
+    held_environment: Option<&'a crate::phase_environment::PreparedEnvironment>,
 }
 
 struct AgentPhaseRunOutcome {
@@ -2182,6 +2176,7 @@ async fn run_workflow_phase_with_agent(params: PhaseAgentParams<'_>) -> Result<A
                     subject_kind_arg,
                     &request,
                     actor,
+                    params.held_environment,
                 )
                 .await
                 {
@@ -2449,6 +2444,12 @@ pub struct PhaseRunParams<'a> {
     /// the stdio command / endpoint / transport per call. When `None`,
     /// callers fall back to `McpRuntimeConfig::default()`.
     pub mcp_config: Option<&'a protocol::McpRuntimeConfig>,
+    /// The per-workflow-run environment node (REQUIREMENT-048), prepared once by
+    /// `workflow_execute` and shared across every phase of the run. `None` for a
+    /// local workflow (each phase spawns its harness on the host). Threaded
+    /// through to [`run_workflow_phase_attempt`], where an agent phase execs
+    /// inside it instead of starting a local session.
+    pub held_environment: Option<&'a crate::phase_environment::PreparedEnvironment>,
 }
 
 pub async fn run_workflow_phase(params: &PhaseRunParams<'_>) -> Result<PhaseRunResult> {
@@ -2617,6 +2618,7 @@ async fn run_workflow_phase_inner(params: &PhaseRunParams<'_>) -> Result<PhaseRu
                 phase_timeout_secs: params.phase_timeout_secs,
                 mcp_config: params.mcp_config,
                 actor: params.actor,
+                held_environment: params.held_environment,
             })
             .await?;
             metadata.selected_tool = agent_result.selected_tool.clone();
@@ -2730,6 +2732,9 @@ async fn run_workflow_phase_inner(params: &PhaseRunParams<'_>) -> Result<PhaseRu
                 pipeline_vars,
                 dispatch_input,
                 schedule_input,
+                // Populated inside `run_workflow_phase_with_command` from the raw
+                // `subject/get` record (the upstream context has no subject data).
+                custom_fields: None,
             };
 
             let command_result = run_workflow_phase_with_command(&command_context, &merged_runtime, command).await?;
@@ -3991,6 +3996,7 @@ mod tests {
                 "impl",
                 None,
                 &request,
+                None,
                 None,
             )
             .await;
