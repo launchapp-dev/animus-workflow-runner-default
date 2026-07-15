@@ -454,8 +454,16 @@ pub async fn handle_workflow_run_phase(request: WorkflowPhaseRunRequest) -> Resu
     // teardown — the daemon owns the lifecycle). Absent the broker env vars this
     // stays `None` (the byte-for-byte local path). A broker acquire failure fails
     // the phase and NEVER falls back to an owned prepare.
+    // The run's target repo (the subject's `git_repo` custom field — the SAME
+    // value a command phase renders as `{{git_repo}}`) rides the acquire spec's
+    // `metadata.github_repo` so the environment plugin repo-scopes the minted
+    // GitHub App installation token to THAT repo. The broker single-flights the
+    // node per run, so this matters on the run's FIRST phase acquire; a bare run
+    // without `git_repo` leaves the metadata untouched.
+    let subject_git_repo =
+        crate::phase_command::subject_git_repo(&project_root, "", &request.subject_id).await;
     let brokered_environment: Option<std::sync::Arc<crate::phase_environment::BrokeredEnvironment>> =
-        match crate::phase_environment::BrokeredEnvironment::acquire_from_env().await {
+        match crate::phase_environment::BrokeredEnvironment::acquire_from_env(subject_git_repo).await {
             Some(result) => Some(std::sync::Arc::new(result.with_context(|| {
                 format!("failed to acquire brokered environment for phase '{}'", request.phase_id)
             })?)),

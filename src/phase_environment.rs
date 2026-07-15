@@ -305,7 +305,11 @@ impl PreparedEnvironment {
     /// Resolve the environment plugin and prepare a BARE node for the whole run.
     /// Blocking (the [`EnvironmentClient`] surface is blocking) — call via
     /// [`Self::prepare_off_runtime`] from an async context.
-    pub(crate) fn prepare(project_root: &Path, environment: &ResolvedEnvironment) -> Result<Self> {
+    pub(crate) fn prepare(
+        project_root: &Path,
+        environment: &ResolvedEnvironment,
+        github_repo: Option<&str>,
+    ) -> Result<Self> {
         let environment_id = environment.id.as_str();
         let client = EnvironmentClient::resolve(project_root, environment_id).map_err(|err| {
             anyhow!(
@@ -314,7 +318,7 @@ impl PreparedEnvironment {
             )
         })?;
         let backend_label = format!("environment:{}", client.plugin_name());
-        Self::prepare_with_backend(Arc::new(client), backend_label, environment)
+        Self::prepare_with_backend(Arc::new(client), backend_label, environment, github_repo)
     }
 
     /// Prepare against an already-resolved backend (production wraps an
@@ -325,6 +329,7 @@ impl PreparedEnvironment {
         backend: Arc<dyn EnvironmentExecBackend>,
         backend_label: String,
         environment: &ResolvedEnvironment,
+        github_repo: Option<&str>,
     ) -> Result<Self> {
         let mut spec = EnvironmentSpec {
             kind: environment.id.clone(),
@@ -337,6 +342,9 @@ impl PreparedEnvironment {
         if let Some(overrides) = environment.spec_overrides.clone() {
             apply_spec_overrides(&mut spec, overrides);
         }
+        // Repo-scope the node's GitHub App token: merged AFTER the routing-rule
+        // overrides so it lands on (and preserves) any metadata they set.
+        merge_github_repo_metadata(&mut spec, github_repo);
         let handle =
             backend.prepare(spec).map_err(|err| anyhow!("environment prepare failed for {backend_label}: {err:#}"))?;
         Ok(Self {
@@ -360,7 +368,11 @@ impl PreparedEnvironment {
     /// runtime cannot be created from within another runtime's worker), then the
     /// idle runtime — whose own worker threads keep the driver parked and live —
     /// is moved back to the async caller and stored on the struct.
-    pub(crate) async fn prepare_off_runtime(project_root: &Path, environment: &ResolvedEnvironment) -> Result<Self> {
+    pub(crate) async fn prepare_off_runtime(
+        project_root: &Path,
+        environment: &ResolvedEnvironment,
+        github_repo: Option<String>,
+    ) -> Result<Self> {
         let project_root = project_root.to_path_buf();
         let environment = environment.clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -373,7 +385,8 @@ impl PreparedEnvironment {
                     .context("building dedicated runtime for the environment host")?;
                 // Lease + prepare INSIDE this runtime so the host's I/O driver
                 // binds here (not to a per-call throwaway that would die on return).
-                let mut prepared = runtime.block_on(async { Self::prepare(&project_root, &environment) })?;
+                let mut prepared =
+                    runtime.block_on(async { Self::prepare(&project_root, &environment, github_repo.as_deref()) })?;
                 prepared.runtime = Some(runtime);
                 Ok::<_, anyhow::Error>(prepared)
             })();
@@ -484,6 +497,27 @@ impl HeldEnvironment for PreparedEnvironment {
             .map_err(|_| anyhow!("environment exec_command thread panicked"))?
             .map_err(|err| anyhow!("environment exec_command failed in {backend_label}: {err:#}"))?;
         Ok(response.into())
+    }
+}
+
+/// Merge the run's target repo into the [`EnvironmentSpec`]'s `metadata` as
+/// `github_repo`, so the environment plugin resolves the GitHub App INSTALLATION
+/// for THAT repo (`GET /repos/{owner}/{repo}/installation`) and scopes the minted
+/// installation token to it — instead of falling back to the first of possibly
+/// several org installations (which mints a token for the WRONG org and 403s on
+/// push). The repo is the subject's `git_repo` custom field (the same value the
+/// harness renders as `{{git_repo}}`). Any existing `metadata` object is
+/// PRESERVED (`github_repo` is merged in, not clobbered); a `None`/empty repo
+/// leaves `metadata` untouched (a bare non-coding run must not invent a repo).
+fn merge_github_repo_metadata(spec: &mut EnvironmentSpec, github_repo: Option<&str>) {
+    let Some(repo) = github_repo.map(str::trim).filter(|repo| !repo.is_empty()) else {
+        return;
+    };
+    if !matches!(spec.metadata, Value::Object(_)) {
+        spec.metadata = Value::Object(serde_json::Map::new());
+    }
+    if let Value::Object(map) = &mut spec.metadata {
+        map.insert("github_repo".to_string(), Value::String(repo.to_string()));
     }
 }
 
@@ -1074,17 +1108,19 @@ impl BrokeredEnvironment {
     ///
     /// The blocking socket dial runs on a blocking thread so it never stalls the
     /// async runtime's worker.
-    pub(crate) async fn acquire_from_env() -> Option<Result<Self>> {
+    pub(crate) async fn acquire_from_env(github_repo: Option<String>) -> Option<Result<Self>> {
         let env = broker_env()?;
-        let joined = tokio::task::spawn_blocking(move || Self::acquire(env)).await;
+        let joined = tokio::task::spawn_blocking(move || Self::acquire(env, github_repo.as_deref())).await;
         Some(joined.map_err(|err| anyhow!("environment broker acquire task panicked: {err}")).and_then(|res| res))
     }
 
     /// Dial the broker socket and perform the `acquire` handshake.
-    fn acquire(env: BrokerEnv) -> Result<Self> {
+    fn acquire(env: BrokerEnv, github_repo: Option<&str>) -> Result<Self> {
         // Bare spec (no repos), carrying `metadata.animus_run_id` so the plugin
-        // names the node deterministically per run.
-        let spec = EnvironmentSpec {
+        // names the node deterministically per run — plus `github_repo` (when the
+        // subject carries one) so the plugin repo-scopes the minted GitHub App
+        // installation token to the run's target repo.
+        let mut spec = EnvironmentSpec {
             kind: env.environment_id.clone(),
             repos: Vec::new(),
             image: None,
@@ -1092,6 +1128,7 @@ impl BrokeredEnvironment {
             env: BTreeMap::new(),
             metadata: serde_json::json!({ "animus_run_id": env.run_id }),
         };
+        merge_github_repo_metadata(&mut spec, github_repo);
         let request = AcquireRequest {
             op: "acquire",
             token: &env.token,
@@ -1606,6 +1643,52 @@ environment_routing:
     /// The prepared node is BARE (no repos) but a routing rule's opaque `spec`
     /// overrides (image / env / metadata) still ride the prepared EnvironmentSpec.
     #[test]
+    fn merge_github_repo_metadata_scopes_the_token_and_preserves_existing_metadata() {
+        let mut spec = EnvironmentSpec {
+            kind: "railway".to_string(),
+            repos: Vec::new(),
+            image: None,
+            resources: None,
+            env: BTreeMap::new(),
+            metadata: Value::Null,
+        };
+
+        // Null metadata -> a fresh object carrying only github_repo.
+        merge_github_repo_metadata(&mut spec, Some("launchapp-dev/animus-cli"));
+        assert_eq!(
+            spec.metadata.pointer("/github_repo").and_then(Value::as_str),
+            Some("launchapp-dev/animus-cli"),
+            "github_repo lands on metadata so the plugin repo-scopes the token"
+        );
+
+        // Existing metadata keys (e.g. the broker's animus_run_id) are PRESERVED.
+        spec.metadata = serde_json::json!({ "animus_run_id": "RUN-1", "network": "none" });
+        merge_github_repo_metadata(&mut spec, Some("  launchapp-dev/animus-cli  "));
+        assert_eq!(spec.metadata.pointer("/animus_run_id").and_then(Value::as_str), Some("RUN-1"));
+        assert_eq!(spec.metadata.pointer("/network").and_then(Value::as_str), Some("none"));
+        assert_eq!(
+            spec.metadata.pointer("/github_repo").and_then(Value::as_str),
+            Some("launchapp-dev/animus-cli"),
+            "the repo is trimmed and merged in without clobbering sibling keys"
+        );
+
+        // None / empty repo (a non-coding run) leaves metadata untouched — never
+        // invents a repo.
+        let mut bare = EnvironmentSpec {
+            kind: "railway".to_string(),
+            repos: Vec::new(),
+            image: None,
+            resources: None,
+            env: BTreeMap::new(),
+            metadata: Value::Null,
+        };
+        merge_github_repo_metadata(&mut bare, None);
+        assert!(bare.metadata.is_null(), "no repo -> metadata stays untouched");
+        merge_github_repo_metadata(&mut bare, Some("   "));
+        assert!(bare.metadata.is_null(), "blank repo -> metadata stays untouched");
+    }
+
+    #[test]
     fn prepared_spec_is_bare_but_carries_rule_spec_overrides() {
         let _lock = crate::test_env::scoped_state_serializer();
         let _gate = EnvVarGuard::set("ANIMUS_ENVIRONMENT_EXEC", None);
@@ -1641,6 +1724,7 @@ environment_routing:
             backend.clone(),
             "environment:container-env".to_string(),
             &resolved,
+            None,
         )
         .expect("prepare succeeds");
         assert_eq!(prepared.id(), "container-env");
@@ -2076,6 +2160,7 @@ environment_routing:
             backend.clone(),
             "environment:container".to_string(),
             &bare_env("container"),
+            None,
         ) {
             Ok(_) => panic!("prepare failure must surface as an error"),
             Err(err) => err,
@@ -2094,6 +2179,7 @@ environment_routing:
             backend.clone(),
             "environment:container".to_string(),
             &bare_env("container"),
+            None,
         )
         .expect("prepare succeeds");
         assert_eq!(backend.prepare_calls.load(Ordering::SeqCst), 1, "prepared exactly once");
@@ -2292,6 +2378,9 @@ environment_routing:
             // on metadata for deterministic per-run node naming.
             assert!(v["spec"].get("repos").is_none(), "bare node carries no repos: {v}");
             assert_eq!(v["spec"]["metadata"]["animus_run_id"], "run-1");
+            // The target repo rides metadata so the plugin repo-scopes the token,
+            // alongside (not clobbering) the run id.
+            assert_eq!(v["spec"]["metadata"]["github_repo"], "launchapp-dev/animus-cli");
             writeln!(out, r#"{{"ok":true,"workspace_root":"/workspace","handle_id":"h-1"}}"#).unwrap();
             out.flush().unwrap();
         });
@@ -2301,7 +2390,7 @@ environment_routing:
             run_id: "run-1".to_string(),
             environment_id: "railway".to_string(),
         };
-        let brokered = BrokeredEnvironment::acquire(env).expect("acquire succeeds");
+        let brokered = BrokeredEnvironment::acquire(env, Some("launchapp-dev/animus-cli")).expect("acquire succeeds");
         assert_eq!(brokered.id(), "railway");
         assert_eq!(brokered.handle_id, "h-1");
         assert_eq!(brokered.workspace_root, "/workspace");
@@ -2321,7 +2410,7 @@ environment_routing:
             run_id: "run-1".to_string(),
             environment_id: "railway".to_string(),
         };
-        let err = BrokeredEnvironment::acquire(env).expect_err("ok:false must fail");
+        let err = BrokeredEnvironment::acquire(env, None).expect_err("ok:false must fail");
         assert!(format!("{err:#}").contains("no capacity"), "error surfaces the broker reason: {err:#}");
         server.join().unwrap();
     }

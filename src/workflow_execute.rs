@@ -339,8 +339,16 @@ pub async fn execute_workflow_with_hub(
     // Preparation runs OFF the async runtime (the `EnvironmentClient` surface is
     // blocking); a prepare failure fails the run up front rather than executing
     // locally.
+    //
+    // The run's target repo (the subject's `git_repo` custom field — the SAME
+    // value a command phase renders as `{{git_repo}}`) rides the prepared spec's
+    // `metadata.github_repo` so the environment plugin repo-scopes the GitHub App
+    // installation token to THAT repo (correct installation, least privilege). A
+    // bare non-coding run without `git_repo` leaves the metadata untouched.
+    let subject_git_repo =
+        crate::phase_command::subject_git_repo(&params.project_root, &subject_kind_str, &subject_id_str).await;
     let brokered_environment: Option<std::sync::Arc<crate::phase_environment::BrokeredEnvironment>> =
-        match crate::phase_environment::BrokeredEnvironment::acquire_from_env().await {
+        match crate::phase_environment::BrokeredEnvironment::acquire_from_env(subject_git_repo.clone()).await {
             Some(result) => Some(std::sync::Arc::new(
                 result
                     .with_context(|| format!("failed to acquire brokered environment for workflow {}", workflow.id))?,
@@ -360,6 +368,7 @@ pub async fn execute_workflow_with_hub(
                     let prepared = crate::phase_environment::PreparedEnvironment::prepare_off_runtime(
                         Path::new(&params.project_root),
                         &environment,
+                        subject_git_repo.clone(),
                     )
                     .await
                     .with_context(|| {
