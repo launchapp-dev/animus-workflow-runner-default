@@ -482,8 +482,16 @@ async fn fetch_subject_record(project_root: &str, kind: &str, native_id: &str) -
 /// `git clone {{git_repo}} .` renders (REQUIREMENT-048).
 fn subject_custom_fields(record: Option<&Value>) -> HashMap<String, String> {
     let mut fields = HashMap::new();
+    // Custom fields land under `data`/`attributes` on some backends, but the
+    // consolidated animus-postgres subject/get surfaces them under `custom`
+    // (verified live) — read all three so a `git_repo` set via
+    // `animus subject update --data` resolves as `{{git_repo}}`.
     let Some(bag) = record.and_then(|record| {
-        record.get("data").and_then(Value::as_object).or_else(|| record.get("attributes").and_then(Value::as_object))
+        record
+            .get("data")
+            .and_then(Value::as_object)
+            .or_else(|| record.get("attributes").and_then(Value::as_object))
+            .or_else(|| record.get("custom").and_then(Value::as_object))
     }) else {
         return fields;
     };
@@ -1360,6 +1368,13 @@ mod tests {
         // Falls back to the backend `attributes` bag when there is no `data`.
         let attrs = serde_json::json!({ "attributes": { "git_repo": "git@x:y.git" } });
         assert_eq!(subject_custom_fields(Some(&attrs)).get("git_repo").map(String::as_str), Some("git@x:y.git"));
+
+        // Falls back to `custom` — the shape animus-postgres subject/get returns.
+        let custom = serde_json::json!({ "custom": { "git_repo": "https://github.com/launchapp-dev/animus-cli.git" } });
+        assert_eq!(
+            subject_custom_fields(Some(&custom)).get("git_repo").map(String::as_str),
+            Some("https://github.com/launchapp-dev/animus-cli.git")
+        );
 
         // No record / no bag -> empty.
         assert!(subject_custom_fields(None).is_empty());
