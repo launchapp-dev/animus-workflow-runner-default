@@ -957,6 +957,15 @@ pub(crate) async fn run_workflow_phase_with_command(
     // on the stdout/stderr strings + exit_code, so it is execution-path-agnostic.
     let (exit_code, stdout, stderr, duration_ms, phase_decision) = match held_environment {
         Some(held) => {
+            let subject_status = subject_record
+                .as_ref()
+                .and_then(|rec| rec.get("status"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let mut env = env.clone();
+            for (key, value) in build_animus_context_env(context, &template_vars, subject_status) {
+                env.insert(key.to_string(), value);
+            }
             let started = std::time::Instant::now();
             let output = held.exec_command(
                 Path::new(context.project_root),
@@ -1461,8 +1470,8 @@ mod tests {
     /// command it is handed and returns a canned buffered output, WITHOUT
     /// running anything on the host. Used to assert the command phase routes
     /// through the node instead of spawning a local process.
-    /// One recorded `exec_command` call: `(program, args, cwd)`.
-    type RecordedEnvCall = (String, Vec<String>, Option<String>);
+    /// One recorded `exec_command` call: `(program, args, cwd, env)`.
+    type RecordedEnvCall = (String, Vec<String>, Option<String>, BTreeMap<String, String>);
 
     struct FakeHeldEnvironment {
         calls: std::sync::Mutex<Vec<RecordedEnvCall>>,
@@ -1488,12 +1497,12 @@ mod tests {
             _project_root: &Path,
             program: &str,
             args: &[String],
-            _env: &BTreeMap<String, String>,
+            env: &BTreeMap<String, String>,
             cwd: Option<&str>,
             _stdin: Option<String>,
             _timeout: Option<Duration>,
         ) -> Result<crate::phase_environment::EnvCommandOutput> {
-            self.calls.lock().unwrap().push((program.to_string(), args.to_vec(), cwd.map(str::to_string)));
+            self.calls.lock().unwrap().push((program.to_string(), args.to_vec(), cwd.map(str::to_string), env.clone()));
             Ok(crate::phase_environment::EnvCommandOutput {
                 exit_code: self.exit_code,
                 stdout: self.stdout.clone(),
@@ -1516,7 +1525,9 @@ mod tests {
         // `echo` is allowlisted + parse_json_output opts the phase into verdicts.
         let command = echo_json_command("unused-when-env-routed");
 
-        let result = run_workflow_phase_with_command(&bound_context(), &echo_runtime(), &command, Some(&fake))
+        let mut ctx = bound_context();
+        ctx.subject_title = r#"Land it (with "quotes")"#;
+        let result = run_workflow_phase_with_command(&ctx, &echo_runtime(), &command, Some(&fake))
             .await
             .expect("env-routed command runs");
 
@@ -1524,6 +1535,13 @@ mod tests {
         let calls = fake.calls.lock().unwrap();
         assert_eq!(calls.len(), 1, "command must be sent to the held environment");
         assert_eq!(calls[0].0, "echo", "program forwarded to the environment");
+
+        assert_eq!(
+            calls[0].3.get("ANIMUS_SUBJECT_TITLE").map(String::as_str),
+            Some(r#"Land it (with "quotes")"#),
+            "ANIMUS_SUBJECT_TITLE forwarded to the held environment"
+        );
+        assert_eq!(calls[0].3.get("ANIMUS_SUBJECT_NATIVE_ID").map(String::as_str), Some("task:TASK-1"));
 
         // stdout + exit code flow back from the environment.
         assert_eq!(result.exit_code, 0);
