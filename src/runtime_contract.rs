@@ -252,6 +252,15 @@ pub fn apply_phase_capability_launch_flags(
 ) {
     if caps.is_strictly_read_only() {
         inject_read_only_flag(runtime_contract, config);
+        return;
+    }
+    if caps.writes_files {
+        // A write-capable phase launches the CLI in the tool's edit-permitting
+        // mode — driven by the CAPABILITY, not `tool == "claude"` alone. claude
+        // gains `--permission-mode bypassPermissions` when no explicit mode is
+        // already set; codex launches edit-capable by default so it needs none.
+        let cli_name = runtime_contract.pointer("/cli/name").and_then(Value::as_str).unwrap_or("").to_string();
+        crate::runtime_support::apply_write_capable_permission_mode(runtime_contract, &cli_name);
     }
 }
 

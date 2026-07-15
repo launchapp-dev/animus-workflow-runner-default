@@ -93,12 +93,52 @@ impl RuntimeConfigContext {
     }
 
     pub fn phase_capabilities(&self, phase_id: &str) -> PhaseCapabilities {
+        // Authority order (capabilities come from CONFIG, never a phase NAME):
+        // (a) an EXPLICIT `capabilities` block on the phase definition wins
+        //     VERBATIM (workflow YAML first, then agent_runtime_config), and
+        // (b) otherwise the default is derived from the phase's declared MODE,
+        //     NOT from a `defaults_for_phase(phase_id)` name lookup.
         if let Some(caps) =
             self.workflow_config.config.phase_definitions.get(phase_id).and_then(|def| def.capabilities.clone())
         {
-            return caps.merge_with_defaults(phase_id);
+            return caps;
         }
-        self.agent_runtime_config.phase_capabilities(phase_id)
+        if let Some(caps) = self.agent_runtime_config.phase_execution(phase_id).and_then(|def| def.capabilities.clone()) {
+            return caps;
+        }
+        self.default_capabilities_for_mode(phase_id)
+    }
+
+    /// Derive a phase's default capabilities from its declared MODE when no
+    /// explicit `capabilities` block is configured. An AGENT-mode phase is
+    /// WRITE-CAPABLE by default — a read-only outcome must be an EXPLICIT
+    /// capability decision, so an unknown/custom phase name (`code-implement`)
+    /// must NOT silently become read-only. `defaults_for_phase` is consulted
+    /// only as a NON-AUTHORITATIVE seed: its named read-only kinds (research /
+    /// review / testing / requirements / ui) are honored, but its all-false
+    /// `_ => default()` catch-all is NOT allowed to win for an agent phase.
+    fn default_capabilities_for_mode(&self, phase_id: &str) -> PhaseCapabilities {
+        let seed = PhaseCapabilities::defaults_for_phase(phase_id);
+        match self.phase_mode(phase_id) {
+            PhaseExecutionMode::Agent => {
+                if seed == PhaseCapabilities::default() {
+                    // Name unrecognized by the seed table: default an agent phase
+                    // to write-capable rather than letting the all-false catch-all
+                    // silence it into read-only.
+                    PhaseCapabilities {
+                        writes_files: true,
+                        mutates_state: true,
+                        requires_commit: true,
+                        ..Default::default()
+                    }
+                } else {
+                    seed
+                }
+            }
+            // Command / Manual phases do not launch an agent harness; keep the
+            // seed's (name-table) classification unchanged for them.
+            _ => seed,
+        }
     }
 
     pub fn phase_output_contract(&self, phase_id: &str) -> Option<&PhaseOutputContract> {

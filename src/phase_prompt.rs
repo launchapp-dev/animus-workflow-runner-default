@@ -692,9 +692,12 @@ pub fn phase_requires_commit_message_with_config(project_root: &str, phase_id: &
 }
 
 pub fn phase_requires_commit_message_with_ctx(ctx: &RuntimeConfigContext, phase_id: &str) -> bool {
+    // Drive from the phase's resolved CAPABILITY (config-derived), not a phase
+    // NAME table: an output contract that declares a `commit_message` field
+    // still forces it, but the fallback is `caps.requires_commit`.
     ctx.phase_output_contract(phase_id)
         .map(|contract| contract.requires_field("commit_message"))
-        .unwrap_or_else(|| phase_requires_commit_message(phase_id))
+        .unwrap_or_else(|| ctx.phase_capabilities(phase_id).requires_commit)
 }
 
 pub(crate) fn phase_result_kind_for_ctx(ctx: &RuntimeConfigContext, phase_id: &str) -> String {
