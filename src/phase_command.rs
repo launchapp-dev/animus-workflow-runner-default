@@ -806,6 +806,11 @@ pub(crate) async fn run_workflow_phase_with_command(
     context: &CommandExecutionContext<'_>,
     runtime_config: &orchestrator_core::AgentRuntimeConfig,
     command: &orchestrator_core::PhaseCommandDefinition,
+    // REQUIREMENT-048: the per-run environment node, when the run is env-routed.
+    // `Some` -> exec the command INSIDE the shared node (so a `git clone` /
+    // `git commit` operates on the SAME workspace the agent phases edit); `None`
+    // -> the default local `TokioCommand` path (byte-for-byte unchanged).
+    held_environment: Option<&dyn crate::phase_environment::HeldEnvironment>,
 ) -> Result<CommandExecutionResult> {
     if !is_program_allowlisted(&command.program, &runtime_config.tools_allowlist) {
         return Err(anyhow!("phase '{}' command '{}' is not in tools_allowlist", context.phase_id, command.program));
@@ -893,106 +898,150 @@ pub(crate) async fn run_workflow_phase_with_command(
         .collect::<BTreeMap<_, _>>();
     let cwd = resolve_command_cwd(context, command, &template_vars)?;
 
-    let prior_phases =
-        crate::phase_output::list_prior_phase_outputs(context.project_root, context.workflow_id, context.phase_id);
-    let context_json = build_command_context_json(context, &template_vars, subject_record.as_ref(), &prior_phases);
-    let subject_status =
-        subject_record.as_ref().and_then(|rec| rec.get("status")).and_then(Value::as_str).unwrap_or_default();
-    let animus_env = build_animus_context_env(context, &template_vars, subject_status);
-
-    // Write the structured context JSON to a temp file scoped to THIS phase
-    // run. The RAII guard removes it on every return path so it never leaks
-    // across phases; stdin stays null.
-    let context_file = command_context_file_path(context);
-    let context_bytes = serde_json::to_vec(&context_json).unwrap_or_default();
-    // Own the path with the RAII guard BEFORE writing so a partial file left by a
-    // mid-write error is still cleaned up (the guard drops on the Err arm). The
-    // file is written 0600 — it embeds subject.data which may carry secrets,
-    // unlike the scalar ANIMUS_* env.
-    let context_file_guard = {
-        let guard = TempContextFile { path: context_file.clone() };
-        match write_context_file_private(&context_file, &context_bytes) {
-            Ok(()) => Some(guard),
-            Err(error) => {
-                tracing::warn!(
-                    phase_id = context.phase_id,
-                    path = %context_file.display(),
-                    %error,
-                    "command-phase context: failed to write ANIMUS_CONTEXT_FILE; continuing with scalar env only"
-                );
-                None
-            }
-        }
-    };
-
-    let started = std::time::Instant::now();
-
-    let mut process = TokioCommand::new(&command.program);
-    process
-        .args(&args)
-        .current_dir(&cwd)
-        .env_remove("CLAUDECODE")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    for (key, value) in &env {
-        process.env(key, value);
-    }
-
-    // TASK-292: promote the context scalars to real env vars (additive — the
-    // `{{var}}` templating above is unchanged). Set AFTER the user's
-    // command.env so the runner-provided ANIMUS_* contract is authoritative.
-    for (key, value) in &animus_env {
-        process.env(key, value);
-    }
-    if let Some(guard) = context_file_guard.as_ref() {
-        process.env("ANIMUS_CONTEXT_FILE", &guard.path);
-    }
-
-    let mut child = process.spawn()?;
-    let stdout_reader = child.stdout.take().ok_or_else(|| anyhow!("failed to capture stdout for command phase"))?;
-    let stderr_reader = child.stderr.take().ok_or_else(|| anyhow!("failed to capture stderr for command phase"))?;
-    let phase_id = context.phase_id.to_string();
-    let phase_id2 = phase_id.clone();
-    // Codex P3 #5: `capture_command_stream` now takes an owned `String`,
-    // so the spawned tasks no longer require leaking `&'static str` per
-    // command phase. In a long-lived plugin process this stops the
-    // monotonic memory growth observed in the pre-fix path.
-    let stdout_task = tokio::spawn(capture_command_stream(stdout_reader, phase_id));
-    let stderr_task = tokio::spawn(capture_command_stream(stderr_reader, phase_id2));
-
-    let status = if let Some(timeout_secs) = command.timeout_secs {
-        match timeout(Duration::from_secs(timeout_secs), child.wait()).await {
-            Ok(status) => status?,
-            Err(_) => {
-                let _ = child.kill().await;
-                let _ = stdout_task.await;
-                let _ = stderr_task.await;
+    // REQUIREMENT-048: exec the templated command INSIDE the per-run
+    // environment node when the run is env-routed, so a `git clone` / `git
+    // commit` / `gh pr create` operates on the SAME shared workspace the agent
+    // phases edit. The rendered program/args/env/cwd are identical to the local
+    // path; only WHERE the process runs changes. The shared tail below
+    // (success_exit_codes check, verdict/JSON parsing, result assembly) operates
+    // on the stdout/stderr strings + exit_code, so it is execution-path-agnostic.
+    let (exit_code, stdout, stderr, duration_ms, phase_decision) = match held_environment {
+        Some(held) => {
+            let started = std::time::Instant::now();
+            let output = held.exec_command(
+                Path::new(context.project_root),
+                &command.program,
+                &args,
+                &env,
+                Some(cwd.as_str()),
+                None, // command phases run with stdin closed (mirrors Stdio::null())
+                command.timeout_secs.map(Duration::from_secs),
+            )?;
+            let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+            if output.timed_out {
                 return Err(anyhow!(
-                    "phase '{}' command '{}' timed out after {} seconds",
+                    "phase '{}' command '{}' timed out{}",
                     context.phase_id,
                     command.program,
-                    timeout_secs
+                    command.timeout_secs.map(|secs| format!(" after {secs} seconds")).unwrap_or_default()
                 ));
             }
+            let phase_decision = parse_phase_decision_from_text(&output.stdout, context.phase_id)
+                .or_else(|| parse_phase_decision_from_text(&output.stderr, context.phase_id));
+            (output.exit_code, output.stdout, output.stderr, duration_ms, phase_decision)
         }
-    } else {
-        child.wait().await?
+        None => {
+            let prior_phases = crate::phase_output::list_prior_phase_outputs(
+                context.project_root,
+                context.workflow_id,
+                context.phase_id,
+            );
+            let context_json =
+                build_command_context_json(context, &template_vars, subject_record.as_ref(), &prior_phases);
+            let subject_status =
+                subject_record.as_ref().and_then(|rec| rec.get("status")).and_then(Value::as_str).unwrap_or_default();
+            let animus_env = build_animus_context_env(context, &template_vars, subject_status);
+
+            // Write the structured context JSON to a temp file scoped to THIS phase
+            // run. The RAII guard removes it on every return path so it never leaks
+            // across phases; stdin stays null.
+            let context_file = command_context_file_path(context);
+            let context_bytes = serde_json::to_vec(&context_json).unwrap_or_default();
+            // Own the path with the RAII guard BEFORE writing so a partial file left by a
+            // mid-write error is still cleaned up (the guard drops on the Err arm). The
+            // file is written 0600 — it embeds subject.data which may carry secrets,
+            // unlike the scalar ANIMUS_* env.
+            let context_file_guard = {
+                let guard = TempContextFile { path: context_file.clone() };
+                match write_context_file_private(&context_file, &context_bytes) {
+                    Ok(()) => Some(guard),
+                    Err(error) => {
+                        tracing::warn!(
+                            phase_id = context.phase_id,
+                            path = %context_file.display(),
+                            %error,
+                            "command-phase context: failed to write ANIMUS_CONTEXT_FILE; continuing with scalar env only"
+                        );
+                        None
+                    }
+                }
+            };
+
+            let started = std::time::Instant::now();
+
+            let mut process = TokioCommand::new(&command.program);
+            process
+                .args(&args)
+                .current_dir(&cwd)
+                .env_remove("CLAUDECODE")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+
+            for (key, value) in &env {
+                process.env(key, value);
+            }
+
+            // TASK-292: promote the context scalars to real env vars (additive — the
+            // `{{var}}` templating above is unchanged). Set AFTER the user's
+            // command.env so the runner-provided ANIMUS_* contract is authoritative.
+            for (key, value) in &animus_env {
+                process.env(key, value);
+            }
+            if let Some(guard) = context_file_guard.as_ref() {
+                process.env("ANIMUS_CONTEXT_FILE", &guard.path);
+            }
+
+            let mut child = process.spawn()?;
+            let stdout_reader =
+                child.stdout.take().ok_or_else(|| anyhow!("failed to capture stdout for command phase"))?;
+            let stderr_reader =
+                child.stderr.take().ok_or_else(|| anyhow!("failed to capture stderr for command phase"))?;
+            let phase_id = context.phase_id.to_string();
+            let phase_id2 = phase_id.clone();
+            // Codex P3 #5: `capture_command_stream` now takes an owned `String`,
+            // so the spawned tasks no longer require leaking `&'static str` per
+            // command phase. In a long-lived plugin process this stops the
+            // monotonic memory growth observed in the pre-fix path.
+            let stdout_task = tokio::spawn(capture_command_stream(stdout_reader, phase_id));
+            let stderr_task = tokio::spawn(capture_command_stream(stderr_reader, phase_id2));
+
+            let status = if let Some(timeout_secs) = command.timeout_secs {
+                match timeout(Duration::from_secs(timeout_secs), child.wait()).await {
+                    Ok(status) => status?,
+                    Err(_) => {
+                        let _ = child.kill().await;
+                        let _ = stdout_task.await;
+                        let _ = stderr_task.await;
+                        return Err(anyhow!(
+                            "phase '{}' command '{}' timed out after {} seconds",
+                            context.phase_id,
+                            command.program,
+                            timeout_secs
+                        ));
+                    }
+                }
+            } else {
+                child.wait().await?
+            };
+
+            let stdout_capture =
+                stdout_task.await.map_err(|error| anyhow!("stdout capture task failed: {error}"))??;
+            let stderr_capture =
+                stderr_task.await.map_err(|error| anyhow!("stderr capture task failed: {error}"))??;
+
+            let exit_code = status.code().unwrap_or(-1);
+            let stdout = stdout_capture.text;
+            let stderr = stderr_capture.text;
+            let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+            let phase_decision = stdout_capture
+                .phase_decision
+                .or(stderr_capture.phase_decision)
+                .or_else(|| parse_phase_decision_from_text(&stdout, context.phase_id))
+                .or_else(|| parse_phase_decision_from_text(&stderr, context.phase_id));
+            (exit_code, stdout, stderr, duration_ms, phase_decision)
+        }
     };
-
-    let stdout_capture = stdout_task.await.map_err(|error| anyhow!("stdout capture task failed: {error}"))??;
-    let stderr_capture = stderr_task.await.map_err(|error| anyhow!("stderr capture task failed: {error}"))??;
-
-    let exit_code = status.code().unwrap_or(-1);
-    let stdout = stdout_capture.text;
-    let stderr = stderr_capture.text;
-    let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-    let phase_decision = stdout_capture
-        .phase_decision
-        .or(stderr_capture.phase_decision)
-        .or_else(|| parse_phase_decision_from_text(&stdout, context.phase_id))
-        .or_else(|| parse_phase_decision_from_text(&stderr, context.phase_id));
 
     if !command.success_exit_codes.contains(&exit_code) {
         let mut failure_summary = format!(
@@ -1323,7 +1372,7 @@ mod tests {
         let runtime =
             orchestrator_core::AgentRuntimeConfig { tools_allowlist: vec!["false".to_string()], ..Default::default() };
 
-        let err = run_workflow_phase_with_command(&subjectless_context(), &runtime, &command)
+        let err = run_workflow_phase_with_command(&subjectless_context(), &runtime, &command, None)
             .await
             .expect_err("empty required var must fail fast");
         let cmd_fail =
@@ -1346,9 +1395,102 @@ mod tests {
         let mut context = subjectless_context();
         context.subject_id = "task:TASK-1";
 
-        let result = run_workflow_phase_with_command(&context, &runtime, &command).await.expect("command runs");
+        let result = run_workflow_phase_with_command(&context, &runtime, &command, None).await.expect("command runs");
         assert_eq!(result.exit_code, 1);
         assert!(result.failure_summary.is_some());
+    }
+
+    /// A fake [`crate::phase_environment::HeldEnvironment`] that records the raw
+    /// command it is handed and returns a canned buffered output, WITHOUT
+    /// running anything on the host. Used to assert the command phase routes
+    /// through the node instead of spawning a local process.
+    /// One recorded `exec_command` call: `(program, args, cwd)`.
+    type RecordedEnvCall = (String, Vec<String>, Option<String>);
+
+    struct FakeHeldEnvironment {
+        calls: std::sync::Mutex<Vec<RecordedEnvCall>>,
+        stdout: String,
+        exit_code: i32,
+    }
+
+    impl crate::phase_environment::HeldEnvironment for FakeHeldEnvironment {
+        fn id(&self) -> &str {
+            "fake"
+        }
+
+        fn exec_session(
+            &self,
+            _project_root: &Path,
+            _request: &animus_session_backend::session::SessionRequest,
+        ) -> Result<animus_session_backend::session::SessionRun> {
+            unreachable!("command phases route through exec_command, never exec_session")
+        }
+
+        fn exec_command(
+            &self,
+            _project_root: &Path,
+            program: &str,
+            args: &[String],
+            _env: &BTreeMap<String, String>,
+            cwd: Option<&str>,
+            _stdin: Option<String>,
+            _timeout: Option<Duration>,
+        ) -> Result<crate::phase_environment::EnvCommandOutput> {
+            self.calls.lock().unwrap().push((program.to_string(), args.to_vec(), cwd.map(str::to_string)));
+            Ok(crate::phase_environment::EnvCommandOutput {
+                exit_code: self.exit_code,
+                stdout: self.stdout.clone(),
+                stderr: String::new(),
+                timed_out: false,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn run_workflow_phase_with_command_routes_through_held_environment() {
+        // The command is sent to the held environment (NOT spawned locally); its
+        // stdout + exit code flow back into the CommandExecutionResult, and the
+        // shared verdict-parsing tail still lifts an emitted verdict from stdout.
+        let fake = FakeHeldEnvironment {
+            calls: std::sync::Mutex::new(Vec::new()),
+            stdout: r#"{"verdict":"advance","reason":"clone ok"}"#.to_string(),
+            exit_code: 0,
+        };
+        // `echo` is allowlisted + parse_json_output opts the phase into verdicts.
+        let command = echo_json_command("unused-when-env-routed");
+
+        let result = run_workflow_phase_with_command(&bound_context(), &echo_runtime(), &command, Some(&fake))
+            .await
+            .expect("env-routed command runs");
+
+        // The command was dispatched to the environment exactly once.
+        let calls = fake.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "command must be sent to the held environment");
+        assert_eq!(calls[0].0, "echo", "program forwarded to the environment");
+
+        // stdout + exit code flow back from the environment.
+        assert_eq!(result.exit_code, 0);
+        assert!(result.stdout.contains("advance"), "env stdout surfaced: {}", result.stdout);
+        assert!(result.failure_summary.is_none(), "exit 0 is not a failure");
+
+        // Verdict parsing (shared execution-path-agnostic tail) still works.
+        let decision = result.phase_decision.as_ref().expect("verdict parsed from env stdout");
+        assert_eq!(decision.verdict, orchestrator_core::PhaseDecisionVerdict::Advance);
+    }
+
+    #[tokio::test]
+    async fn run_workflow_phase_with_command_env_routed_nonzero_exit_reports_failure() {
+        // A non-zero exit from the environment flows through the SAME failure
+        // path as the local spawn (failure_summary set, exit code preserved).
+        let fake =
+            FakeHeldEnvironment { calls: std::sync::Mutex::new(Vec::new()), stdout: String::new(), exit_code: 2 };
+        let command = command_def("echo", &["hi"]);
+
+        let result = run_workflow_phase_with_command(&bound_context(), &echo_runtime(), &command, Some(&fake))
+            .await
+            .expect("env-routed command runs");
+        assert_eq!(result.exit_code, 2);
+        assert!(result.failure_summary.is_some(), "non-zero env exit sets failure_summary");
     }
 
     #[test]
@@ -1452,7 +1594,7 @@ mod tests {
         ];
         for (raw, expected) in cases {
             let command = echo_json_command(raw);
-            let result = run_workflow_phase_with_command(&bound_context(), &echo_runtime(), &command)
+            let result = run_workflow_phase_with_command(&bound_context(), &echo_runtime(), &command, None)
                 .await
                 .expect("echo command runs");
             // Exit 0 -> not a failure_summary; the verdict comes from stdout JSON.
@@ -1468,7 +1610,7 @@ mod tests {
         // exit. This must NOT hard-fail (TASK-206 leniency): no verdict is
         // produced, so the arm falls back to exit-code inference (advance).
         let command = echo_json_command("this is not json");
-        let result = run_workflow_phase_with_command(&bound_context(), &echo_runtime(), &command)
+        let result = run_workflow_phase_with_command(&bound_context(), &echo_runtime(), &command, None)
             .await
             .expect("malformed JSON must not hard-fail the phase");
         assert_eq!(result.exit_code, 0);
@@ -1626,7 +1768,7 @@ mod tests {
         context.subject_kind = "transcript";
         context.subject_title = "Standup";
 
-        let result = run_workflow_phase_with_command(&context, &runtime, &command).await.expect("command runs");
+        let result = run_workflow_phase_with_command(&context, &runtime, &command, None).await.expect("command runs");
         assert_eq!(result.exit_code, 0);
         let stdout = result.stdout;
 
