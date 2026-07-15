@@ -793,15 +793,21 @@ fn apply_codex_node_sandbox(tool: &str, mut args: Vec<String>) -> Vec<String> {
         return args;
     }
     const BYPASS: &str = "--dangerously-bypass-approvals-and-sandbox";
+    // The codex launch table (ao-cli build_cli_launch_contract) defaults codex to
+    // `--full-auto` = workspace-write sandbox + on-failure approval, which uses
+    // bwrap. bwrap can't create a namespace in the node, and `--full-auto` is
+    // mutually exclusive with the bypass flag — so drop it first. A `-c
+    // sandbox_mode=...` config override does NOT change `codex exec`'s effective
+    // sandbox either; the documented flag for an externally-sandboxed host skips
+    // both the inner sandbox and approval prompts. (`--full-auto` stays for LOCAL
+    // codex runs, where the sandbox works and is wanted — only the node path
+    // swaps it, mirroring claude's node-only bypassPermissions.)
+    args.retain(|arg| arg != "--full-auto");
     if args.iter().any(|arg| arg == BYPASS) {
         return args;
     }
-    // A `-c sandbox_mode=...` config override does NOT change `codex exec`'s
-    // effective sandbox — it still tried bwrap and failed to create a namespace
-    // in the node. The documented flag for an externally-sandboxed host skips
-    // both the inner sandbox and approval prompts. Place it right after the
-    // `exec` subcommand so codex parses it as an exec flag; fall back to the
-    // front when there is no explicit subcommand.
+    // Place it right after the `exec` subcommand so codex parses it as an exec
+    // flag; fall back to the front when there is no explicit subcommand.
     let insert_at = args.iter().position(|arg| arg == "exec").map(|index| index + 1).unwrap_or(0);
     args.insert(insert_at, BYPASS.to_string());
     args
@@ -1968,6 +1974,20 @@ environment_routing:
             !claude_cmd.args.iter().any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox"),
             "claude gets no codex sandbox flag"
         );
+    }
+
+    #[test]
+    fn codex_node_sandbox_replaces_full_auto_with_bypass() {
+        // `--full-auto` (bwrap workspace-write) is mutually exclusive with the
+        // bypass flag and fails in the node, so it must be stripped.
+        let out = apply_codex_node_sandbox("codex", vec!["exec".into(), "--full-auto".into(), "prompt".into()]);
+        assert!(!out.iter().any(|arg| arg == "--full-auto"), "full-auto stripped: {out:?}");
+        assert!(
+            out.iter().any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox"),
+            "bypass added after exec: {out:?}"
+        );
+        // Non-codex tools are untouched.
+        assert_eq!(apply_codex_node_sandbox("claude", vec!["--full-auto".into()]), vec!["--full-auto".to_string()]);
     }
 
     #[test]
