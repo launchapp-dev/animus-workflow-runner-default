@@ -2739,7 +2739,13 @@ async fn run_workflow_phase_inner(params: &PhaseRunParams<'_>) -> Result<PhaseRu
                 custom_fields: None,
             };
 
-            let command_result = run_workflow_phase_with_command(&command_context, &merged_runtime, command).await?;
+            // REQUIREMENT-048: thread the per-run environment node through so an
+            // env-routed command phase execs INSIDE the shared node (the SAME
+            // workspace the agent phases edit). `None` for local runs -> the
+            // unchanged local `TokioCommand` path.
+            let command_result =
+                run_workflow_phase_with_command(&command_context, &merged_runtime, command, params.held_environment)
+                    .await?;
             {
                 let logger = orchestrator_logging::Logger::for_project(std::path::Path::new(project_root));
                 let success = command_result.failure_summary.is_none();

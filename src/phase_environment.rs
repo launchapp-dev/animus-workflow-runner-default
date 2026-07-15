@@ -214,6 +214,69 @@ pub trait HeldEnvironment: Send + Sync {
     /// Execute a phase's harness command INSIDE the held node, returning a
     /// [`SessionRun`] whose event stream mirrors the local provider path.
     fn exec_session(&self, project_root: &Path, request: &SessionRequest) -> Result<SessionRun>;
+    /// Execute a RAW command (not a harness/provider launch) INSIDE the held
+    /// node, BUFFERED — used by env-routed COMMAND phases so a `git clone` /
+    /// `git commit` / `gh pr create` runs in the SAME shared workspace the run's
+    /// agent phases edit (REQUIREMENT-048). `cwd` is the command's resolved
+    /// (host) working dir; the impl maps it into the node's `workspace_root`
+    /// (see [`map_command_cwd`]). `program`/`args`/`env` are already templated.
+    fn exec_command(
+        &self,
+        project_root: &Path,
+        program: &str,
+        args: &[String],
+        env: &std::collections::BTreeMap<String, String>,
+        cwd: Option<&str>,
+        stdin: Option<String>,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<EnvCommandOutput>;
+}
+
+/// The buffered result of a RAW command exec inside a held node (REQUIREMENT-048
+/// command-phase routing). Mirrors the fields of an environment [`ExecResponse`]
+/// the command-phase result is built from, with `exit_code` normalized to `-1`
+/// when the process produced none (signal / OOM kill) so it slots into the same
+/// [`crate::phase_command::CommandExecutionResult`] the local path yields.
+// `pub` (not `pub(crate)`) so it does not leak a private type through the `pub`
+// `HeldEnvironment::exec_command` return position, matching the sibling `pub`
+// env types (`PreparedEnvironment` / `BrokeredEnvironment`).
+pub struct EnvCommandOutput {
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+    pub timed_out: bool,
+}
+
+impl From<ExecResponse> for EnvCommandOutput {
+    fn from(response: ExecResponse) -> Self {
+        Self {
+            exit_code: response.exit_code.unwrap_or(-1),
+            stdout: response.stdout,
+            stderr: response.stderr,
+            timed_out: response.timed_out,
+        }
+    }
+}
+
+/// Map a command phase's resolved (host) cwd into the environment. A
+/// [`HarnessCommand::cwd`] is relative to the node's `workspace_root`:
+/// - the daemon `project_root` (the common `ProjectRoot`-mode cwd) maps to
+///   `None`, so the command runs in the node's workspace root — the SAME shared
+///   workspace the run's agent phases edit;
+/// - a cwd BELOW the project root maps to that relative subpath;
+/// - an absolute cwd OUTSIDE the project root (e.g. `/tmp/animus-work/...`) is
+///   passed through verbatim (absolute paths dominate).
+fn map_command_cwd(project_root: &Path, cwd: Option<&str>) -> Option<String> {
+    let cwd = cwd.map(str::trim).filter(|value| !value.is_empty())?;
+    let root = project_root.canonicalize().unwrap_or_else(|_| project_root.to_path_buf());
+    let cwd_path = Path::new(cwd);
+    let canonical = cwd_path.canonicalize().unwrap_or_else(|_| cwd_path.to_path_buf());
+    match canonical.strip_prefix(&root) {
+        Ok(relative) if relative.as_os_str().is_empty() => None,
+        Ok(relative) => Some(relative.to_string_lossy().to_string()),
+        // Absolute path outside the project root: dominates — pass it through.
+        Err(_) => Some(cwd.to_string()),
+    }
 }
 
 /// A prepared, per-workflow-run environment: ONE resident host + ONE plugin
@@ -387,6 +450,40 @@ impl HeldEnvironment for PreparedEnvironment {
 
     fn exec_session(&self, project_root: &Path, request: &SessionRequest) -> Result<SessionRun> {
         PreparedEnvironment::exec_session(self, project_root, request)
+    }
+
+    fn exec_command(
+        &self,
+        project_root: &Path,
+        program: &str,
+        args: &[String],
+        env: &BTreeMap<String, String>,
+        cwd: Option<&str>,
+        stdin: Option<String>,
+        timeout: Option<Duration>,
+    ) -> Result<EnvCommandOutput> {
+        let command = HarnessCommand {
+            program: program.to_string(),
+            args: args.to_vec(),
+            env: env.clone(),
+            cwd: map_command_cwd(project_root, cwd),
+        };
+        // Mirror the harness path's default run cap so an un-timed command exec
+        // is bounded (a hung `git`/`gh` inside the node would otherwise drain
+        // forever).
+        let timeout = timeout.or(Some(Duration::from_secs(DEFAULT_ENVIRONMENT_RUN_TIMEOUT_SECS)));
+        // Run the blocking BUFFERED exec on a dedicated OS thread (like
+        // `teardown`) so it uses the client's own throwaway runtime and never
+        // nests on the async caller's runtime; the resident host's I/O driver
+        // stays live on the struct's dedicated runtime for the whole run.
+        let backend = self.backend.clone();
+        let handle = self.handle.clone();
+        let backend_label = self.backend_label.clone();
+        let response = std::thread::spawn(move || backend.exec(&handle, command, stdin, timeout))
+            .join()
+            .map_err(|_| anyhow!("environment exec_command thread panicked"))?
+            .map_err(|err| anyhow!("environment exec_command failed in {backend_label}: {err:#}"))?;
+        Ok(response.into())
     }
 }
 
@@ -1044,6 +1141,52 @@ impl HeldEnvironment for BrokeredEnvironment {
             timeout_secs,
             self.backend_label.clone(),
         ))
+    }
+
+    fn exec_command(
+        &self,
+        project_root: &Path,
+        program: &str,
+        args: &[String],
+        env: &BTreeMap<String, String>,
+        cwd: Option<&str>,
+        stdin: Option<String>,
+        timeout: Option<Duration>,
+    ) -> Result<EnvCommandOutput> {
+        let command = HarnessCommand {
+            program: program.to_string(),
+            args: args.to_vec(),
+            env: env.clone(),
+            cwd: map_command_cwd(project_root, cwd),
+        };
+        let timeout_secs = timeout.map(|t| t.as_secs()).unwrap_or(DEFAULT_ENVIRONMENT_RUN_TIMEOUT_SECS);
+        let target = BrokerExecTarget {
+            socket_path: self.socket_path.clone(),
+            token: self.token.clone(),
+            run_id: self.run_id.clone(),
+            handle_id: self.handle_id.clone(),
+        };
+        // Buffered variant of the streaming broker exec: reuse the SAME socket
+        // dial + framing helper ([`brokered_exec_stream`]), but COLLECT the
+        // streamed `{"out",...}` frames into stdout/stderr strings instead of
+        // forwarding them as `SessionEvent`s. Interior mutability because the
+        // helper's callback is `Fn` (shared), not `FnMut`.
+        let stdout = std::sync::Mutex::new(String::new());
+        let stderr = std::sync::Mutex::new(String::new());
+        let on_output = |stream: BrokerStream, text: &str| match stream {
+            BrokerStream::Stdout => stdout.lock().expect("brokered stdout mutex").push_str(text),
+            BrokerStream::Stderr => stderr.lock().expect("brokered stderr mutex").push_str(text),
+        };
+        let response = brokered_exec_stream(&target, command, stdin, timeout_secs, &on_output)
+            .map_err(|err| anyhow!("environment exec_command failed in {}: {err:#}", self.backend_label))?;
+        // `on_output`'s borrows of stdout/stderr end here (its last use was the
+        // `&on_output` above), so the mutexes are free to unwrap.
+        Ok(EnvCommandOutput {
+            exit_code: response.exit_code.unwrap_or(-1),
+            stdout: stdout.into_inner().expect("brokered stdout mutex"),
+            stderr: stderr.into_inner().expect("brokered stderr mutex"),
+            timed_out: response.timed_out,
+        })
     }
 }
 
