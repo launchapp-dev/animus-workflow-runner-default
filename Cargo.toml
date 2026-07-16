@@ -14,6 +14,18 @@ path = "src/lib.rs"
 name = "animus-workflow-runner-default"
 path = "src/main.rs"
 
+[features]
+# REQUIREMENT-052 remote-animus session (whole-workflow delegation via
+# `EnvironmentClient::exec_session`). OFF by default: the parent-side
+# `exec_session` / `EnvironmentJournalEvent` surface (orchestrator-core) and the
+# `environment/exec_session` protocol types (animus-environment-protocol) are not
+# in the currently pinned `orchestrator-core` rev (d03cd174) / env-protocol tag
+# (v0.7.0-rc.6). Enable on node/CI once those pins are advanced to a rev/tag that
+# ship exec_session; the whole delegation call site is `#[cfg]`-gated on it while
+# the pure detection/mapping logic compiles + tests unconditionally.
+default = []
+remote-animus-session = []
+
 [dependencies]
 # --- protocol crates — pinned to animus-protocol tag v0.7.0-rc.6, the SAME tag
 # ao-cli release/0.7 (rc.6, rev 48ad8507) resolves ALL its protocol/wire crates

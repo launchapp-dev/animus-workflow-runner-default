@@ -323,6 +323,49 @@ pub async fn execute_workflow_with_hub(
     let mut results = Vec::new();
     let workflow_start = Instant::now();
 
+    // REQUIREMENT-052: when the resolved `environment` is a FULL standalone animus
+    // (it advertises `environment/exec_session`), delegate the WHOLE workflow to it
+    // in ONE `EnvironmentClient::exec_session` call instead of running phases here
+    // or routing them per-phase (REQUIREMENT-048, below). The node runs every phase
+    // on its OWN animus and streams `environment/journal` events home, which the
+    // delegator forwards through `event_emitter`. Only FULL runs delegate -- a
+    // `--phase` single-phase run keeps the local/per-phase path. No session-capable
+    // environment resolves (the default) -> fall through UNCHANGED. With the
+    // `remote-animus-session` feature off, `environment_is_session_capable` is
+    // always `false`, so this branch is inert and the runner's behavior is
+    // byte-for-byte the current per-phase / local paths.
+    if params.phase_filter.is_none() {
+        if let Some(environment) = crate::phase_environment::resolve_workflow_environment(
+            Path::new(&params.project_root),
+            &workflow_ref,
+            Some(&subject_kind_str),
+        ) {
+            if crate::workflow_session::environment_is_session_capable(
+                Path::new(&params.project_root),
+                &environment.id,
+            ) {
+                let subject_git_repo =
+                    crate::phase_command::subject_git_repo(&params.project_root, &subject_kind_str, &subject_id_str)
+                        .await;
+                let phases_requested: Vec<String> =
+                    workflow.phases.iter().map(|phase| phase.phase_id.clone()).collect();
+                return crate::workflow_session::delegate_workflow_via_session(
+                    &params.project_root,
+                    &environment.id,
+                    &workflow.id,
+                    &workflow_ref,
+                    &subject_id_str,
+                    subject_git_repo.as_deref(),
+                    phase_inputs.dispatch_input.as_deref(),
+                    &execution_cwd,
+                    phases_requested,
+                    event_emitter.as_ref(),
+                )
+                .await;
+            }
+        }
+    }
+
     // REQUIREMENT-048: resolve the per-workflow-run environment node ONCE, shared
     // across every phase (so a clone in one phase is visible to the next).
     //
