@@ -16,37 +16,34 @@ path = "src/main.rs"
 
 [features]
 # REQUIREMENT-052 remote-animus session (whole-workflow delegation via
-# `EnvironmentClient::exec_session`). OFF by default: the parent-side
-# `exec_session` / `EnvironmentJournalEvent` surface (orchestrator-core) and the
-# `environment/exec_session` protocol types (animus-environment-protocol) are not
-# in the currently pinned `orchestrator-core` rev (d03cd174) / env-protocol tag
-# (v0.7.0-rc.6). Enable on node/CI once those pins are advanced to a rev/tag that
-# ship exec_session; the whole delegation call site is `#[cfg]`-gated on it while
-# the pure detection/mapping logic compiles + tests unconditionally.
-default = []
+# `EnvironmentClient::exec_session`). ENABLED by default now that the pins ship
+# exec_session: orchestrator-* -> animus-cli rev 748f684d (env-protocol pinned to
+# the published v0.7.0-rc.8 tag), and all animus-protocol crates -> v0.7.0-rc.8
+# (rc.8 = rc.6 + the environment/exec_session commit only). Needs node/CI build.
+default = ["remote-animus-session"]
 remote-animus-session = []
 
 [dependencies]
-# --- protocol crates — pinned to animus-protocol tag v0.7.0-rc.6, the SAME tag
+# --- protocol crates — pinned to animus-protocol tag v0.7.0-rc.8, the SAME tag
 # ao-cli release/0.7 (rc.6, rev 48ad8507) resolves ALL its protocol/wire crates
-# to. Keeping every protocol crate on the single v0.7.0-rc.6 tag avoids
+# to. Keeping every protocol crate on the single v0.7.0-rc.8 tag avoids
 # duplicate-crate / type-mismatch errors with orchestrator-core's transitive
 # deps (the tag-unification hazard). Bumped from v0.1.25 in lockstep with the
 # orchestrator-* rev below so the runner's vendored plugin discovery understands
 # the multi-kind `plugin_kinds` manifest field (config_source served by the
 # consolidated animus-postgres BaaS plugin). ---------------------------------
-animus-session-backend      = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.7.0-rc.6" }
-animus-subject-protocol     = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.7.0-rc.6" }
-animus-workflow-runner-protocol = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.7.0-rc.6" }
-animus-plugin-protocol      = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.7.0-rc.6" }
-animus-actor                = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.7.0-rc.6" }
-protocol                    = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.7.0-rc.6", package = "protocol" }
+animus-session-backend      = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.7.0-rc.8" }
+animus-subject-protocol     = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.7.0-rc.8" }
+animus-workflow-runner-protocol = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.7.0-rc.8" }
+animus-plugin-protocol      = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.7.0-rc.8" }
+animus-actor                = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.7.0-rc.8" }
+protocol                    = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.7.0-rc.8", package = "protocol" }
 # REQUIREMENT-048 Phase B: native workflow-phase environment routing. The
 # environment wire types (EnvironmentSpec / HarnessCommand / RepoRef /
 # ExecResponse / ExecStream / EnvironmentHandle) live in this crate, pinned to
-# the SAME v0.7.0-rc.6 tag as every other protocol crate above (tag-unification
+# the SAME v0.7.0-rc.8 tag as every other protocol crate above (tag-unification
 # hazard — see the note at the top of this block).
-animus-environment-protocol = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.7.0-rc.6" }
+animus-environment-protocol = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.7.0-rc.8" }
 
 # --- ao-cli kernel crates — pinned to the current HEAD rev. The session
 # dispatch types (`SessionBackendResolver`, `PluginSessionBackend`,
@@ -55,22 +52,22 @@ animus-environment-protocol = { git = "https://github.com/launchapp-dev/animus-p
 # `orchestrator-config`, `orchestrator-plugin-host`, and `orchestrator-logging`
 # are in-tree path deps inside the kernel workspace, so they have no standalone
 # published tag — pin them to the kernel git rev instead. ---------------------
-orchestrator-core          = { git = "https://github.com/launchapp-dev/animus-cli", rev = "d03cd174592370b48b22c1b368fa509e10dd1ce5" }
-orchestrator-config        = { git = "https://github.com/launchapp-dev/animus-cli", rev = "d03cd174592370b48b22c1b368fa509e10dd1ce5" }
-orchestrator-plugin-host   = { git = "https://github.com/launchapp-dev/animus-cli", rev = "d03cd174592370b48b22c1b368fa509e10dd1ce5" }
-orchestrator-logging       = { git = "https://github.com/launchapp-dev/animus-cli", rev = "d03cd174592370b48b22c1b368fa509e10dd1ce5" }
+orchestrator-core          = { git = "https://github.com/launchapp-dev/animus-cli", rev = "748f684df9948353db7a9fb915d42abe3f29aed9" }
+orchestrator-config        = { git = "https://github.com/launchapp-dev/animus-cli", rev = "748f684df9948353db7a9fb915d42abe3f29aed9" }
+orchestrator-plugin-host   = { git = "https://github.com/launchapp-dev/animus-cli", rev = "748f684df9948353db7a9fb915d42abe3f29aed9" }
+orchestrator-logging       = { git = "https://github.com/launchapp-dev/animus-cli", rev = "748f684df9948353db7a9fb915d42abe3f29aed9" }
 # rc.9 (#318/TASK-276): the task-status projection now writes through a
 # `TaskProjectionStore`. `resolve_task_projection_store` selects the subject
 # router when a `subject_backend` plugin owns `task`/`*` (portal) and falls back
 # to the in-tree hub store otherwise — the runner reuses the daemon's exact
 # builder so its own in-process projections route through the plugin instead of
 # the empty in-tree store (else finished/paused runs leave the subject stuck).
-orchestrator-daemon-runtime = { git = "https://github.com/launchapp-dev/animus-cli", rev = "d03cd174592370b48b22c1b368fa509e10dd1ce5" }
+orchestrator-daemon-runtime = { git = "https://github.com/launchapp-dev/animus-cli", rev = "748f684df9948353db7a9fb915d42abe3f29aed9" }
 # REQUIREMENT-048 Phase B: `inject_codex_config_overrides_list` (codex
 # reasoning-effort override on the env-exec argv) is provided by this ao-cli
 # workspace crate; pinned to the SAME kernel rev as the orchestrator-* crates
 # above so the shared runtime-contract types stay byte-identical.
-animus-runtime-shared      = { git = "https://github.com/launchapp-dev/animus-cli", rev = "d03cd174592370b48b22c1b368fa509e10dd1ce5" }
+animus-runtime-shared      = { git = "https://github.com/launchapp-dev/animus-cli", rev = "748f684df9948353db7a9fb915d42abe3f29aed9" }
 
 # --- stdlib-ish deps (move with the crate) ----------------------------------
 anyhow = "1.0"
@@ -103,11 +100,11 @@ tempfile = "3.10"
 # behind orchestrator-config's `test-utils` feature. Same kernel rev as the
 # normal dep above so cargo unifies them (this only turns on the extra feature
 # in test builds).
-orchestrator-config = { git = "https://github.com/launchapp-dev/animus-cli", rev = "d03cd174592370b48b22c1b368fa509e10dd1ce5", features = ["test-utils"] }
+orchestrator-config = { git = "https://github.com/launchapp-dev/animus-cli", rev = "748f684df9948353db7a9fb915d42abe3f29aed9", features = ["test-utils"] }
 # The env-var gate tests use `protocol::test_utils::EnvVarGuard`, gated behind
 # the protocol crate's `test-utils` feature. Same tag as the normal `protocol`
 # dep above so cargo just turns the extra feature on in test builds.
-protocol = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.7.0-rc.6", package = "protocol", features = ["test-utils"] }
+protocol = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.7.0-rc.8", package = "protocol", features = ["test-utils"] }
 
 # v0.5 lift: mirror the relevant relaxations from ao-cli's workspace lints
 # so the (byte-identical) lifted modules clear `clippy -- -D warnings`. As
