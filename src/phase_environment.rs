@@ -57,12 +57,13 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use animus_environment_protocol::{EnvironmentHandle, EnvironmentSpec, ExecResponse, ExecStream, HarnessCommand};
 use animus_plugin_protocol::error_codes::METHOD_NOT_SUPPORTED;
 use animus_session_backend::session::{SessionEvent, SessionRequest, SessionRun};
+use animus_session_backend::{extract_text_from_line, NormalizedTextEvent};
 use anyhow::{anyhow, Context, Result};
 use interprocess::local_socket::prelude::*;
 use interprocess::local_socket::{GenericFilePath, Stream as LocalSocketStream};
@@ -417,6 +418,7 @@ impl PreparedEnvironment {
             stdin,
             timeout,
             self.backend_label.clone(),
+            request.tool.clone(),
         ))
     }
 
@@ -561,9 +563,10 @@ fn apply_spec_overrides(spec: &mut EnvironmentSpec, overrides: BTreeMap<String, 
 /// contract path uses. Either way the argv is normalized for the env-exec
 /// transport:
 ///
-/// - machine-output flags are stripped (see [`plain_text_launch_args`]): the
-///   env path forwards raw stdout as text deltas rather than running a
-///   provider-plugin stream parser;
+/// - machine-output flags are KEPT: the env path runs the shared
+///   [`animus_session_backend::extract_text_from_line`] parser over the relayed
+///   stdout, the SAME parser the local subprocess backend uses, so the node
+///   streams clean text deltas live instead of surfacing raw JSON;
 /// - an explicit `permission_mode` is re-applied via
 ///   [`apply_permission_mode_to_launch`] (idempotent when the graft already
 ///   applied it), so a mode like `plan` is never silently dropped;
@@ -633,7 +636,6 @@ fn harness_command_for_request(
         args.push("--append-system-prompt".to_string());
         args.push(system.to_string());
     }
-    let args = plain_text_launch_args(&request.tool, args);
     // Launch a WRITE-CAPABLE phase in the tool's edit-permitting mode when no
     // explicit `permission_mode` is set — driven by the phase CAPABILITY (which
     // rides `extras.phase_capabilities`), not by `tool == "claude"` alone. Today
@@ -813,34 +815,6 @@ fn apply_codex_node_sandbox(tool: &str, mut args: Vec<String>) -> Vec<String> {
     args
 }
 
-/// Strip the machine-output flags from a launch argv so the command emits plain
-/// text. The env-exec path has no provider stream parser — stdout is surfaced
-/// directly as text deltas — so the structured-output mode would leak raw JSON
-/// into rendered/persisted output.
-fn plain_text_launch_args(tool: &str, args: Vec<String>) -> Vec<String> {
-    let normalized = tool.trim().to_ascii_lowercase();
-    let (strip_flags, strip_pairs): (&[&str], &[&str]) = match normalized.as_str() {
-        "claude" => (&["--verbose"], &["--output-format"]),
-        "codex" => (&["--json"], &[]),
-        "gemini" => (&[], &["--output-format"]),
-        "opencode" | "oai-runner" => (&[], &["--format"]),
-        _ => (&[], &[]),
-    };
-    let mut plain = Vec::with_capacity(args.len());
-    let mut iter = args.into_iter().peekable();
-    while let Some(arg) = iter.next() {
-        if strip_pairs.contains(&arg.as_str()) {
-            let _ = iter.next();
-            continue;
-        }
-        if strip_flags.contains(&arg.as_str()) {
-            continue;
-        }
-        plain.push(arg);
-    }
-    plain
-}
-
 /// Extract `(command, args)` from a `cli.launch` JSON block. Returns `None` when
 /// the block carries no non-empty `command`.
 fn launch_program_args(launch: &Value) -> Option<(String, Vec<String>)> {
@@ -921,6 +895,7 @@ pub(crate) fn spawn_environment_exec(
     stdin: Option<String>,
     timeout: Option<Duration>,
     backend_label: String,
+    tool: String,
 ) -> SessionRun {
     let (events_tx, events_rx) = mpsc::channel::<SessionEvent>(256);
     // The pipeline thread sends through an unbounded channel: the exec_stream
@@ -938,17 +913,41 @@ pub(crate) fn spawn_environment_exec(
 
     let selected_backend = backend_label.clone();
     std::thread::spawn(move || {
-        run_environment_exec_pipeline(backend.as_ref(), &handle, command, stdin, timeout, &backend_label, &pipeline_tx);
+        run_environment_exec_pipeline(
+            backend.as_ref(),
+            &handle,
+            command,
+            stdin,
+            timeout,
+            &backend_label,
+            &tool,
+            &pipeline_tx,
+        );
     });
 
     SessionRun { session_id: None, events: events_rx, selected_backend, fallback_reason: None, pid: None }
 }
 
+fn emit_parsed_stdout_line(line: &str, tool: &str, events: &mpsc::UnboundedSender<SessionEvent>) {
+    match extract_text_from_line(line, tool) {
+        NormalizedTextEvent::TextChunk { text } => {
+            let _ = events.send(SessionEvent::TextDelta { text });
+        }
+        NormalizedTextEvent::FinalResult { text } => {
+            let _ = events.send(SessionEvent::FinalText { text });
+        }
+        NormalizedTextEvent::Ignored => {}
+    }
+}
+
 /// The blocking exec_stream pipeline against a prepared `handle`. Emits the same
-/// event grammar the provider path does: `Started`, stdout deltas as
-/// `TextDelta`, stderr deltas as recoverable `Error` frames, then a terminal
-/// `Finished` (or an unrecoverable `Error`). Teardown is NOT performed here (the
-/// node is shared across phases and torn down once per run).
+/// event grammar the provider path does: `Started`, stdout run through the shared
+/// [`extract_text_from_line`] parser (the SAME one the local subprocess backend
+/// uses) into `TextDelta` / `FinalText`, stderr deltas as recoverable `Error`
+/// frames, then a terminal `Finished` (or an unrecoverable `Error`). Teardown is
+/// NOT performed here (the node is shared across phases and torn down once per
+/// run). The relayed stdout is machine-output (stream-json), so it is buffered
+/// into whole lines before parsing — an `on_output` chunk may split a line.
 fn run_environment_exec_pipeline(
     backend: &dyn EnvironmentExecBackend,
     handle: &EnvironmentHandle,
@@ -956,6 +955,7 @@ fn run_environment_exec_pipeline(
     stdin: Option<String>,
     timeout: Option<Duration>,
     backend_label: &str,
+    tool: &str,
     events: &mpsc::UnboundedSender<SessionEvent>,
 ) {
     let send = |event: SessionEvent| {
@@ -963,13 +963,27 @@ fn run_environment_exec_pipeline(
     };
     send(SessionEvent::Started { backend: backend_label.to_string(), session_id: None, pid: None });
 
+    let stdout_buffer = Arc::new(Mutex::new(String::new()));
+    let buffer_for_output = stdout_buffer.clone();
+    let tool_owned = tool.to_string();
     let stream_events = events.clone();
-    let on_output = move |stream: ExecStream, text: &str| {
-        let event = match stream {
-            ExecStream::Stdout => SessionEvent::TextDelta { text: text.to_string() },
-            ExecStream::Stderr => SessionEvent::Error { message: text.to_string(), recoverable: true },
-        };
-        let _ = stream_events.send(event);
+    let on_output = move |stream: ExecStream, text: &str| match stream {
+        ExecStream::Stdout => {
+            let mut lines = Vec::new();
+            {
+                let mut buf = buffer_for_output.lock().unwrap();
+                buf.push_str(text);
+                while let Some(nl) = buf.find('\n') {
+                    lines.push(buf.drain(..=nl).collect::<String>());
+                }
+            }
+            for line in lines {
+                emit_parsed_stdout_line(line.trim_end_matches(['\n', '\r']), &tool_owned, &stream_events);
+            }
+        }
+        ExecStream::Stderr => {
+            let _ = stream_events.send(SessionEvent::Error { message: text.to_string(), recoverable: true });
+        }
     };
 
     let result = match backend.exec_stream(handle, command.clone(), stdin.clone(), timeout, &on_output) {
@@ -979,8 +993,8 @@ fn run_environment_exec_pipeline(
         // once, post-hoc — deltas were never streamed.
         Err(err) if is_method_not_supported(&err) => {
             backend.exec(handle, command, stdin, timeout).inspect(|response| {
-                if !response.stdout.is_empty() {
-                    send(SessionEvent::FinalText { text: response.stdout.clone() });
+                for line in response.stdout.lines() {
+                    emit_parsed_stdout_line(line, tool, events);
                 }
                 if !response.stderr.is_empty() {
                     send(SessionEvent::Error { message: response.stderr.clone(), recoverable: true });
@@ -989,6 +1003,12 @@ fn run_environment_exec_pipeline(
         }
         result => result,
     };
+
+    let remainder = std::mem::take(&mut *stdout_buffer.lock().unwrap());
+    let remainder = remainder.trim_end_matches(['\n', '\r']);
+    if !remainder.is_empty() {
+        emit_parsed_stdout_line(remainder, tool, events);
+    }
 
     match result {
         Ok(response) if response.timed_out => send(SessionEvent::Error {
@@ -1779,36 +1799,40 @@ environment_routing:
     // -----------------------------------------------------------------
 
     #[test]
-    fn harness_command_builds_a_plain_text_launch_for_a_known_tool() {
+    fn harness_command_keeps_machine_output_for_stream_parsing() {
         let request = sample_request("claude");
         let (command, _stdin) = harness_command_for_request(Path::new("."), &request).expect("known tool builds");
         assert_eq!(command.program, "claude");
         assert!(command.args.contains(&"--print".to_string()), "launch args mirror the local argv: {:?}", command.args);
         assert_eq!(command.args.last().map(String::as_str), Some("do the thing"), "prompt rides the argv");
         assert!(
-            !command.args.iter().any(|arg| arg == "--output-format" || arg == "stream-json" || arg == "--verbose"),
-            "machine-output flags stripped for env exec: {:?}",
+            command.args.iter().any(|arg| arg == "stream-json") && command.args.iter().any(|arg| arg == "--verbose"),
+            "machine-output flags KEPT so the env path runs the shared stream parser: {:?}",
             command.args
         );
         assert!(command.cwd.is_none(), "cwd at the project root defaults to the environment's primary repo dir");
     }
 
     #[test]
-    fn plain_text_launch_strips_json_mode_per_tool() {
-        let codex = plain_text_launch_args(
-            "codex",
-            vec!["exec".to_string(), "--json".to_string(), "--full-auto".to_string(), "prompt".to_string()],
+    fn emit_parsed_stdout_line_maps_and_drops_envelope() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<SessionEvent>();
+        emit_parsed_stdout_line(
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}"#,
+            "claude",
+            &tx,
         );
-        assert_eq!(codex, vec!["exec".to_string(), "--full-auto".to_string(), "prompt".to_string()]);
+        emit_parsed_stdout_line(r#"{"type":"result","result":"Done"}"#, "claude", &tx);
+        emit_parsed_stdout_line(r#"{"type":"system","subtype":"init"}"#, "claude", &tx);
+        emit_parsed_stdout_line("", "claude", &tx);
+        drop(tx);
 
-        let gemini = plain_text_launch_args(
-            "gemini",
-            vec!["--output-format".to_string(), "json".to_string(), "-p".to_string(), "prompt".to_string()],
-        );
-        assert_eq!(gemini, vec!["-p".to_string(), "prompt".to_string()]);
-
-        let other = plain_text_launch_args("other", vec!["--json".to_string()]);
-        assert_eq!(other, vec!["--json".to_string()]);
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        assert_eq!(events.len(), 2, "text + result emitted, envelope + blank dropped: {events:?}");
+        assert!(matches!(&events[0], SessionEvent::TextDelta { text } if text == "Hello"));
+        assert!(matches!(&events[1], SessionEvent::FinalText { text } if text == "Done"));
     }
 
     #[test]
@@ -1861,7 +1885,7 @@ environment_routing:
     }
 
     #[test]
-    fn harness_command_strips_machine_output_from_a_contract_launch_too() {
+    fn harness_command_keeps_machine_output_from_a_contract_launch_too() {
         let mut request = sample_request("claude");
         request.extras = serde_json::json!({
             "phase_capabilities": { "writes_files": true },
@@ -1882,6 +1906,9 @@ environment_routing:
                 "--print".to_string(),
                 "--permission-mode".to_string(),
                 "bypassPermissions".to_string(),
+                "--verbose".to_string(),
+                "--output-format".to_string(),
+                "stream-json".to_string(),
                 "prompt".to_string()
             ]
         );
@@ -2180,7 +2207,11 @@ environment_routing:
     async fn env_exec_streams_deltas_through_the_session_channel() {
         let backend = Arc::new(FakeBackend::new());
         *backend.exec_stream_outcome.lock().unwrap() = Some(StreamOutcome::Deltas(
-            vec![(ExecStream::Stdout, "out-1".to_string()), (ExecStream::Stderr, "err-1".to_string())],
+            vec![
+                (ExecStream::Stdout, "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"tex".to_string()),
+                (ExecStream::Stdout, "t_delta\",\"text\":\"out-1\"}}\n".to_string()),
+                (ExecStream::Stderr, "err-1".to_string()),
+            ],
             Ok(ok_response(7)),
         ));
 
@@ -2191,6 +2222,7 @@ environment_routing:
             None,
             None,
             "environment:container".to_string(),
+            "claude".to_string(),
         );
         assert_eq!(run.selected_backend, "environment:container");
         let events = drain(run).await;
@@ -2283,6 +2315,7 @@ environment_routing:
             None,
             None,
             "environment:container".to_string(),
+            "claude".to_string(),
         );
         let events = drain(run).await;
         assert!(
@@ -2306,7 +2339,7 @@ environment_routing:
             }))));
         *backend.exec_result.lock().unwrap() = Some(Ok(ExecResponse {
             exit_code: Some(0),
-            stdout: "buffered-out".to_string(),
+            stdout: "{\"type\":\"result\",\"result\":\"buffered-out\"}".to_string(),
             stderr: "buffered-err".to_string(),
             timed_out: false,
         }));
@@ -2318,6 +2351,7 @@ environment_routing:
             None,
             None,
             "environment:container".to_string(),
+            "claude".to_string(),
         );
         let events = drain(run).await;
         assert_eq!(backend.exec_calls.load(Ordering::SeqCst), 1, "buffered exec retried exactly once");
@@ -2349,6 +2383,7 @@ environment_routing:
             None,
             None,
             "environment:container".to_string(),
+            "claude".to_string(),
         );
         let events = drain(run).await;
         assert!(
@@ -2375,6 +2410,7 @@ environment_routing:
             None,
             Some(Duration::from_secs(5)),
             "environment:container".to_string(),
+            "claude".to_string(),
         );
         let events = drain(run).await;
         assert!(
