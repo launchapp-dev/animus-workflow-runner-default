@@ -1256,6 +1256,7 @@ impl HeldEnvironment for BrokeredEnvironment {
             stdin,
             timeout_secs,
             self.backend_label.clone(),
+            request.tool.clone(),
         ))
     }
 
@@ -1341,6 +1342,7 @@ fn spawn_brokered_exec(
     stdin: Option<String>,
     timeout_secs: u64,
     backend_label: String,
+    tool: String,
 ) -> SessionRun {
     let (events_tx, events_rx) = mpsc::channel::<SessionEvent>(256);
     // The pipeline thread sends through an unbounded channel; the async forwarder
@@ -1357,7 +1359,7 @@ fn spawn_brokered_exec(
 
     let selected_backend = backend_label.clone();
     std::thread::spawn(move || {
-        run_brokered_exec_pipeline(&target, command, stdin, timeout_secs, &backend_label, &pipeline_tx);
+        run_brokered_exec_pipeline(&target, command, stdin, timeout_secs, &backend_label, &tool, &pipeline_tx);
     });
 
     SessionRun { session_id: None, events: events_rx, selected_backend, fallback_reason: None, pid: None }
@@ -1374,6 +1376,7 @@ fn run_brokered_exec_pipeline(
     stdin: Option<String>,
     timeout_secs: u64,
     backend_label: &str,
+    tool: &str,
     events: &mpsc::UnboundedSender<SessionEvent>,
 ) {
     let send = |event: SessionEvent| {
@@ -1381,16 +1384,38 @@ fn run_brokered_exec_pipeline(
     };
     send(SessionEvent::Started { backend: backend_label.to_string(), session_id: None, pid: None });
 
+    let stdout_buffer = Arc::new(Mutex::new(String::new()));
+    let buffer_for_output = stdout_buffer.clone();
+    let tool_owned = tool.to_string();
     let stream_events = events.clone();
-    let on_output = move |stream: BrokerStream, text: &str| {
-        let event = match stream {
-            BrokerStream::Stdout => SessionEvent::TextDelta { text: text.to_string() },
-            BrokerStream::Stderr => SessionEvent::Error { message: text.to_string(), recoverable: true },
-        };
-        let _ = stream_events.send(event);
+    let on_output = move |stream: BrokerStream, text: &str| match stream {
+        BrokerStream::Stdout => {
+            let mut lines = Vec::new();
+            {
+                let mut buf = buffer_for_output.lock().unwrap();
+                buf.push_str(text);
+                while let Some(nl) = buf.find('\n') {
+                    lines.push(buf.drain(..=nl).collect::<String>());
+                }
+            }
+            for line in lines {
+                emit_parsed_stdout_line(line.trim_end_matches(['\n', '\r']), &tool_owned, &stream_events);
+            }
+        }
+        BrokerStream::Stderr => {
+            let _ = stream_events.send(SessionEvent::Error { message: text.to_string(), recoverable: true });
+        }
     };
 
-    match brokered_exec_stream(target, command, stdin, timeout_secs, &on_output) {
+    let result = brokered_exec_stream(target, command, stdin, timeout_secs, &on_output);
+
+    let remainder = std::mem::take(&mut *stdout_buffer.lock().unwrap());
+    let remainder = remainder.trim_end_matches(['\n', '\r']);
+    if !remainder.is_empty() {
+        emit_parsed_stdout_line(remainder, tool, events);
+    }
+
+    match result {
         Ok(response) if response.timed_out => send(SessionEvent::Error {
             message: format!("environment exec timed out in {backend_label} after {timeout_secs}s"),
             recoverable: false,
@@ -2587,8 +2612,10 @@ environment_routing:
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn brokered_exec_session_mirrors_the_session_event_grammar() {
         let (_dir, path) = socket_path();
-        let server = serve_once(path.clone(), |_req, out| {
-            writeln!(out, r#"{{"out":"stdout","text":"delta"}}"#).unwrap();
+        let inner = r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"delta"}}"#;
+        let frame = serde_json::json!({"out": "stdout", "text": format!("{inner}\n")}).to_string();
+        let server = serve_once(path.clone(), move |_req, out| {
+            writeln!(out, "{frame}").unwrap();
             writeln!(out, r#"{{"done":{{"exit_code":3,"stdout":"","stderr":"","timed_out":false}}}}"#).unwrap();
             out.flush().unwrap();
         });
@@ -2598,7 +2625,8 @@ environment_routing:
             run_id: "run-1".to_string(),
             handle_id: "h-1".to_string(),
         };
-        let run = spawn_brokered_exec(target, command_for_test(), None, 60, "environment-broker:railway".to_string());
+        let run =
+            spawn_brokered_exec(target, command_for_test(), None, 60, "environment-broker:railway".to_string(), "claude".to_string());
         assert_eq!(run.selected_backend, "environment-broker:railway");
         let events = drain(run).await;
         assert!(
@@ -2607,7 +2635,7 @@ environment_routing:
         );
         assert!(
             events.iter().any(|e| matches!(e, SessionEvent::TextDelta { text } if text == "delta")),
-            "stdout rides TextDelta (same channel as the owned path): {events:?}"
+            "stream-json stdout is parsed to a clean TextDelta (same as the owned path): {events:?}"
         );
         assert!(
             matches!(events.last(), Some(SessionEvent::Finished { exit_code: Some(3) })),
@@ -2627,7 +2655,8 @@ environment_routing:
             run_id: "run-1".to_string(),
             handle_id: "h-1".to_string(),
         };
-        let run = spawn_brokered_exec(target, command_for_test(), None, 60, "environment-broker:railway".to_string());
+        let run =
+            spawn_brokered_exec(target, command_for_test(), None, 60, "environment-broker:railway".to_string(), "claude".to_string());
         let events = drain(run).await;
         assert!(
             matches!(
