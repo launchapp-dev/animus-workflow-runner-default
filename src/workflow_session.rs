@@ -153,6 +153,7 @@ pub(crate) fn environment_is_session_capable(_project_root: &Path, _environment_
 #[cfg(not(feature = "remote-animus-session"))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn delegate_workflow_via_session(
+    _hub: std::sync::Arc<dyn orchestrator_core::services::ServiceHub>,
     _project_root: &str,
     environment_id: &str,
     workflow_id: &str,
@@ -189,6 +190,7 @@ pub(crate) async fn delegate_workflow_via_session(
 #[cfg(feature = "remote-animus-session")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn delegate_workflow_via_session(
+    hub: std::sync::Arc<dyn orchestrator_core::services::ServiceHub>,
     project_root: &str,
     environment_id: &str,
     workflow_id: &str,
@@ -315,6 +317,45 @@ pub(crate) async fn delegate_workflow_via_session(
     let response = rx.await.map_err(|_| anyhow!("remote-animus session thread terminated unexpectedly"))??;
 
     let workflow_status = session_status_to_workflow_status(&response.status);
+
+    // REQ-052 exact-once: the delegated node already ran every phase; drive the
+    // PARENT's persisted workflow state machine to terminal so its `journal_runs`
+    // row leaves `running`. Without this the daemon's journal-resume sweep
+    // (`resumable_orphans_for_redispatch`, past the 90s grace) re-dispatches the
+    // run as a "resumable orphan" until a re-dispatch happens to terminalize the
+    // row -- ~3 runs per dispatch instead of exactly 1.
+    //
+    // BEST-EFFORT: the single terminal event is still emitted below and the
+    // synthesized result is returned unchanged; a transition hiccup must NEVER
+    // fail an otherwise-successful delegated run. These are PURE state-machine
+    // transitions (no agents, no post-success -- the node already did the work);
+    // the bounded loop + `is_terminal_workflow_status` guard prevents any
+    // rework/verdict loop from spinning.
+    match workflow_status {
+        WorkflowStatus::Completed => {
+            for _ in 0..=phases_requested.len() {
+                match hub.workflows().get(workflow_id).await {
+                    Ok(wf) if crate::workflow_execute::is_terminal_workflow_status(wf.status) => break,
+                    Ok(_) => {
+                        if hub.workflows().complete_current_phase_with_decision(workflow_id, None).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        WorkflowStatus::Failed | WorkflowStatus::Escalated => {
+            let _ = hub
+                .workflows()
+                .mark_completed_failed(workflow_id, format!("remote-animus session ended {}", response.status))
+                .await;
+        }
+        WorkflowStatus::Cancelled => {
+            let _ = hub.workflows().cancel(workflow_id).await;
+        }
+        _ => {}
+    }
 
     // Emit the single terminal workflow event home (the driver owns it; the
     // journal map deliberately does not forward node-level terminal events).

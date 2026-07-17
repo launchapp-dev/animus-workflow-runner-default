@@ -350,6 +350,7 @@ pub async fn execute_workflow_with_hub(
                 let phases_requested: Vec<String> =
                     workflow.phases.iter().map(|phase| phase.phase_id.clone()).collect();
                 return crate::workflow_session::delegate_workflow_via_session(
+                    hub.clone(),
                     &params.project_root,
                     &environment.id,
                     &workflow.id,
@@ -1564,7 +1565,7 @@ fn phase_rework_context(outcome: &PhaseExecutionOutcome) -> Option<String> {
     }
 }
 
-fn is_terminal_workflow_status(status: WorkflowStatus) -> bool {
+pub(crate) fn is_terminal_workflow_status(status: WorkflowStatus) -> bool {
     matches!(
         status,
         WorkflowStatus::Completed | WorkflowStatus::Failed | WorkflowStatus::Escalated | WorkflowStatus::Cancelled
