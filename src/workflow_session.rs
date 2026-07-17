@@ -111,6 +111,69 @@ pub(crate) fn session_status_to_workflow_status(status: &str) -> WorkflowStatus 
     }
 }
 
+/// Agent-run transcript event kinds -- the fine-grained session stream that
+/// carries a [`protocol::AgentRunEvent`] payload and must be MIRRORED into the
+/// parent run dir (so the daemon's log_storage supervisor offloads it under the
+/// parent workflow id, the id the portal's `/api/workflows/<id>/logs` reads).
+///
+/// Workflow LIFECYCLE kinds (`phase_*`, `run_*`, `workflow_*`) are deliberately
+/// EXCLUDED: they reach the parent journal via the upstream backend proxy, so
+/// mirroring them here would double-journal. Pure; unit-tested.
+#[cfg_attr(not(feature = "remote-animus-session"), allow(dead_code))]
+pub(crate) fn is_transcript_event_kind(event_kind: &str) -> bool {
+    matches!(
+        event_kind,
+        "output_chunk" | "tool_call" | "tool_result" | "thinking" | "started" | "finished" | "metadata" | "error" | "artifact"
+    )
+}
+
+/// Re-key a node-local agent-run `run_id` onto the PARENT workflow id so the
+/// portal groups the mirrored transcript under the parent run (the log read path
+/// matches a `wf-<workflow_id>-` prefix). Swaps the node workflow id in place
+/// when it is present in the run id (preserving the `-<phase>-<attempt>-...`
+/// suffix); otherwise prefixes the parent id. Pure; unit-tested.
+#[cfg_attr(not(feature = "remote-animus-session"), allow(dead_code))]
+pub(crate) fn rekey_transcript_run_id(orig_run_id: &str, node_workflow_id: &str, parent_workflow_id: &str) -> String {
+    if !node_workflow_id.is_empty() && orig_run_id.contains(node_workflow_id) {
+        orig_run_id.replacen(node_workflow_id, parent_workflow_id, 1)
+    } else if let Some(rest) = orig_run_id.strip_prefix("wf-") {
+        format!("wf-{parent_workflow_id}-{rest}")
+    } else {
+        format!("wf-{parent_workflow_id}-{orig_run_id}")
+    }
+}
+
+/// Mirror one relayed transcript event into the PARENT run dir's `events.jsonl`
+/// (re-keyed to the parent workflow id) so the daemon's log_storage supervisor
+/// offloads it to the same store the portal reads. Non-transcript events and
+/// malformed payloads are ignored; a persist error is swallowed so it never
+/// disturbs the delegated run.
+#[cfg(feature = "remote-animus-session")]
+fn persist_session_transcript(
+    project_root: &str,
+    parent_workflow_id: &str,
+    event: &orchestrator_core::EnvironmentJournalEvent,
+) {
+    if !is_transcript_event_kind(&event.event_kind) {
+        return;
+    }
+    let mut payload = event.payload.clone();
+    let Some(obj) = payload.as_object_mut() else {
+        return;
+    };
+    let Some(orig_run_id) = obj.get("run_id").and_then(|value| value.as_str()).map(str::to_string) else {
+        return;
+    };
+    let node_workflow_id = event.workflow_id.as_deref().unwrap_or_default();
+    let new_run_id = rekey_transcript_run_id(&orig_run_id, node_workflow_id, parent_workflow_id);
+    obj.insert("run_id".to_string(), serde_json::Value::String(new_run_id.clone()));
+    let Ok(agent_event) = serde_json::from_value::<protocol::AgentRunEvent>(payload) else {
+        return;
+    };
+    let dir = crate::ipc::run_dir(project_root, &protocol::RunId(new_run_id), None);
+    let _ = crate::ipc::persist_run_event(&dir, &agent_event);
+}
+
 /// Whether the environment `environment_id` is session-capable -- it advertises
 /// `environment/exec_session` (REQ-052) -- so the whole workflow should be
 /// delegated to it rather than run phase-by-phase.
@@ -222,10 +285,15 @@ pub(crate) async fn delegate_workflow_via_session(
     // Clones captured by the (Fn + Send + Sync) journal callback.
     let emitter = event_emitter.cloned();
     let workflow_id_for_events = workflow_id.to_string();
+    let project_root_for_journal = project_root.to_string();
     let phase_results_sink = phase_results.clone();
     let phases_completed_sink = phases_completed.clone();
 
     let on_journal = move |event: &EnvironmentJournalEvent| {
+        // Mirror the node's agent-run transcript (output chunks, tool calls, ...)
+        // into the PARENT run dir; lifecycle events fall through to the coarse map.
+        persist_session_transcript(&project_root_for_journal, &workflow_id_for_events, event);
+
         let Some(kind) = map_journal_event_kind(&event.event_kind) else {
             return;
         };
@@ -474,6 +542,31 @@ mod tests {
         assert_eq!(map_journal_event_kind("run_completed"), None);
         assert_eq!(map_journal_event_kind("output_chunk"), None);
         assert_eq!(map_journal_event_kind("tool_call"), None);
+    }
+
+    #[test]
+    fn transcript_kinds_exclude_lifecycle() {
+        for kind in ["output_chunk", "tool_call", "tool_result", "thinking", "started", "finished", "metadata", "error", "artifact"] {
+            assert!(is_transcript_event_kind(kind), "{kind} should mirror to the parent transcript");
+        }
+        for kind in ["phase_started", "phase_completed", "phase_failed", "run_completed", "workflow_completed"] {
+            assert!(!is_transcript_event_kind(kind), "{kind} is lifecycle -- must not be mirrored");
+        }
+    }
+
+    #[test]
+    fn rekey_swaps_node_workflow_id_for_parent() {
+        // A node run id embeds the node workflow uuid; swapping it for the parent's
+        // preserves the phase/attempt suffix so the portal groups it under the parent.
+        let orig = "wf-11111111-1111-1111-1111-111111111111-code-implement-0-c0-a1-deadbeef";
+        let got = rekey_transcript_run_id(orig, "11111111-1111-1111-1111-111111111111", "PARENT");
+        assert_eq!(got, "wf-PARENT-code-implement-0-c0-a1-deadbeef");
+    }
+
+    #[test]
+    fn rekey_prefixes_when_node_id_absent() {
+        assert_eq!(rekey_transcript_run_id("wf-abc-code-check-0", "", "PARENT"), "wf-PARENT-abc-code-check-0");
+        assert_eq!(rekey_transcript_run_id("loose-id", "nope", "PARENT"), "wf-PARENT-loose-id");
     }
 
     #[test]
