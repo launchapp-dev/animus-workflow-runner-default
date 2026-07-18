@@ -338,6 +338,11 @@ pub(crate) async fn delegate_workflow_via_session(
     let subject_id_owned = subject_id.to_string();
     let workflow_ref_owned = workflow_ref.to_string();
     let dispatch_input_owned = dispatch_input.map(str::to_string);
+    // REQ-052 one-id (TASK-723): hand the delegating run's id to the node so it
+    // RESUMES this row (`execute --workflow-id`) instead of minting its own --
+    // exactly ONE journal_runs row per dispatch, and the transcript mirror
+    // re-keys to a no-op. `None`-tolerant on the wire (old env plugins ignore it).
+    let workflow_id_owned = workflow_id.to_string();
 
     let (tx, rx) = tokio::sync::oneshot::channel();
     std::thread::spawn(move || {
@@ -365,6 +370,7 @@ pub(crate) async fn delegate_workflow_via_session(
                     subject_id_owned,
                     Some(workflow_ref_owned),
                     dispatch_input_owned,
+                    Some(workflow_id_owned),
                     on_journal,
                 );
                 // Best-effort teardown regardless of the session outcome.
@@ -413,14 +419,34 @@ pub(crate) async fn delegate_workflow_via_session(
                 }
             }
         }
+        // REQ-052 one-id: the node journals INTO this shared row and terminalizes
+        // it itself, so it is normally ALREADY terminal here. These are pure
+        // BACKSTOPS for the crash/lag case where the node did NOT record its
+        // terminal. `force_failed` / `cancel` NO-OP internally on any
+        // already-terminal status -- the terminal guard lives INSIDE the service
+        // op's load-mutate-save (not a racy caller-side pre-check) -- so they can
+        // never clobber the node's richer terminal (Completed / Escalated /
+        // Cancelled). An error is logged (not swallowed) so a stuck-Running row is
+        // diagnosable instead of silently inviting orphan re-dispatch.
         WorkflowStatus::Failed | WorkflowStatus::Escalated => {
-            let _ = hub
+            if let Err(err) = hub
                 .workflows()
-                .mark_completed_failed(workflow_id, format!("remote-animus session ended {}", response.status))
-                .await;
+                .force_failed(workflow_id, format!("remote-animus session ended {}", response.status))
+                .await
+            {
+                eprintln!(
+                    "warning: remote-animus session backstop force_failed('{workflow_id}') failed: {err:#} \
+                     (shared row may remain Running; daemon reconciliation will retry)"
+                );
+            }
         }
         WorkflowStatus::Cancelled => {
-            let _ = hub.workflows().cancel(workflow_id).await;
+            if let Err(err) = hub.workflows().cancel(workflow_id).await {
+                eprintln!(
+                    "warning: remote-animus session backstop cancel('{workflow_id}') failed: {err:#} \
+                     (shared row may remain Running; daemon reconciliation will retry)"
+                );
+            }
         }
         _ => {}
     }
