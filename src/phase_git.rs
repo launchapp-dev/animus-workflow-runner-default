@@ -67,18 +67,25 @@ pub fn ensure_git_identity(cwd: &str) -> Result<()> {
 }
 
 pub fn commit_implementation_changes(cwd: &str, commit_message: &str) -> Result<()> {
-    let commit_message = commit_message.trim();
-    if commit_message.is_empty() {
-        anyhow::bail!("implementation phase requires a non-empty commit message");
-    }
+    // Do NOT force a commit or require a git repo. Portal-harness / orchestration
+    // agent phases run at a non-repo project root (e.g. /app) and edit no files;
+    // failing them here ("requires a git repository for commit") was wrong. Coding
+    // phases run in a cloned repo and their `code-open-pr` phase commits + pushes
+    // explicitly, so this auto-commit is only a convenience for the in-repo case.
+    // No repo, or no pending changes -> nothing to do (no-op, not an error).
     if !is_git_repo(cwd) {
-        anyhow::bail!("implementation phase requires a git repository for commit at {}", cwd);
+        tracing::debug!(cwd, "commit skipped — not a git repository (non-coding phase)");
+        return Ok(());
     }
     if !git_has_pending_changes(cwd)? {
         tracing::info!(cwd, "No pending changes to commit — agent likely already committed");
         return Ok(());
     }
 
+    let commit_message = commit_message.trim();
+    if commit_message.is_empty() {
+        anyhow::bail!("implementation phase requires a non-empty commit message");
+    }
     ensure_git_identity(cwd)?;
     git_status(cwd, &["add", "-A"], "stage implementation changes")?;
     git_status(cwd, &["commit", "-m", commit_message], "commit implementation changes")?;
