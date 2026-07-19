@@ -279,7 +279,7 @@ pub async fn handle_workflow_execute(request: WorkflowExecuteRequest) -> Result<
     };
 
     let recorder_dyn: crate::workflow_event_emitter::SharedWorkflowEventEmitter = recorder.clone();
-    let internal = execute_workflow_with_hub(params, state.hub.clone(), Some(recorder_dyn)).await?;
+    let internal = execute_workflow_with_hub(params, state.hub.clone(), Some(recorder_dyn), None).await?;
 
     let phase_results = internal.phase_results.into_iter().map(snapshot_from_value).collect();
 

@@ -240,8 +240,12 @@ async fn run_execute_inner(args: ExecuteArgs) -> anyhow::Result<u8> {
     }
 
     let event_emitter = compose_event_emitter();
+    // TASK-811: capture the resolved workflow id even when execution returns Err
+    // (e.g. a delegated `prepare` failure), so `runner_complete` below can carry
+    // it and the daemon can terminalize the run instead of leaving a ghost.
+    let workflow_id_sink = Arc::new(std::sync::Mutex::new(None::<String>));
     let wf_start = std::time::Instant::now();
-    let result = execute_workflow_with_hub(params, hub, event_emitter).await;
+    let result = execute_workflow_with_hub(params, hub, event_emitter, Some(workflow_id_sink.clone())).await;
     let wf_duration = wf_start.elapsed();
 
     {
@@ -293,7 +297,13 @@ async fn run_execute_inner(args: ExecuteArgs) -> anyhow::Result<u8> {
     let completion = RunnerEvent {
         event: "runner_complete",
         task_id: subject_id,
-        workflow_id: result.as_ref().ok().map(|value| value.workflow_id.clone()),
+        // On success, the result carries the id; on failure, fall back to the
+        // sink so a failed (e.g. delegated-prepare) run still terminalizes (TASK-811).
+        workflow_id: result
+            .as_ref()
+            .ok()
+            .map(|value| value.workflow_id.clone())
+            .or_else(|| workflow_id_sink.lock().ok().and_then(|slot| slot.clone())),
         workflow_ref,
         workflow_status,
         exit_code: Some(exit_code),

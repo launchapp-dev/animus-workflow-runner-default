@@ -220,6 +220,12 @@ pub async fn execute_workflow_with_hub(
     mut params: WorkflowExecuteInternalParams,
     hub: Arc<dyn ServiceHub>,
     event_emitter: Option<SharedWorkflowEventEmitter>,
+    // TASK-811: publishes the resolved workflow id as soon as the row is
+    // minted/loaded, so a caller can TERMINALIZE the run even when execution
+    // fails downstream (e.g. a delegated `prepare` failure). Without it the
+    // `runner_complete` Err arm carries `workflow_id: None` and the daemon
+    // cannot mark the run Failed — it ghosts as "Running" forever.
+    workflow_id_sink: Option<Arc<std::sync::Mutex<Option<String>>>>,
 ) -> Result<WorkflowExecuteInternalResult> {
     let routing = params.phase_routing.take().unwrap_or_default();
     let phase_timeout_secs = params.phase_timeout_secs;
@@ -251,6 +257,15 @@ pub async fn execute_workflow_with_hub(
             })?
         }
     };
+    // TASK-811: the row now exists (minted or loaded) and its id is known BEFORE
+    // any phase / delegated prepare runs. Publish it so a downstream failure can
+    // still terminalize this exact run instead of ghosting.
+    if let Some(sink) = &workflow_id_sink {
+        if let Ok(mut slot) = sink.lock() {
+            *slot = Some(workflow.id.clone());
+        }
+    }
+
     // rc.6 Option-ized `OrchestratorWorkflow.subject` to support genuinely
     // subjectless runs. This runner binds a concrete subject for every dispatch
     // path (task / requirement / title / subject-id); a subjectless workflow is
