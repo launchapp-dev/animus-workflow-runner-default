@@ -7,7 +7,7 @@
 //! 2). When a workflow routes to a NON-LOCAL environment (a container / remote
 //! sandbox plugin), [`workflow_execute`](crate::workflow_execute) resolves it
 //! ONCE at the start of the run and prepares a single bare node
-//! ([`PreparedEnvironment::prepare`]). Each phase's harness command is then
+//! ([`PreparedEnvironment::prepare_off_runtime`]). Each phase's harness command is then
 //! executed INSIDE that held node via [`PreparedEnvironment::exec_session`]
 //! (`exec_stream` on the SAME pinned [`EnvironmentClient`] + [`EnvironmentHandle`]),
 //! with the streamed stdout/stderr surfaced through the SAME [`SessionEvent`]
@@ -62,6 +62,7 @@ use std::time::Duration;
 
 use animus_environment_protocol::{EnvironmentHandle, EnvironmentSpec, ExecResponse, ExecStream, HarnessCommand};
 use animus_plugin_protocol::error_codes::METHOD_NOT_SUPPORTED;
+use chrono::Utc;
 use animus_session_backend::session::{SessionEvent, SessionRequest, SessionRun};
 use animus_session_backend::{extract_text_from_line, NormalizedTextEvent};
 use anyhow::{anyhow, Context, Result};
@@ -231,6 +232,29 @@ pub trait HeldEnvironment: Send + Sync {
         stdin: Option<String>,
         timeout: Option<std::time::Duration>,
     ) -> Result<EnvCommandOutput>;
+
+    /// Persist THIS run's delegated-node binding into the given phase checkpoint
+    /// so a daemon restart can reap / reattach the node by handle (companion to
+    /// animus-cli#345). The runner-owned [`PreparedEnvironment`] writes the
+    /// binding; the daemon-owned [`BrokeredEnvironment`] is a deliberate no-op —
+    /// the DAEMON owns that node's lifecycle and reconciles its own binding, and
+    /// the broker acquire only yields a `handle_id`, not the full handle metadata
+    /// teardown-by-handle needs. Default = no-op (brokered).
+    fn persist_binding(&self, _scoped_root: &Path, _workflow_id: &str, _phase_id: &str) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Probe whether a persisted delegated node is still reachable: a trivial,
+/// side-effect-free `exec` of `true` with a short timeout. `Ok` (the node
+/// answered, regardless of exit code) = alive; any transport / plugin error =
+/// dead or unreachable. There is no environment `status` method, so this exec IS
+/// the liveness check — it mirrors the ao-cli #345 `probe_delegate` intent. A
+/// dead probe means the re-dispatch prepares a fresh node instead of reusing.
+fn probe_handle_alive(backend: &dyn EnvironmentExecBackend, handle: &EnvironmentHandle) -> bool {
+    const PROBE_TIMEOUT_SECS: u64 = 10;
+    let command = HarnessCommand { program: "true".to_string(), args: Vec::new(), env: BTreeMap::new(), cwd: None };
+    backend.exec(handle, command, None, Some(Duration::from_secs(PROBE_TIMEOUT_SECS))).is_ok()
 }
 
 /// The buffered result of a RAW command exec inside a held node (REQUIREMENT-048
@@ -290,6 +314,15 @@ pub struct PreparedEnvironment {
     id: String,
     backend_label: String,
     torn_down: AtomicBool,
+    /// True when this node was REUSED from a persisted binding (a daemon-restart
+    /// re-dispatch reattached to a still-live node) rather than freshly
+    /// prepared. Diagnostic only — the exec/teardown path is identical.
+    reused: bool,
+    /// The phase checkpoints this node's binding was persisted into (via
+    /// [`Self::persist_binding`]). On a successful [`Self::teardown`] each is
+    /// flipped `torn_down` so the daemon reconciler (animus-cli#345) does not
+    /// try to re-reap a node that is already gone.
+    bound_phases: Mutex<Vec<(PathBuf, String, String)>>,
     /// A DEDICATED tokio runtime that owns the resident host's stdio I/O driver
     /// for the whole environment lifetime. The lease's driver is spawned (via
     /// `tokio::spawn`) onto whatever runtime is current when the host is first
@@ -303,25 +336,6 @@ pub struct PreparedEnvironment {
 }
 
 impl PreparedEnvironment {
-    /// Resolve the environment plugin and prepare a BARE node for the whole run.
-    /// Blocking (the [`EnvironmentClient`] surface is blocking) — call via
-    /// [`Self::prepare_off_runtime`] from an async context.
-    pub(crate) fn prepare(
-        project_root: &Path,
-        environment: &ResolvedEnvironment,
-        github_repo: Option<&str>,
-    ) -> Result<Self> {
-        let environment_id = environment.id.as_str();
-        let client = EnvironmentClient::resolve(project_root, environment_id).map_err(|err| {
-            anyhow!(
-                "workflow run is routed to environment '{environment_id}' but no usable environment plugin was \
-                 resolved (the run is NOT executed locally when an environment is requested): {err}"
-            )
-        })?;
-        let backend_label = format!("environment:{}", client.plugin_name());
-        Self::prepare_with_backend(Arc::new(client), backend_label, environment, github_repo)
-    }
-
     /// Prepare against an already-resolved backend (production wraps an
     /// [`EnvironmentClient`]; tests inject a fake). Builds a BARE
     /// [`EnvironmentSpec`] (no repos) and applies any routing-rule `spec`
@@ -354,8 +368,106 @@ impl PreparedEnvironment {
             id: environment.id.clone(),
             backend_label,
             torn_down: AtomicBool::new(false),
+            reused: false,
+            bound_phases: Mutex::new(Vec::new()),
             runtime: None,
         })
+    }
+
+    /// Build a [`PreparedEnvironment`] that REUSES an already-prepared node
+    /// (from a persisted [`crate::phase_session::EnvironmentBinding`]) instead of
+    /// preparing a fresh one. NO `prepare` RPC is issued — the caller has already
+    /// verified the node is live via [`probe_handle_alive`]. This is the
+    /// re-dispatch resume path (companion to the ao-cli #345
+    /// `spawn_environment_resume` intent): on a daemon restart the runner
+    /// reattaches to the SAME node (its on-disk workspace, and thus the phase's
+    /// in-progress edits, are intact) rather than leaking it and materializing a
+    /// new one.
+    fn reuse_prepared_handle(
+        backend: Arc<dyn EnvironmentExecBackend>,
+        backend_label: String,
+        environment_id: String,
+        handle: EnvironmentHandle,
+    ) -> Self {
+        Self {
+            backend,
+            handle,
+            id: environment_id,
+            backend_label,
+            torn_down: AtomicBool::new(false),
+            reused: true,
+            bound_phases: Mutex::new(Vec::new()),
+            runtime: None,
+        }
+    }
+
+    /// Either REUSE a persisted node (when `reuse_candidate` is `Some` and the
+    /// node still answers a liveness probe) or prepare a FRESH one (no candidate,
+    /// or the candidate is dead/unreachable). This is the re-dispatch entry the
+    /// runner uses after a restart: it never blindly prepares over a live node
+    /// (which would leak it), and it never trusts a dead binding. Must run inside
+    /// the dedicated environment runtime (the client's I/O driver binds there),
+    /// so it is only called from [`Self::prepare_off_runtime`].
+    fn reuse_or_prepare_with_backend(
+        backend: Arc<dyn EnvironmentExecBackend>,
+        backend_label: String,
+        environment: &ResolvedEnvironment,
+        github_repo: Option<&str>,
+        reuse_candidate: Option<EnvironmentHandle>,
+    ) -> Result<Self> {
+        if let Some(handle) = reuse_candidate {
+            if probe_handle_alive(backend.as_ref(), &handle) {
+                return Ok(Self::reuse_prepared_handle(backend, backend_label, environment.id.clone(), handle));
+            }
+        }
+        Self::prepare_with_backend(backend, backend_label, environment, github_repo)
+    }
+
+    /// Resolve the environment plugin backend (production wraps an
+    /// [`EnvironmentClient`]). Split out of [`Self::prepare`] so the re-dispatch
+    /// path can resolve the backend once and then decide reuse-vs-prepare.
+    fn resolve_backend(
+        project_root: &Path,
+        environment: &ResolvedEnvironment,
+    ) -> Result<(Arc<dyn EnvironmentExecBackend>, String)> {
+        let environment_id = environment.id.as_str();
+        let client = EnvironmentClient::resolve(project_root, environment_id).map_err(|err| {
+            anyhow!(
+                "workflow run is routed to environment '{environment_id}' but no usable environment plugin was \
+                 resolved (the run is NOT executed locally when an environment is requested): {err}"
+            )
+        })?;
+        let backend_label = format!("environment:{}", client.plugin_name());
+        Ok((Arc::new(client), backend_label))
+    }
+
+    /// True when this node was reused from a persisted binding rather than
+    /// freshly prepared (diagnostics / tests).
+    pub(crate) fn was_reused(&self) -> bool {
+        self.reused
+    }
+
+    /// Persist THIS node's binding into the given phase checkpoint (companion to
+    /// animus-cli#345): the daemon's restart reconciler reads it back to reap /
+    /// reattach the node by handle. Called by the runner right after the phase's
+    /// pending checkpoint is written, before any exec — so a crash mid-phase
+    /// leaves a durable binding. Remembers the phase so a later [`Self::teardown`]
+    /// can flip its `torn_down`. Overwrites a prior (e.g. dead) binding.
+    pub(crate) fn persist_binding(&self, scoped_root: &Path, workflow_id: &str, phase_id: &str) -> Result<()> {
+        let binding = crate::phase_session::EnvironmentBinding {
+            environment_id: self.id.clone(),
+            handle: self.handle.clone(),
+            bound_at: Utc::now().to_rfc3339(),
+            torn_down: false,
+        };
+        crate::phase_session::update_session_environment(scoped_root, workflow_id, phase_id, binding)
+            .map_err(|err| anyhow!("failed to persist environment binding for {workflow_id}/{phase_id}: {err}"))?;
+        self.bound_phases.lock().unwrap().push((
+            scoped_root.to_path_buf(),
+            workflow_id.to_string(),
+            phase_id.to_string(),
+        ));
+        Ok(())
     }
 
     /// Prepare the node on a DEDICATED, long-lived runtime and hand that runtime
@@ -373,6 +485,7 @@ impl PreparedEnvironment {
         project_root: &Path,
         environment: &ResolvedEnvironment,
         github_repo: Option<String>,
+        reuse_candidate: Option<EnvironmentHandle>,
     ) -> Result<Self> {
         let project_root = project_root.to_path_buf();
         let environment = environment.clone();
@@ -384,10 +497,22 @@ impl PreparedEnvironment {
                     .enable_all()
                     .build()
                     .context("building dedicated runtime for the environment host")?;
-                // Lease + prepare INSIDE this runtime so the host's I/O driver
-                // binds here (not to a per-call throwaway that would die on return).
-                let mut prepared =
-                    runtime.block_on(async { Self::prepare(&project_root, &environment, github_repo.as_deref()) })?;
+                // Resolve + (reuse|prepare) INSIDE this runtime so the host's I/O
+                // driver binds here (not to a per-call throwaway that would die on
+                // return). When a persisted binding is handed in and its node still
+                // answers a liveness probe, REUSE it (skip prepare) so a restart
+                // reattaches to the same node instead of leaking it; otherwise
+                // prepare a fresh one.
+                let mut prepared = runtime.block_on(async {
+                    let (backend, backend_label) = Self::resolve_backend(&project_root, &environment)?;
+                    Self::reuse_or_prepare_with_backend(
+                        backend,
+                        backend_label,
+                        &environment,
+                        github_repo.as_deref(),
+                        reuse_candidate,
+                    )
+                })?;
                 prepared.runtime = Some(runtime);
                 Ok::<_, anyhow::Error>(prepared)
             })();
@@ -433,12 +558,33 @@ impl PreparedEnvironment {
         let backend = self.backend.clone();
         let handle = self.handle.clone();
         let backend_label = self.backend_label.clone();
-        let _ = std::thread::spawn(move || {
-            if let Err(err) = backend.teardown(&handle) {
-                eprintln!("warning: environment teardown failed for {backend_label} (handle {}): {err:#}", handle.id);
+        let handle_id = self.handle.id.clone();
+        let outcome = std::thread::spawn(move || backend.teardown(&handle)).join();
+        match outcome {
+            Ok(Ok(())) => {
+                // Node reaped: flip every phase checkpoint bound to it so the
+                // daemon reconciler (animus-cli#345) does not try to re-reap a
+                // node that is already gone.
+                let bound = std::mem::take(&mut *self.bound_phases.lock().unwrap());
+                for (scoped_root, workflow_id, phase_id) in bound {
+                    if let Err(err) =
+                        crate::phase_session::mark_environment_torn_down(&scoped_root, &workflow_id, &phase_id)
+                    {
+                        eprintln!(
+                            "warning: environment torn down but failed to mark checkpoint {workflow_id}/{phase_id}: {err}"
+                        );
+                    }
+                }
             }
-        })
-        .join();
+            Ok(Err(err)) => {
+                // Teardown failed: leave the bindings NOT torn_down so the daemon
+                // reconciler retries the reap on its next sweep.
+                eprintln!("warning: environment teardown failed for {backend_label} (handle {handle_id}): {err:#}");
+            }
+            Err(_) => {
+                eprintln!("warning: environment teardown thread panicked for {backend_label} (handle {handle_id})");
+            }
+        }
     }
 }
 
@@ -499,6 +645,10 @@ impl HeldEnvironment for PreparedEnvironment {
             .map_err(|_| anyhow!("environment exec_command thread panicked"))?
             .map_err(|err| anyhow!("environment exec_command failed in {backend_label}: {err:#}"))?;
         Ok(response.into())
+    }
+
+    fn persist_binding(&self, scoped_root: &Path, workflow_id: &str, phase_id: &str) -> Result<()> {
+        PreparedEnvironment::persist_binding(self, scoped_root, workflow_id, phase_id)
     }
 }
 
@@ -2296,6 +2446,124 @@ environment_routing:
         assert!(format!("{err:#}").contains("prepare failed"), "error names the failed prepare: {err:#}");
         assert_eq!(backend.exec_calls.load(Ordering::SeqCst), 0, "nothing executed after a failed prepare");
         assert_eq!(backend.teardown_calls.load(Ordering::SeqCst), 0, "no handle -> no teardown");
+    }
+
+    // -----------------------------------------------------------------
+    // TASK-933 (companion to animus-cli#345): persist binding on prepare,
+    // mark torn_down on teardown, reuse a live node / prepare fresh on dead.
+    // -----------------------------------------------------------------
+
+    /// A runner-owned prepared node persists its binding (env id + full handle)
+    /// into the phase checkpoint — THE write the daemon restart reconciler reads.
+    #[test]
+    fn prepare_success_persists_binding_into_the_phase_checkpoint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scoped_root = tmp.path();
+        crate::phase_session::write_session_pending(scoped_root, "wf-1", "impl", "claude", "run-1", None)
+            .expect("pending");
+
+        let backend = Arc::new(FakeBackend::new()); // prepare() yields the default sample_handle ("env-1")
+        let prepared =
+            PreparedEnvironment::prepare_with_backend(backend.clone(), "environment:railway".to_string(), &bare_env("animus-environment-railway"), None)
+                .expect("prepare");
+        assert!(!prepared.was_reused(), "a freshly prepared node is not a reuse");
+
+        // Before persist: a local pending checkpoint carries no binding.
+        let cp = crate::phase_session::read_checkpoint(scoped_root, "wf-1", "impl").expect("read").expect("present");
+        assert!(cp.environment.is_none(), "no binding until prepare-success persists one");
+
+        // The daemon-facing write, exercised through the HeldEnvironment surface
+        // the runner actually calls.
+        (&prepared as &dyn HeldEnvironment).persist_binding(scoped_root, "wf-1", "impl").expect("persist");
+
+        let cp = crate::phase_session::read_checkpoint(scoped_root, "wf-1", "impl").expect("read").expect("present");
+        let binding = cp.environment.expect("binding persisted");
+        assert_eq!(binding.environment_id, "animus-environment-railway", "binding records the resolved env id");
+        assert_eq!(binding.handle.id, "env-1", "binding carries the full prepared handle");
+        assert!(!binding.torn_down, "a live binding is not torn down");
+        assert_eq!(backend.prepare_calls.load(Ordering::SeqCst), 1, "prepared exactly once");
+    }
+
+    /// A successful teardown flips the bound phase checkpoint's `torn_down` so the
+    /// daemon reconciler does not try to re-reap a node that is already gone.
+    #[test]
+    fn teardown_marks_the_bound_checkpoint_torn_down() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scoped_root = tmp.path();
+        crate::phase_session::write_session_pending(scoped_root, "wf-2", "impl", "claude", "run-2", None)
+            .expect("pending");
+
+        let backend = Arc::new(FakeBackend::new());
+        let prepared = PreparedEnvironment::prepare_with_backend(
+            backend.clone(),
+            "environment:railway".to_string(),
+            &bare_env("animus-environment-railway"),
+            None,
+        )
+        .expect("prepare");
+        prepared.persist_binding(scoped_root, "wf-2", "impl").expect("persist");
+
+        prepared.teardown();
+        assert_eq!(backend.teardown_calls.load(Ordering::SeqCst), 1, "node was reaped once");
+        let cp = crate::phase_session::read_checkpoint(scoped_root, "wf-2", "impl").expect("read").expect("present");
+        assert!(cp.environment.expect("binding").torn_down, "teardown flips the checkpoint binding torn_down");
+    }
+
+    /// Re-dispatch with a LIVE persisted handle REUSES the node — no fresh
+    /// `prepare` — so the in-progress workspace is not lost and the old node is
+    /// not leaked.
+    #[test]
+    fn redispatch_reuses_a_live_persisted_node_and_skips_prepare() {
+        let backend = Arc::new(FakeBackend::new());
+        // The liveness probe (`exec true`) answers Ok -> node is alive.
+        *backend.exec_result.lock().unwrap() = Some(Ok(ok_response(0)));
+
+        let persisted = EnvironmentHandle {
+            id: "node-live".to_string(),
+            workspace_root: "/work".to_string(),
+            metadata: Value::Null,
+        };
+        let prepared = PreparedEnvironment::reuse_or_prepare_with_backend(
+            backend.clone(),
+            "environment:railway".to_string(),
+            &bare_env("animus-environment-railway"),
+            None,
+            Some(persisted),
+        )
+        .expect("reuse");
+
+        assert!(prepared.was_reused(), "a live persisted node is reused");
+        assert_eq!(prepared.handle.id, "node-live", "the persisted handle is reattached");
+        assert_eq!(backend.prepare_calls.load(Ordering::SeqCst), 0, "reuse must NOT prepare a fresh node");
+        assert_eq!(backend.exec_calls.load(Ordering::SeqCst), 1, "reuse ran exactly one liveness probe");
+    }
+
+    /// Re-dispatch with a DEAD/unreachable persisted handle prepares a FRESH node
+    /// (and the caller overwrites the stale binding).
+    #[test]
+    fn redispatch_prepares_fresh_when_the_persisted_node_is_dead() {
+        let backend = Arc::new(FakeBackend::new());
+        // The liveness probe fails -> node is dead/unreachable.
+        *backend.exec_result.lock().unwrap() = Some(Err(anyhow!("plugin connection lost")));
+
+        let persisted = EnvironmentHandle {
+            id: "node-dead".to_string(),
+            workspace_root: "/work".to_string(),
+            metadata: Value::Null,
+        };
+        let prepared = PreparedEnvironment::reuse_or_prepare_with_backend(
+            backend.clone(),
+            "environment:railway".to_string(),
+            &bare_env("animus-environment-railway"),
+            None,
+            Some(persisted),
+        )
+        .expect("prepare fresh");
+
+        assert!(!prepared.was_reused(), "a dead persisted node is NOT reused");
+        assert_eq!(prepared.handle.id, "env-1", "a fresh node was prepared (default sample handle)");
+        assert_eq!(backend.prepare_calls.load(Ordering::SeqCst), 1, "a dead node forces a fresh prepare");
+        assert_eq!(backend.exec_calls.load(Ordering::SeqCst), 1, "the dead node was probed once before preparing");
     }
 
     /// The per-workflow node is prepared ONCE, shared across every phase's exec,

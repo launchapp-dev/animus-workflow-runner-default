@@ -365,10 +365,25 @@ pub async fn execute_workflow_with_hub(
                 Some(&subject_kind_str),
             ) {
                 Some(environment) => {
+                    // TASK-933 (companion to animus-cli#345): a re-dispatch after a
+                    // daemon restart may find a node this run already prepared, its
+                    // handle persisted on a phase checkpoint. Reuse that live node
+                    // (skip prepare, keep the in-progress workspace) instead of
+                    // leaking it and materializing a fresh one; a dead/absent
+                    // binding prepares fresh. There is at most ONE node per run, so
+                    // any non-torn-down phase binding points at the same node.
+                    let scoped_root = protocol::scoped_state_root(Path::new(&params.project_root))
+                        .unwrap_or_else(|| Path::new(&params.project_root).join(".animus"));
+                    let reuse_candidate =
+                        crate::phase_session::find_reusable_binding(&scoped_root, &workflow.id, &environment.id)
+                            .ok()
+                            .flatten()
+                            .map(|binding| binding.handle);
                     let prepared = crate::phase_environment::PreparedEnvironment::prepare_off_runtime(
                         Path::new(&params.project_root),
                         &environment,
                         subject_git_repo.clone(),
+                        reuse_candidate,
                     )
                     .await
                     .with_context(|| {
@@ -377,6 +392,13 @@ pub async fn execute_workflow_with_hub(
                             environment.id, workflow.id
                         )
                     })?;
+                    if prepared.was_reused() {
+                        tracing::info!(
+                            workflow_id = %workflow.id,
+                            environment = %environment.id,
+                            "reattached to a live persisted delegated node across restart (skipped prepare)"
+                        );
+                    }
                     Some(std::sync::Arc::new(prepared))
                 }
                 None => None,

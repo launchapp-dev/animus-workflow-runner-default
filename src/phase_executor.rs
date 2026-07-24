@@ -799,6 +799,26 @@ pub async fn run_workflow_phase_attempt(
             ),
         }));
     }
+    // TASK-933 (companion to animus-cli#345): the instant the phase's pending
+    // checkpoint is durable and BEFORE any exec, persist the delegated node's
+    // binding (handle + env id) into that checkpoint. This is THE write the
+    // daemon's restart reconciler reads to reap / reattach the node BY HANDLE
+    // instead of leaking it. Runner-owned (`PreparedEnvironment`) writes it;
+    // the daemon-owned brokered node no-ops (the daemon reconciles its own).
+    // Best-effort: a failure degrades restart reconciliation (possible node
+    // leak) but must not abort a phase whose pending checkpoint already landed.
+    if let Some(environment) = held_environment {
+        if let Err(err) = environment.persist_binding(&scoped_state_root, workflow_id, phase_id) {
+            warn!(
+                workflow_id = %workflow_id,
+                phase_id = %phase_id,
+                environment = %environment.id(),
+                %err,
+                "failed to persist delegated environment binding to the phase checkpoint; \
+                 daemon-restart node reconciliation may be unable to reap this node"
+            );
+        }
+    }
     let notification_log = match crate::notification_log::NotificationLog::open(&scoped_state_root, workflow_id) {
         Ok(log) => Some(std::sync::Arc::new(log)),
         Err(err) => {
