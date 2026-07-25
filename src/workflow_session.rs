@@ -344,6 +344,38 @@ pub(crate) async fn delegate_workflow_via_session(
     // re-keys to a no-op. `None`-tolerant on the wire (old env plugins ignore it).
     let workflow_id_owned = workflow_id.to_string();
 
+    // TASK-933 (companion to animus-cli rc.28): this delegated node is otherwise
+    // invisible to the daemon after a restart -- the home runner holds the handle
+    // in memory only, so a crash leaks the node (a full standalone animus keeps
+    // running) and a re-dispatch prepares a SECOND one. Persist the node's
+    // `EnvironmentBinding` into the run's session checkpoint at the phase the
+    // rc.28 reconciler reads (`current_phase_id` = the phase at
+    // `current_phase_index`), so the reconciler can reap a dead node / preserve a
+    // live one / terminalize a ghost. `scoped_state_root` + the current phase id
+    // are computed HOME-side (before the blocking thread); `None` degrades to the
+    // pre-existing no-persist behavior rather than failing the run.
+    let scoped_root_opt: Option<std::path::PathBuf> =
+        protocol::scoped_state_root(Path::new(project_root));
+    let binding_phase_id: Option<String> = match hub.workflows().get(workflow_id).await {
+        Ok(wf) => wf.phases.get(wf.current_phase_index).map(|phase| phase.phase_id.clone()),
+        Err(_) => None,
+    }
+    .or_else(|| phases_requested.first().cloned());
+    // On a restart re-dispatch the run may already have a persisted node whose
+    // handle is still live -- REUSE it (reattach, skip prepare) instead of
+    // leaking it and preparing a fresh one. Read the candidate handle home-side;
+    // liveness is probed inside the thread (needs the resolved client).
+    let reuse_candidate: Option<animus_environment_protocol::EnvironmentHandle> =
+        match (scoped_root_opt.as_deref(), environment_id) {
+            (Some(scoped_root), env_id) => crate::phase_session::find_reusable_binding(scoped_root, workflow_id, env_id)
+                .ok()
+                .flatten()
+                .map(|binding| binding.handle),
+            _ => None,
+        };
+    let scoped_root_for_thread = scoped_root_opt.clone();
+    let binding_phase_id_for_thread = binding_phase_id.clone();
+
     let (tx, rx) = tokio::sync::oneshot::channel();
     std::thread::spawn(move || {
         let result = (|| {
@@ -361,24 +393,68 @@ pub(crate) async fn delegate_workflow_via_session(
                              session environment is requested): {err}"
                         )
                     })?;
-                let handle = client.prepare(spec).map_err(|err| {
-                    anyhow!("remote-animus session prepare failed for '{environment_id_owned}': {err:#}")
-                })?;
+                // TASK-933: reuse a still-live persisted node (skip prepare) or
+                // prepare a fresh one. `probe_session_node_alive` is a trivial,
+                // side-effect-free `exec` of `true` -- there is no environment
+                // `status` method, so this exec IS the liveness check (mirrors the
+                // rc.28 reconciler's `probe_delegate`).
+                let (handle, reused) = match reuse_candidate {
+                    Some(candidate) if probe_session_node_alive(&client, &candidate) => (candidate, true),
+                    _ => {
+                        let handle = client.prepare(spec).map_err(|err| {
+                            anyhow!("remote-animus session prepare failed for '{environment_id_owned}': {err:#}")
+                        })?;
+                        (handle, false)
+                    }
+                };
+                if reused {
+                    eprintln!(
+                        "info: remote-animus session reattached to a live persisted node for '{environment_id_owned}' \
+                         (handle {}) across restart -- skipped prepare",
+                        handle.id
+                    );
+                }
+                // TASK-933: persist the node binding into the run's session
+                // checkpoint at the reconciler's phase BEFORE exec_session, so a
+                // crash mid-session leaves a durable handle to reap/reattach.
+                if let (Some(scoped_root), Some(phase_id)) =
+                    (scoped_root_for_thread.as_deref(), binding_phase_id_for_thread.as_deref())
+                {
+                    persist_session_binding(scoped_root, &workflow_id_owned, phase_id, &environment_id_owned, &handle);
+                }
                 // Unbounded: an agent-run session's duration is not known up front.
                 let response = client.exec_session(
                     &handle,
                     subject_id_owned,
                     Some(workflow_ref_owned),
                     dispatch_input_owned,
-                    Some(workflow_id_owned),
+                    Some(workflow_id_owned.clone()),
                     on_journal,
                 );
                 // Best-effort teardown regardless of the session outcome.
-                if let Err(err) = client.teardown(&handle) {
-                    eprintln!(
-                        "warning: remote-animus session teardown failed for '{environment_id_owned}' (handle {}): {err:#}",
-                        handle.id
-                    );
+                match client.teardown(&handle) {
+                    Ok(()) => {
+                        // TASK-811/933: node reaped -> flip the checkpoint binding
+                        // torn_down so the reconciler does not try to re-reap a
+                        // node that is already gone.
+                        if let (Some(scoped_root), Some(phase_id)) =
+                            (scoped_root_for_thread.as_deref(), binding_phase_id_for_thread.as_deref())
+                        {
+                            let _ = crate::phase_session::mark_environment_torn_down(
+                                scoped_root,
+                                &workflow_id_owned,
+                                phase_id,
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        // Teardown failed: leave the binding NOT torn_down so the
+                        // daemon reconciler retries the reap on its next sweep.
+                        eprintln!(
+                            "warning: remote-animus session teardown failed for '{environment_id_owned}' (handle {}): {err:#}",
+                            handle.id
+                        );
+                    }
                 }
                 response.map_err(|err| {
                     anyhow!("remote-animus session exec_session failed for '{environment_id_owned}': {err:#}")
@@ -451,6 +527,25 @@ pub(crate) async fn delegate_workflow_via_session(
         _ => {}
     }
 
+    // TASK-933: the delegated run is terminal -> flip its session checkpoint out
+    // of `Running` so `list_running_checkpoints` (auto-resume / reconcile scans)
+    // no longer surfaces it. The node binding was already marked `torn_down` on
+    // teardown success; this closes the checkpoint's lifecycle to match the
+    // workflow. Best-effort: a missing checkpoint (binding never persisted) or a
+    // write hiccup must never fail an otherwise-terminal delegated run.
+    if let (Some(scoped_root), Some(phase_id)) = (scoped_root_opt.as_deref(), binding_phase_id.as_deref()) {
+        let _ = if matches!(workflow_status, WorkflowStatus::Completed) {
+            crate::phase_session::update_session_completed(scoped_root, workflow_id, phase_id)
+        } else {
+            crate::phase_session::update_session_failed(
+                scoped_root,
+                workflow_id,
+                phase_id,
+                &format!("remote-animus session ended {}", response.status),
+            )
+        };
+    }
+
     // Emit the single terminal workflow event home (the driver owns it; the
     // journal map deliberately does not forward node-level terminal events).
     if let Some(emitter) = event_emitter {
@@ -501,6 +596,69 @@ pub(crate) async fn delegate_workflow_via_session(
             "reason": "remote-animus session owns the full workflow (incl. post-success) on the node",
         }),
     })
+}
+
+/// Probe whether a persisted remote-animus node is still reachable: a trivial,
+/// side-effect-free `exec` of `true` with a short timeout. `Ok` (the node
+/// answered, regardless of exit code) = alive; any transport / plugin error =
+/// dead or unreachable. There is no environment `status` method, so this exec IS
+/// the liveness check — it mirrors the rc.28 reconciler's `probe_delegate`. A
+/// dead probe means the re-dispatch prepares a fresh node instead of reusing.
+#[cfg(feature = "remote-animus-session")]
+fn probe_session_node_alive(
+    client: &orchestrator_core::EnvironmentClient,
+    handle: &animus_environment_protocol::EnvironmentHandle,
+) -> bool {
+    use std::collections::BTreeMap;
+    use std::time::Duration;
+
+    const PROBE_TIMEOUT_SECS: u64 = 10;
+    let command = animus_environment_protocol::HarnessCommand {
+        program: "true".to_string(),
+        args: Vec::new(),
+        env: BTreeMap::new(),
+        cwd: None,
+    };
+    client.exec(handle, command, BTreeMap::new(), None, Some(Duration::from_secs(PROBE_TIMEOUT_SECS))).is_ok()
+}
+
+/// Persist the delegated node's [`EnvironmentBinding`](crate::phase_session::EnvironmentBinding)
+/// into the run's session checkpoint at `phase_id` (the phase the rc.28
+/// reconciler reads via `current_phase_id`). The node itself drives the phase,
+/// so this checkpoint is purely the RECONCILE ORACLE: rc.28's `auto_resume`
+/// SKIPS env-bound checkpoints (it never mis-resumes them as a local provider),
+/// and its reconciler reads the binding here to reap a dead node / preserve a
+/// live one / terminalize a ghost. Create-or-overwrite as `Running` (the run IS
+/// in flight on the node). Best-effort — a write failure degrades restart
+/// reconciliation (possible node leak) but never fails the delegated run.
+#[cfg(feature = "remote-animus-session")]
+fn persist_session_binding(
+    scoped_root: &Path,
+    workflow_id: &str,
+    phase_id: &str,
+    environment_id: &str,
+    handle: &animus_environment_protocol::EnvironmentHandle,
+) {
+    use crate::phase_session::{
+        update_session_environment, update_session_running, write_session_pending, EnvironmentBinding,
+    };
+
+    // `run_id` is the workflow id (the REQ-052 one-id identity); `provider` names
+    // the environment so the synthetic checkpoint is self-describing.
+    if let Err(err) = write_session_pending(scoped_root, workflow_id, phase_id, environment_id, workflow_id, None) {
+        eprintln!("warning: failed to seed remote-animus session checkpoint for {workflow_id}/{phase_id}: {err}");
+        return;
+    }
+    let _ = update_session_running(scoped_root, workflow_id, phase_id);
+    let binding = EnvironmentBinding {
+        environment_id: environment_id.to_string(),
+        handle: handle.clone(),
+        bound_at: chrono::Utc::now().to_rfc3339(),
+        torn_down: false,
+    };
+    if let Err(err) = update_session_environment(scoped_root, workflow_id, phase_id, binding) {
+        eprintln!("warning: failed to persist remote-animus env binding for {workflow_id}/{phase_id}: {err}");
+    }
 }
 
 /// Build the bare [`EnvironmentSpec`] for a remote-animus session: no repos (the
@@ -617,5 +775,42 @@ mod tests {
 
         let bare = build_session_spec("animus-environment-railway", None);
         assert!(bare.metadata.is_null());
+    }
+
+    // TASK-933: the remote-animus session path persists the node binding into the
+    // run's session checkpoint at the reconciler's phase, as a Running checkpoint
+    // carrying exactly rc.28's EnvironmentBinding shape. This is THE write the
+    // released daemon reconciler reads to reap/reattach the node by handle.
+    #[cfg(feature = "remote-animus-session")]
+    #[test]
+    fn persist_session_binding_writes_running_checkpoint_with_the_rc28_shape() {
+        use crate::phase_session::{read_checkpoint, SessionCheckpointStatus};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let scoped_root = tmp.path();
+        let handle = animus_environment_protocol::EnvironmentHandle {
+            id: "node-xyz".to_string(),
+            workspace_root: "/work".to_string(),
+            metadata: serde_json::json!({ "railway_service_id": "svc-9" }),
+        };
+
+        persist_session_binding(scoped_root, "wf-sess-1", "implementation", "animus-environment-railway", &handle);
+
+        let cp = read_checkpoint(scoped_root, "wf-sess-1", "implementation").expect("read").expect("present");
+        assert_eq!(cp.status, SessionCheckpointStatus::Running, "the delegated run is in flight on the node");
+        let binding = cp.environment.expect("binding persisted for the reconciler");
+        assert_eq!(binding.environment_id, "animus-environment-railway");
+        assert_eq!(binding.handle.id, "node-xyz");
+        assert_eq!(
+            binding.handle.metadata.pointer("/railway_service_id").and_then(|v| v.as_str()),
+            Some("svc-9"),
+            "opaque handle metadata is preserved for teardown-by-handle"
+        );
+        assert!(!binding.torn_down, "a freshly persisted binding is live");
+
+        // Teardown-success path: the reconciler must not re-reap a gone node.
+        crate::phase_session::mark_environment_torn_down(scoped_root, "wf-sess-1", "implementation").expect("mark");
+        let cp = read_checkpoint(scoped_root, "wf-sess-1", "implementation").expect("read").expect("present");
+        assert!(cp.environment.expect("binding").torn_down, "teardown flips torn_down");
     }
 }
