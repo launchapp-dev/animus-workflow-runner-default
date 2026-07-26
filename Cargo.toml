@@ -101,6 +101,7 @@ tempfile = "3.10"
 # normal dep above so cargo unifies them (this only turns on the extra feature
 # in test builds).
 orchestrator-config = { git = "https://github.com/launchapp-dev/animus-cli", rev = "e3dbbc9b05cee118822d87e97d0864eca0ece87a", features = ["test-utils"] }
+orchestrator-plugin-host = { git = "https://github.com/launchapp-dev/animus-cli", rev = "e3dbbc9b05cee118822d87e97d0864eca0ece87a", features = ["test-support"] }
 # The env-var gate tests use `protocol::test_utils::EnvVarGuard`, gated behind
 # the protocol crate's `test-utils` feature. Same tag as the normal `protocol`
 # dep above so cargo just turns the extra feature on in test builds.

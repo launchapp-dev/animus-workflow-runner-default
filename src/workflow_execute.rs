@@ -75,7 +75,9 @@ pub struct WorkflowExecuteInternalParams {
     /// Transport-asserted caller identity relayed verbatim from the inbound
     /// `WorkflowExecuteRequest`. Threaded into every phase's `SessionRequest`
     /// so the provider/agent runs as the user. `None` for system-initiated
-    /// runs (e.g. the CLI direct-execute path). The runner never interprets it.
+    /// runs. Direct execution inherits this only from rc.30's trusted
+    /// `ANIMUS_ACTOR_JSON` daemon-to-runner channel. The runner never
+    /// interprets it.
     pub actor: Option<Actor>,
 }
 
@@ -373,6 +375,7 @@ pub async fn execute_workflow_with_hub(
                     phase_inputs.dispatch_input.as_deref(),
                     &execution_cwd,
                     phases_requested,
+                    params.actor.as_ref(),
                     event_emitter.as_ref(),
                 )
                 .await;

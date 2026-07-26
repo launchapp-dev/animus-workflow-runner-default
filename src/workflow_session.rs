@@ -41,6 +41,7 @@
 
 use std::path::Path;
 
+use animus_actor::Actor;
 use anyhow::Result;
 use orchestrator_core::WorkflowStatus;
 
@@ -98,19 +99,48 @@ where
 /// Session-only environment client for CLI rc.30. Holds a resident-host lease
 /// for its whole lifetime so all stateful environment RPCs share one process.
 #[cfg(feature = "remote-animus-session")]
+#[derive(Clone)]
+struct SessionRegistryKey {
+    plugin_path: std::path::PathBuf,
+    binary_mtime: u128,
+    spawn_context: String,
+}
+
+#[cfg(feature = "remote-animus-session")]
+struct PinnedSessionLease {
+    lease: orchestrator_plugin_host::resident_host_registry::ResidentHostLease,
+    generation: u64,
+}
+
+#[cfg(feature = "remote-animus-session")]
+enum SessionHostCallError {
+    Death(anyhow::Error),
+    Other(anyhow::Error),
+}
+
+#[cfg(feature = "remote-animus-session")]
+impl SessionHostCallError {
+    fn into_anyhow(self) -> anyhow::Error {
+        match self {
+            Self::Death(error) | Self::Other(error) => error,
+        }
+    }
+}
+
+#[cfg(feature = "remote-animus-session")]
 struct SessionEnvironmentClient {
     plugin_name: String,
-    lease: orchestrator_plugin_host::resident_host_registry::ResidentHostLease,
+    plugin: orchestrator_plugin_host::DiscoveredPlugin,
+    forwarded_env: Vec<String>,
+    registry_key: SessionRegistryKey,
+    pinned: tokio::sync::Mutex<Option<PinnedSessionLease>>,
 }
 
 #[cfg(feature = "remote-animus-session")]
 impl SessionEnvironmentClient {
     async fn resolve(project_root: &Path, environment_id: &str) -> Result<Self> {
         use anyhow::{anyhow, Context};
-        use orchestrator_plugin_host::resident_host_registry::{
-            binary_mtime_nanos, global_resident_host_registry, spawn_context_fingerprint,
-        };
-        use orchestrator_plugin_host::{PluginHost, PluginSpawnOptions};
+        use orchestrator_plugin_host::resident_host_registry::{binary_mtime_nanos, spawn_context_fingerprint};
 
         let plugins = orchestrator_plugin_host::discover_by_kind(project_root.to_path_buf(), PLUGIN_KIND_ENVIRONMENT)
             .with_context(|| format!("discovering environment plugins for {}", project_root.display()))?;
@@ -126,36 +156,139 @@ impl SessionEnvironmentClient {
         };
 
         let forwarded_env: Vec<String> = std::env::vars().map(|(name, _)| name).collect();
-        let spawn_context = spawn_context_fingerprint(&forwarded_env, None, plugin.manifest.notification_buffer_size);
-        let mtime = binary_mtime_nanos(&plugin.path);
-        let plugin_for_spawn = plugin.clone();
-        let lease = global_resident_host_registry()
-            .get_or_spawn(&plugin.path, mtime, &spawn_context, || async move {
-                let options = PluginSpawnOptions::for_manifest(
-                    plugin_for_spawn.name.clone(),
-                    &plugin_for_spawn.manifest.env_required,
-                    forwarded_env,
-                    None,
-                )
-                .with_notification_buffer_hint(plugin_for_spawn.manifest.notification_buffer_size);
-                let host = PluginHost::spawn_with_options(&plugin_for_spawn.path, &[], options)
-                    .await
-                    .with_context(|| format!("spawning environment plugin {}", plugin_for_spawn.name))?;
-                if let Err(error) = host.handshake().await {
-                    let _ = host.clone().shutdown().await;
-                    return Err(error)
-                        .with_context(|| format!("handshake with environment plugin {}", plugin_for_spawn.name));
-                }
-                Ok(host)
-            })
-            .await?;
+        let registry_key = SessionRegistryKey {
+            plugin_path: plugin.path.clone(),
+            binary_mtime: binary_mtime_nanos(&plugin.path),
+            spawn_context: spawn_context_fingerprint(&forwarded_env, None, plugin.manifest.notification_buffer_size),
+        };
+        let client = Self {
+            plugin_name: plugin.name.clone(),
+            plugin,
+            forwarded_env,
+            registry_key,
+            pinned: tokio::sync::Mutex::new(None),
+        };
+        let _ = client.pinned_host().await?;
+        Ok(client)
+    }
 
-        Ok(Self { plugin_name: plugin.name, lease })
+    async fn acquire_lease(&self) -> Result<orchestrator_plugin_host::resident_host_registry::ResidentHostLease> {
+        use anyhow::Context;
+        use orchestrator_plugin_host::resident_host_registry::global_resident_host_registry;
+        use orchestrator_plugin_host::{PluginHost, PluginSpawnOptions};
+
+        let plugin = self.plugin.clone();
+        let forwarded_env = self.forwarded_env.clone();
+        global_resident_host_registry()
+            .get_or_spawn(
+                &self.registry_key.plugin_path,
+                self.registry_key.binary_mtime,
+                &self.registry_key.spawn_context,
+                || async move {
+                    let options = PluginSpawnOptions::for_manifest(
+                        plugin.name.clone(),
+                        &plugin.manifest.env_required,
+                        forwarded_env,
+                        None,
+                    )
+                    .with_notification_buffer_hint(plugin.manifest.notification_buffer_size);
+                    let host = PluginHost::spawn_with_options(&plugin.path, &[], options)
+                        .await
+                        .with_context(|| format!("spawning environment plugin {}", plugin.name))?;
+                    if let Err(error) = host.handshake().await {
+                        let _ = host.clone().shutdown().await;
+                        return Err(error)
+                            .with_context(|| format!("handshake with environment plugin {}", plugin.name));
+                    }
+                    Ok(host)
+                },
+            )
+            .await
+    }
+
+    async fn pinned_host(&self) -> Result<(orchestrator_plugin_host::PluginHost, u64)> {
+        let mut pinned = self.pinned.lock().await;
+        if pinned.is_none() {
+            let lease = self.acquire_lease().await?;
+            let generation = lease.generation();
+            *pinned = Some(PinnedSessionLease { lease, generation });
+        }
+        let pinned = pinned.as_ref().expect("lease populated above");
+        Ok((pinned.lease.host().clone(), pinned.generation))
+    }
+
+    async fn invalidate_generation(&self, generation: u64) {
+        {
+            let mut pinned = self.pinned.lock().await;
+            if pinned.as_ref().is_some_and(|lease| lease.generation == generation) {
+                *pinned = None;
+            }
+        }
+        orchestrator_plugin_host::resident_host_registry::global_resident_host_registry()
+            .invalidate_generation(
+                &self.registry_key.plugin_path,
+                self.registry_key.binary_mtime,
+                &self.registry_key.spawn_context,
+                generation,
+            )
+            .await;
+    }
+
+    async fn classify_host_error(
+        &self,
+        generation: u64,
+        error: orchestrator_plugin_host::HostError,
+    ) -> SessionHostCallError {
+        use orchestrator_plugin_host::session::plugin_supervisor::{classify, RetryDecision};
+
+        match classify(&error) {
+            RetryDecision::DeathLike => {
+                self.invalidate_generation(generation).await;
+                SessionHostCallError::Death(anyhow::Error::new(error))
+            }
+            RetryDecision::StructuredError => SessionHostCallError::Other(anyhow::Error::new(error)),
+        }
+    }
+
+    async fn request_once(
+        &self,
+        method: &'static str,
+        params: serde_json::Value,
+        timeout: Option<std::time::Duration>,
+    ) -> std::result::Result<serde_json::Value, SessionHostCallError> {
+        let (host, generation) = self.pinned_host().await.map_err(SessionHostCallError::Other)?;
+        let result = match timeout {
+            Some(timeout) => host.request_typed_with_timeout(method, Some(params), timeout).await,
+            None => host.request_typed(method, Some(params)).await,
+        };
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) => Err(self.classify_host_error(generation, error).await),
+        }
+    }
+
+    /// Control calls mirror rc.30 `EnvironmentClient`: retry once only after a
+    /// death-like failure because prepare and teardown are safe to replay.
+    async fn control_request(
+        &self,
+        method: &'static str,
+        params: serde_json::Value,
+        timeout: std::time::Duration,
+    ) -> Result<serde_json::Value> {
+        let retry_params = params.clone();
+        match self.request_once(method, params, Some(timeout)).await {
+            Ok(value) => Ok(value),
+            Err(SessionHostCallError::Death(_)) => {
+                self.request_once(method, retry_params, Some(timeout)).await.map_err(SessionHostCallError::into_anyhow)
+            }
+            Err(error) => Err(error.into_anyhow()),
+        }
     }
 
     async fn prepare(
         &self,
         spec: animus_environment_protocol::EnvironmentSpec,
+        actor: Option<&Actor>,
     ) -> Result<animus_environment_protocol::EnvironmentHandle> {
         use std::time::Duration;
 
@@ -163,11 +296,9 @@ impl SessionEnvironmentClient {
         use anyhow::Context;
 
         let params =
-            serde_json::to_value(PrepareRequest { spec }).context("serializing environment prepare request")?;
+            request_params_with_actor(PrepareRequest { spec }, actor, "serializing environment prepare request")?;
         let value = self
-            .lease
-            .host()
-            .request_typed_with_timeout(METHOD_ENVIRONMENT_PREPARE, Some(params), Duration::from_secs(360))
+            .control_request(METHOD_ENVIRONMENT_PREPARE, params, Duration::from_secs(360))
             .await
             .with_context(|| format!("environment prepare via {}", self.plugin_name))?;
         let response: PrepareResponse = serde_json::from_value(value)
@@ -190,11 +321,7 @@ impl SessionEnvironmentClient {
         let Ok(params) = serde_json::to_value(request) else {
             return false;
         };
-        self.lease
-            .host()
-            .request_typed_with_timeout(METHOD_ENVIRONMENT_EXEC, Some(params), Duration::from_secs(40))
-            .await
-            .is_ok()
+        self.request_once(METHOD_ENVIRONMENT_EXEC, params, Some(Duration::from_secs(40))).await.is_ok()
     }
 
     async fn exec_session<F>(
@@ -204,6 +331,7 @@ impl SessionEnvironmentClient {
         workflow_ref: Option<String>,
         dispatch_input: Option<String>,
         workflow_id: Option<String>,
+        actor: Option<&Actor>,
         on_journal: F,
     ) -> Result<animus_environment_protocol::ExecSessionResponse>
     where
@@ -215,12 +343,13 @@ impl SessionEnvironmentClient {
 
         let request =
             ExecSessionRequest { handle: handle.clone(), subject_id, workflow_ref, dispatch_input, workflow_id };
-        let params = serde_json::to_value(request).context("serializing environment exec_session request")?;
-        let mut notifications = self.lease.host().subscribe_notifications();
-        let response = self.lease.host().request_typed(METHOD_ENVIRONMENT_EXEC_SESSION, Some(params));
+        let params = request_params_with_actor(request, actor, "serializing environment exec_session request")?;
+        let (host, generation) = self.pinned_host().await?;
+        let mut notifications = host.subscribe_notifications();
+        let response = host.request_typed(METHOD_ENVIRONMENT_EXEC_SESSION, Some(params));
         tokio::pin!(response);
 
-        let value = loop {
+        let result = loop {
             tokio::select! {
                 notification = notifications.recv() => match notification {
                     Ok(notification) => forward_session_journal(&notification, &handle.id, &on_journal),
@@ -229,8 +358,15 @@ impl SessionEnvironmentClient {
                 },
                 result = &mut response => break result,
             }
-        }
-        .with_context(|| format!("environment exec_session via {}", self.plugin_name))?;
+        };
+
+        let value = match result {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(self.classify_host_error(generation, error).await.into_anyhow())
+                    .with_context(|| format!("environment exec_session via {}", self.plugin_name));
+            }
+        };
 
         let buffered = notifications.len();
         for _ in 0..buffered {
@@ -253,15 +389,33 @@ impl SessionEnvironmentClient {
         let params = serde_json::to_value(TeardownRequest { handle: handle.clone() })
             .context("serializing environment teardown request")?;
         let value = self
-            .lease
-            .host()
-            .request_typed_with_timeout(METHOD_ENVIRONMENT_TEARDOWN, Some(params), Duration::from_secs(60))
+            .control_request(METHOD_ENVIRONMENT_TEARDOWN, params, Duration::from_secs(60))
             .await
             .with_context(|| format!("environment teardown via {}", self.plugin_name))?;
         let _: TeardownResponse = serde_json::from_value(value)
             .with_context(|| format!("decoding teardown response from {}", self.plugin_name))?;
         Ok(())
     }
+}
+
+/// Attach the SDK's well-known top-level actor field after serializing the
+/// Protocol request. Protocol rc.12 intentionally does not own transport actor
+/// context, so this preserves its typed request without forking the wire type.
+#[cfg(feature = "remote-animus-session")]
+fn request_params_with_actor<T: serde::Serialize>(
+    request: T,
+    actor: Option<&Actor>,
+    context: &'static str,
+) -> Result<serde_json::Value> {
+    use anyhow::{anyhow, Context};
+
+    let mut params = serde_json::to_value(request).context(context)?;
+    if let Some(actor) = actor {
+        let object = params.as_object_mut().ok_or_else(|| anyhow!("{context}: request must serialize as an object"))?;
+        object
+            .insert("actor".to_string(), serde_json::to_value(actor).context("serializing environment request actor")?);
+    }
+    Ok(params)
 }
 
 /// Whether a plugin manifest's advertised method list (`capabilities`) contains
@@ -309,6 +463,16 @@ pub(crate) fn session_status_to_workflow_status(status: &str) -> WorkflowStatus 
         "paused" => WorkflowStatus::Paused,
         _ => WorkflowStatus::Failed,
     }
+}
+
+#[cfg_attr(not(feature = "remote-animus-session"), allow(dead_code))]
+fn session_succeeded(status: WorkflowStatus) -> bool {
+    matches!(status, WorkflowStatus::Completed)
+}
+
+#[cfg_attr(not(feature = "remote-animus-session"), allow(dead_code))]
+fn session_should_teardown(status: WorkflowStatus) -> bool {
+    !matches!(status, WorkflowStatus::Paused)
 }
 
 /// Agent-run transcript event kinds -- the fine-grained session stream that
@@ -431,6 +595,7 @@ pub(crate) async fn delegate_workflow_via_session(
     _dispatch_input: Option<&str>,
     _execution_cwd: &str,
     _phases_requested: Vec<String>,
+    _actor: Option<&Actor>,
     _event_emitter: Option<&SharedWorkflowEventEmitter>,
 ) -> Result<WorkflowExecuteInternalResult> {
     anyhow::bail!(
@@ -468,6 +633,7 @@ pub(crate) async fn delegate_workflow_via_session(
     dispatch_input: Option<&str>,
     execution_cwd: &str,
     phases_requested: Vec<String>,
+    actor: Option<&Actor>,
     event_emitter: Option<&SharedWorkflowEventEmitter>,
 ) -> Result<WorkflowExecuteInternalResult> {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -547,6 +713,7 @@ pub(crate) async fn delegate_workflow_via_session(
     // exactly ONE journal_runs row per dispatch, and the transcript mirror
     // re-keys to a no-op. `None`-tolerant on the wire (old env plugins ignore it).
     let workflow_id_owned = workflow_id.to_string();
+    let actor_owned = actor.cloned();
 
     // TASK-933 (companion to animus-cli rc.28): this delegated node is otherwise
     // invisible to the daemon after a restart -- the home runner holds the handle
@@ -607,7 +774,7 @@ pub(crate) async fn delegate_workflow_via_session(
                 let (handle, reused) = match reuse_candidate {
                     Some(candidate) if client.probe(&candidate).await => (candidate, true),
                     _ => {
-                        let handle = client.prepare(spec).await.map_err(|err| {
+                        let handle = client.prepare(spec, actor_owned.as_ref()).await.map_err(|err| {
                             anyhow!("remote-animus session prepare failed for '{environment_id_owned}': {err:#}")
                         })?;
                         (handle, false)
@@ -635,31 +802,40 @@ pub(crate) async fn delegate_workflow_via_session(
                     Some(workflow_ref_owned),
                     dispatch_input_owned,
                     Some(workflow_id_owned.clone()),
+                    actor_owned.as_ref(),
                     on_journal,
                 ).await;
-                // Best-effort teardown regardless of the session outcome.
-                match client.teardown(&handle).await {
-                    Ok(()) => {
-                        // TASK-811/933: node reaped -> flip the checkpoint binding
-                        // torn_down so the reconciler does not try to re-reap a
-                        // node that is already gone.
-                        if let (Some(scoped_root), Some(phase_id)) =
-                            (scoped_root_for_thread.as_deref(), binding_phase_id_for_thread.as_deref())
-                        {
-                            let _ = crate::phase_session::mark_environment_torn_down(
-                                scoped_root,
-                                &workflow_id_owned,
-                                phase_id,
+                // A paused node session remains resumable: keep its prepared
+                // environment and live binding. All terminal outcomes (and an
+                // exec error) still get best-effort teardown.
+                let should_teardown = response
+                    .as_ref()
+                    .map(|response| session_should_teardown(session_status_to_workflow_status(&response.status)))
+                    .unwrap_or(true);
+                if should_teardown {
+                    match client.teardown(&handle).await {
+                        Ok(()) => {
+                            // TASK-811/933: node reaped -> flip the checkpoint binding
+                            // torn_down so the reconciler does not try to re-reap a
+                            // node that is already gone.
+                            if let (Some(scoped_root), Some(phase_id)) =
+                                (scoped_root_for_thread.as_deref(), binding_phase_id_for_thread.as_deref())
+                            {
+                                let _ = crate::phase_session::mark_environment_torn_down(
+                                    scoped_root,
+                                    &workflow_id_owned,
+                                    phase_id,
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            // Teardown failed: leave the binding NOT torn_down so the
+                            // daemon reconciler retries the reap on its next sweep.
+                            eprintln!(
+                                "warning: remote-animus session teardown failed for '{environment_id_owned}' (handle {}): {err:#}",
+                                handle.id
                             );
                         }
-                    }
-                    Err(err) => {
-                        // Teardown failed: leave the binding NOT torn_down so the
-                        // daemon reconciler retries the reap on its next sweep.
-                        eprintln!(
-                            "warning: remote-animus session teardown failed for '{environment_id_owned}' (handle {}): {err:#}",
-                            handle.id
-                        );
                     }
                 }
                 response.map_err(|err| {
@@ -728,26 +904,22 @@ pub(crate) async fn delegate_workflow_via_session(
                 );
             }
         }
+        WorkflowStatus::Paused => {
+            if let Err(err) = hub.workflows().pause(workflow_id).await {
+                eprintln!(
+                    "warning: remote-animus session backstop pause('{workflow_id}') failed: {err:#} \
+                     (shared row may remain Running; daemon reconciliation will retry)"
+                );
+            }
+        }
         _ => {}
     }
 
-    // TASK-933: the delegated run is terminal -> flip its session checkpoint out
-    // of `Running` so `list_running_checkpoints` (auto-resume / reconcile scans)
-    // no longer surfaces it. The node binding was already marked `torn_down` on
-    // teardown success; this closes the checkpoint's lifecycle to match the
-    // workflow. Best-effort: a missing checkpoint (binding never persisted) or a
-    // write hiccup must never fail an otherwise-terminal delegated run.
+    // TASK-933: close terminal checkpoints. Paused sessions intentionally remain
+    // Running with a live binding so resume/reconciliation can reattach to the
+    // prepared node rather than manufacturing a failed/completed checkpoint.
     if let (Some(scoped_root), Some(phase_id)) = (scoped_root_opt.as_deref(), binding_phase_id.as_deref()) {
-        let _ = if matches!(workflow_status, WorkflowStatus::Completed) {
-            crate::phase_session::update_session_completed(scoped_root, workflow_id, phase_id)
-        } else {
-            crate::phase_session::update_session_failed(
-                scoped_root,
-                workflow_id,
-                phase_id,
-                &format!("remote-animus session ended {}", response.status),
-            )
-        };
+        let _ = finalize_session_checkpoint(scoped_root, workflow_id, phase_id, workflow_status, &response.status);
     }
 
     // Emit the single terminal workflow event home (the driver owns it; the
@@ -779,10 +951,7 @@ pub(crate) async fn delegate_workflow_via_session(
     let collected = phase_results.lock().map(|guard| guard.clone()).unwrap_or_default();
 
     Ok(WorkflowExecuteInternalResult {
-        success: !matches!(
-            workflow_status,
-            WorkflowStatus::Failed | WorkflowStatus::Escalated | WorkflowStatus::Cancelled
-        ),
+        success: session_succeeded(workflow_status),
         workflow_id: workflow_id.to_string(),
         workflow_ref: workflow_ref.to_string(),
         workflow_status,
@@ -800,6 +969,28 @@ pub(crate) async fn delegate_workflow_via_session(
             "reason": "remote-animus session owns the full workflow (incl. post-success) on the node",
         }),
     })
+}
+
+#[cfg(feature = "remote-animus-session")]
+fn finalize_session_checkpoint(
+    scoped_root: &Path,
+    workflow_id: &str,
+    phase_id: &str,
+    workflow_status: WorkflowStatus,
+    node_status: &str,
+) -> std::io::Result<()> {
+    match workflow_status {
+        WorkflowStatus::Completed => crate::phase_session::update_session_completed(scoped_root, workflow_id, phase_id),
+        // Paused is resumable, not terminal. Leave the checkpoint Running and
+        // retain its non-torn-down environment binding for reattachment.
+        WorkflowStatus::Paused => Ok(()),
+        _ => crate::phase_session::update_session_failed(
+            scoped_root,
+            workflow_id,
+            phase_id,
+            &format!("remote-animus session ended {node_status}"),
+        ),
+    }
 }
 
 /// Persist the delegated node's [`EnvironmentBinding`](crate::phase_session::EnvironmentBinding)
@@ -929,6 +1120,135 @@ mod tests {
         assert_eq!(received.lock().expect("lock").as_slice(), ["phase_completed"]);
     }
 
+    #[cfg(feature = "remote-animus-session")]
+    #[test]
+    fn prepare_and_exec_session_requests_carry_the_same_top_level_actor() {
+        use animus_environment_protocol::{EnvironmentHandle, ExecSessionRequest, PrepareRequest};
+
+        let actor = Actor {
+            user_id: "user-42".to_string(),
+            claims: vec!["admin".to_string()],
+            tenant_id: Some("tenant-7".to_string()),
+        };
+        let actor_value = serde_json::to_value(&actor).expect("serialize actor");
+        let prepare = request_params_with_actor(
+            PrepareRequest { spec: build_session_spec("railway", None) },
+            Some(&actor),
+            "serialize prepare",
+        )
+        .expect("actor-bound prepare params");
+        let exec = request_params_with_actor(
+            ExecSessionRequest {
+                handle: EnvironmentHandle {
+                    id: "node-1".to_string(),
+                    workspace_root: "/work".to_string(),
+                    metadata: serde_json::Value::Null,
+                },
+                subject_id: "task:TASK-1".to_string(),
+                workflow_ref: Some("coding".to_string()),
+                dispatch_input: None,
+                workflow_id: Some("wf-1".to_string()),
+            },
+            Some(&actor),
+            "serialize exec_session",
+        )
+        .expect("actor-bound exec_session params");
+
+        assert_eq!(prepare.get("actor"), Some(&actor_value));
+        assert_eq!(exec.get("actor"), Some(&actor_value));
+        assert_eq!(exec.pointer("/actor/user_id").and_then(|value| value.as_str()), Some("user-42"));
+    }
+
+    #[cfg(feature = "remote-animus-session")]
+    #[test]
+    fn system_session_request_omits_actor_field() {
+        use animus_environment_protocol::PrepareRequest;
+
+        let prepare = request_params_with_actor(
+            PrepareRequest { spec: build_session_spec("railway", None) },
+            None,
+            "serialize prepare",
+        )
+        .expect("system prepare params");
+
+        assert!(prepare.get("actor").is_none(), "None must preserve the legacy system-scoped wire shape");
+    }
+
+    #[cfg(feature = "remote-animus-session")]
+    #[tokio::test]
+    async fn death_like_session_host_is_invalidated_before_next_reacquire() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        use orchestrator_plugin_host::resident_host_registry::install_resident_host_registry_for_test;
+        use orchestrator_plugin_host::{DiscoveredPlugin, DiscoverySource, PluginHost};
+
+        fn disconnected_host() -> PluginHost {
+            let (host_reader, plugin_writer) = tokio::io::duplex(256);
+            let (plugin_reader, host_writer) = tokio::io::duplex(256);
+            drop(plugin_writer);
+            drop(plugin_reader);
+            PluginHost::from_streams("dead-session-environment", host_reader, host_writer)
+        }
+
+        let registry = install_resident_host_registry_for_test(4);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let plugin_path = tmp.path().join("fake-environment");
+        std::fs::write(&plugin_path, b"fake").expect("fake plugin path");
+        let key = SessionRegistryKey {
+            plugin_path: plugin_path.clone(),
+            binary_mtime: 42,
+            spawn_context: "session-death-regression".to_string(),
+        };
+        let spawn_count = Arc::new(AtomicUsize::new(0));
+        let first_count = spawn_count.clone();
+        let lease = registry
+            .get_or_spawn(&plugin_path, key.binary_mtime, &key.spawn_context, || async move {
+                first_count.fetch_add(1, Ordering::SeqCst);
+                Ok(disconnected_host())
+            })
+            .await
+            .expect("first lease");
+        let dead_generation = lease.generation();
+        let client = SessionEnvironmentClient {
+            plugin_name: "fake-environment".to_string(),
+            plugin: DiscoveredPlugin {
+                name: "fake-environment".to_string(),
+                path: plugin_path.clone(),
+                manifest: crate::plugin::plugin_manifest(),
+                source: DiscoverySource::ExplicitConfig,
+            },
+            forwarded_env: Vec::new(),
+            registry_key: key.clone(),
+            pinned: tokio::sync::Mutex::new(Some(PinnedSessionLease { lease, generation: dead_generation })),
+        };
+        tokio::task::yield_now().await;
+
+        let handle = animus_environment_protocol::EnvironmentHandle {
+            id: "dead-handle".to_string(),
+            workspace_root: "/work".to_string(),
+            metadata: serde_json::Value::Null,
+        };
+        assert!(!client.probe(&handle).await, "dead host probe must fail");
+        assert!(
+            !registry.contains(&plugin_path, key.binary_mtime, &key.spawn_context),
+            "death-like failure must remove exactly the cached dead generation"
+        );
+
+        let second_count = spawn_count.clone();
+        let replacement = registry
+            .get_or_spawn(&plugin_path, key.binary_mtime, &key.spawn_context, || async move {
+                second_count.fetch_add(1, Ordering::SeqCst);
+                Ok(disconnected_host())
+            })
+            .await
+            .expect("replacement lease");
+        assert_ne!(replacement.generation(), dead_generation, "reacquire must install a fresh generation");
+        assert_eq!(spawn_count.load(Ordering::SeqCst), 2, "the dead cached host was not reused");
+        drop(replacement);
+        registry.shutdown_all().await;
+    }
+
     #[test]
     fn journal_kind_maps_only_phase_lifecycle() {
         assert_eq!(map_journal_event_kind("phase_started"), Some(RuntimeWorkflowEventKind::PhaseStarted));
@@ -987,6 +1307,43 @@ mod tests {
         assert_eq!(session_status_to_workflow_status("failed"), WorkflowStatus::Failed);
         // Fail closed on an unrecognized terminal status.
         assert_eq!(session_status_to_workflow_status("weird-node-state"), WorkflowStatus::Failed);
+    }
+
+    #[test]
+    fn only_completed_session_is_successful_and_paused_is_not_torn_down() {
+        assert!(session_succeeded(WorkflowStatus::Completed));
+        for status in
+            [WorkflowStatus::Paused, WorkflowStatus::Failed, WorkflowStatus::Escalated, WorkflowStatus::Cancelled]
+        {
+            assert!(!session_succeeded(status), "{status:?} must not be reported as success");
+        }
+        assert!(!session_should_teardown(WorkflowStatus::Paused));
+        assert!(session_should_teardown(WorkflowStatus::Completed));
+        assert!(session_should_teardown(WorkflowStatus::Failed));
+    }
+
+    #[cfg(feature = "remote-animus-session")]
+    #[test]
+    fn paused_session_keeps_running_checkpoint_and_live_binding() {
+        use crate::phase_session::{read_checkpoint, SessionCheckpointStatus};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let handle = animus_environment_protocol::EnvironmentHandle {
+            id: "paused-node".to_string(),
+            workspace_root: "/work".to_string(),
+            metadata: serde_json::json!({ "resume": true }),
+        };
+        persist_session_binding(tmp.path(), "wf-paused", "implementation", "fake-environment", &handle);
+        finalize_session_checkpoint(tmp.path(), "wf-paused", "implementation", WorkflowStatus::Paused, "paused")
+            .expect("paused checkpoint finalization");
+
+        let checkpoint = read_checkpoint(tmp.path(), "wf-paused", "implementation").expect("read").expect("checkpoint");
+        assert_eq!(checkpoint.status, SessionCheckpointStatus::Running);
+        assert!(checkpoint.completed_at.is_none());
+        assert!(checkpoint.blocked_reason.is_none());
+        let binding = checkpoint.environment.expect("live environment binding");
+        assert_eq!(binding.handle.id, "paused-node");
+        assert!(!binding.torn_down, "paused node must remain available for resume");
     }
 
     #[cfg(feature = "remote-animus-session")]

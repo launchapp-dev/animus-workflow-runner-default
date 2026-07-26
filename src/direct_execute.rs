@@ -11,14 +11,32 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use animus_runtime_shared::actor_env::ANIMUS_ACTOR_JSON_ENV;
 use animus_workflow_runner_default::reattach::ReattachListenerEmitter;
 use animus_workflow_runner_default::workflow_event_emitter::{
     FanoutEmitter, SharedWorkflowEventEmitter, SubprocessPipeEmitter,
 };
 use animus_workflow_runner_default::workflow_execute::{execute_workflow_with_hub, WorkflowExecuteInternalParams};
+use anyhow::{anyhow, Context};
 use orchestrator_core::{FileServiceHub, WorkflowStatus};
 use orchestrator_logging::Logger;
 use serde::Serialize;
+
+fn inherited_workflow_actor() -> anyhow::Result<Option<animus_actor::Actor>> {
+    parse_inherited_workflow_actor(std::env::var_os(ANIMUS_ACTOR_JSON_ENV))
+}
+
+fn parse_inherited_workflow_actor(raw: Option<std::ffi::OsString>) -> anyhow::Result<Option<animus_actor::Actor>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let raw = raw.into_string().map_err(|_| {
+        anyhow!("{ANIMUS_ACTOR_JSON_ENV} is present but is not valid UTF-8; refusing unscoped workflow run")
+    })?;
+    serde_json::from_str(&raw)
+        .map(Some)
+        .with_context(|| format!("{ANIMUS_ACTOR_JSON_ENV} is present but malformed; refusing unscoped workflow run"))
+}
 
 pub struct ExecuteArgs {
     pub workflow_id: Option<String>,
@@ -176,6 +194,7 @@ pub async fn run_execute(args: ExecuteArgs) -> u8 {
 }
 
 async fn run_execute_inner(args: ExecuteArgs) -> anyhow::Result<u8> {
+    let actor = inherited_workflow_actor()?;
     let subject_id = args
         .workflow_id
         .as_deref()
@@ -220,9 +239,7 @@ async fn run_execute_inner(args: ExecuteArgs) -> anyhow::Result<u8> {
         phase_filter: None,
         phase_routing,
         mcp_config,
-        // CLI direct-execute is system-initiated; there is no transport-asserted
-        // actor in scope.
-        actor: None,
+        actor,
     };
 
     let hub: Arc<dyn orchestrator_core::services::ServiceHub> = Arc::new(
@@ -348,6 +365,11 @@ fn clamp_exit_code(code: i32) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn actor_env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
 
     #[test]
     fn clamp_exit_code_zero() {
@@ -490,5 +512,70 @@ mod tests {
         if let Some(v) = prev_reattach {
             std::env::set_var(animus_workflow_runner_default::reattach::ANIMUS_WORKFLOW_REATTACH_SOCKET_ENV, v);
         }
+    }
+
+    #[test]
+    fn inherited_workflow_actor_parses_the_exact_actor() {
+        use protocol::test_utils::EnvVarGuard;
+
+        let _lock = actor_env_lock().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let actor = animus_actor::Actor {
+            user_id: "user-42".to_string(),
+            claims: vec!["admin".to_string()],
+            tenant_id: Some("tenant-7".to_string()),
+        };
+        let encoded = serde_json::to_string(&actor).expect("serialize actor");
+        let _actor_env = EnvVarGuard::set(ANIMUS_ACTOR_JSON_ENV, Some(&encoded));
+
+        assert_eq!(inherited_workflow_actor().expect("valid inherited actor"), Some(actor));
+    }
+
+    #[test]
+    fn malformed_inherited_workflow_actor_fails_closed() {
+        use protocol::test_utils::EnvVarGuard;
+
+        let _lock = actor_env_lock().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _actor_env = EnvVarGuard::set(ANIMUS_ACTOR_JSON_ENV, Some("{not-json"));
+
+        let error = inherited_workflow_actor().expect_err("malformed actor must fail");
+        let message = format!("{error:#}");
+        assert!(message.contains(ANIMUS_ACTOR_JSON_ENV));
+        assert!(message.contains("refusing unscoped"), "malformed actor must not downgrade scope: {message}");
+    }
+
+    #[test]
+    fn blank_inherited_workflow_actor_fails_closed() {
+        use protocol::test_utils::EnvVarGuard;
+
+        let _lock = actor_env_lock().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _actor_env = EnvVarGuard::set(ANIMUS_ACTOR_JSON_ENV, Some("   "));
+
+        let error = inherited_workflow_actor().expect_err("blank present actor must fail");
+        let message = format!("{error:#}");
+        assert!(message.contains(ANIMUS_ACTOR_JSON_ENV));
+        assert!(message.contains("refusing unscoped"), "blank actor must not downgrade scope: {message}");
+    }
+
+    #[test]
+    fn absent_inherited_workflow_actor_preserves_system_scope() {
+        use protocol::test_utils::EnvVarGuard;
+
+        let _lock = actor_env_lock().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _actor_env = EnvVarGuard::set(ANIMUS_ACTOR_JSON_ENV, None);
+
+        assert_eq!(inherited_workflow_actor().expect("absent actor is valid"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_inherited_workflow_actor_fails_closed() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let raw = std::ffi::OsString::from_vec(vec![0xff, 0xfe]);
+        let error = parse_inherited_workflow_actor(Some(raw)).expect_err("non-UTF-8 actor must fail");
+        let message = format!("{error:#}");
+        assert!(message.contains(ANIMUS_ACTOR_JSON_ENV));
+        assert!(message.contains("not valid UTF-8"));
+        assert!(message.contains("refusing unscoped"), "invalid actor must not downgrade scope: {message}");
     }
 }
