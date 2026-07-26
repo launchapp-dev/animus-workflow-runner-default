@@ -75,7 +75,9 @@ pub struct WorkflowExecuteInternalParams {
     /// Transport-asserted caller identity relayed verbatim from the inbound
     /// `WorkflowExecuteRequest`. Threaded into every phase's `SessionRequest`
     /// so the provider/agent runs as the user. `None` for system-initiated
-    /// runs (e.g. the CLI direct-execute path). The runner never interprets it.
+    /// runs. Direct execution inherits this only from rc.30's trusted
+    /// `ANIMUS_ACTOR_JSON` daemon-to-runner channel. The runner never
+    /// interprets it.
     pub actor: Option<Actor>,
 }
 
@@ -220,6 +222,12 @@ pub async fn execute_workflow_with_hub(
     mut params: WorkflowExecuteInternalParams,
     hub: Arc<dyn ServiceHub>,
     event_emitter: Option<SharedWorkflowEventEmitter>,
+    // TASK-811: publishes the resolved workflow id as soon as the row is
+    // minted/loaded, so a caller can TERMINALIZE the run even when execution
+    // fails downstream (e.g. a delegated `prepare` failure). Without it the
+    // `runner_complete` Err arm carries `workflow_id: None` and the daemon
+    // cannot mark the run Failed — it ghosts as "Running" forever.
+    workflow_id_sink: Option<Arc<std::sync::Mutex<Option<String>>>>,
 ) -> Result<WorkflowExecuteInternalResult> {
     let routing = params.phase_routing.take().unwrap_or_default();
     let phase_timeout_secs = params.phase_timeout_secs;
@@ -251,6 +259,15 @@ pub async fn execute_workflow_with_hub(
             })?
         }
     };
+    // TASK-811: the row now exists (minted or loaded) and its id is known BEFORE
+    // any phase / delegated prepare runs. Publish it so a downstream failure can
+    // still terminalize this exact run instead of ghosting.
+    if let Some(sink) = &workflow_id_sink {
+        if let Ok(mut slot) = sink.lock() {
+            *slot = Some(workflow.id.clone());
+        }
+    }
+
     // rc.6 Option-ized `OrchestratorWorkflow.subject` to support genuinely
     // subjectless runs. This runner binds a concrete subject for every dispatch
     // path (task / requirement / title / subject-id); a subjectless workflow is
@@ -322,6 +339,49 @@ pub async fn execute_workflow_with_hub(
     let mut rework_context: Option<String> = None;
     let mut results = Vec::new();
     let workflow_start = Instant::now();
+
+    // REQUIREMENT-052: when the resolved `environment` is a FULL standalone animus
+    // (it advertises `environment/exec_session`), delegate the WHOLE workflow to it
+    // in ONE `EnvironmentClient::exec_session` call instead of running phases here
+    // or routing them per-phase (REQUIREMENT-048, below). The node runs every phase
+    // on its OWN animus and streams `environment/journal` events home, which the
+    // delegator forwards through `event_emitter`. Only FULL runs delegate -- a
+    // `--phase` single-phase run keeps the local/per-phase path. No session-capable
+    // environment resolves (the default) -> fall through UNCHANGED. With the
+    // `remote-animus-session` feature off, `environment_is_session_capable` is
+    // always `false`, so this branch is inert and the runner's behavior is
+    // byte-for-byte the current per-phase / local paths.
+    if params.phase_filter.is_none() {
+        if let Some(environment) = crate::phase_environment::resolve_workflow_environment(
+            Path::new(&params.project_root),
+            &workflow_ref,
+            Some(&subject_kind_str),
+        ) {
+            if crate::workflow_session::environment_is_session_capable(Path::new(&params.project_root), &environment.id)
+            {
+                let subject_git_repo =
+                    crate::phase_command::subject_git_repo(&params.project_root, &subject_kind_str, &subject_id_str)
+                        .await;
+                let phases_requested: Vec<String> =
+                    workflow.phases.iter().map(|phase| phase.phase_id.clone()).collect();
+                return crate::workflow_session::delegate_workflow_via_session(
+                    hub.clone(),
+                    &params.project_root,
+                    &environment.id,
+                    &workflow.id,
+                    &workflow_ref,
+                    &subject_id_str,
+                    subject_git_repo.as_deref(),
+                    phase_inputs.dispatch_input.as_deref(),
+                    &execution_cwd,
+                    phases_requested,
+                    params.actor.as_ref(),
+                    event_emitter.as_ref(),
+                )
+                .await;
+            }
+        }
+    }
 
     // REQUIREMENT-048: resolve the per-workflow-run environment node ONCE, shared
     // across every phase (so a clone in one phase is visible to the next).
@@ -1521,7 +1581,7 @@ fn phase_rework_context(outcome: &PhaseExecutionOutcome) -> Option<String> {
     }
 }
 
-fn is_terminal_workflow_status(status: WorkflowStatus) -> bool {
+pub(crate) fn is_terminal_workflow_status(status: WorkflowStatus) -> bool {
     matches!(
         status,
         WorkflowStatus::Completed | WorkflowStatus::Failed | WorkflowStatus::Escalated | WorkflowStatus::Cancelled

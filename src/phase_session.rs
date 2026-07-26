@@ -2,6 +2,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use animus_environment_protocol::EnvironmentHandle;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -45,6 +46,52 @@ pub struct SessionCheckpoint {
     pub blocked_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request: Option<Value>,
+    /// The delegated environment (node) this run/phase is bound to, if any.
+    /// Persisted right after `environment/prepare` succeeds so a daemon restart
+    /// can teardown / reattach the node BY HANDLE instead of leaking it. `None`
+    /// for local (non-delegated) runs.
+    ///
+    /// COMPANION to animus-cli's released `v0.7.0-rc.28` restart reconciler:
+    /// its `daemon_reconciliation` reads THIS field off the on-disk checkpoint
+    /// (`read_checkpoint(scoped_root, workflow_id, current_phase_id)`), then
+    /// reaps a dead node / preserves a live one / terminalizes ghosts. This
+    /// local `phase_session` module is the on-disk twin of the daemon's
+    /// `animus-runtime-shared::phase_session`, so the `EnvironmentBinding` shape
+    /// here MUST match rc.28 byte-for-byte. The field is `#[serde(default,
+    /// skip_serializing_if = ...)]` and the struct is NOT `deny_unknown_fields`,
+    /// so a checkpoint written by an older runner (no `environment`) still
+    /// deserializes and a daemon that predates the field ignores it — the two
+    /// ship independently.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<EnvironmentBinding>,
+}
+
+/// The delegated environment context (Railway/container/remote node) a run is
+/// bound to. Persisted into the [`SessionCheckpoint`] the instant
+/// `environment/prepare` returns a handle, so restart reconciliation can reap
+/// (or reattach to) the node by handle rather than leaking it and preparing a
+/// brand-new one on re-dispatch.
+///
+/// Mirrors `animus-runtime-shared::phase_session::EnvironmentBinding` from
+/// animus-cli `v0.7.0-rc.28` field-for-field (the daemon deserializes exactly
+/// this shape from the same on-disk `*.session.json`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnvironmentBinding {
+    /// Resolved environment plugin id (what `EnvironmentClient::resolve` binds).
+    /// Stored explicitly so a restart knows WHICH environment plugin to talk to
+    /// for teardown/exec — the handle alone does not carry it.
+    pub environment_id: String,
+    /// The full, serializable prepared-context handle (id + workspace_root +
+    /// opaque plugin metadata: container/remote/relay ids). Teardown and
+    /// on-node re-exec are handle-only, so this is sufficient to reap or
+    /// reattach after a restart.
+    pub handle: EnvironmentHandle,
+    /// RFC3339 timestamp of when the binding was persisted (prepare success).
+    pub bound_at: String,
+    /// Set true after a successful teardown so subsequent reconciliation sweeps
+    /// skip an already-reaped node (idempotent, no double-free).
+    #[serde(default)]
+    pub torn_down: bool,
 }
 
 pub fn phase_session_path(scoped_root: &Path, workflow_id: &str, phase_id: &str) -> PathBuf {
@@ -81,6 +128,7 @@ pub fn write_session_pending(
         completed_at: None,
         blocked_reason: None,
         request,
+        environment: None,
     };
     write_atomic(&path, &checkpoint)?;
     Ok(checkpoint)
@@ -112,6 +160,73 @@ pub fn update_provider_session_id(
             checkpoint.provider_session_id = Some(provider_session_id.to_string());
         }
     })
+}
+
+/// Persist the delegated environment binding for this run/phase, right after
+/// `environment/prepare` succeeds (or a live node is reused on re-dispatch).
+/// The runner owns `scoped_root`/`workflow_id`/`phase_id` for a delegated run
+/// and already writes the pending/running/provider-session-id fields. Once
+/// persisted, the daemon's restart reconciler (animus-cli rc.28) can reap the
+/// node BY HANDLE instead of leaking it. Overwrites any prior binding (a
+/// re-dispatch that prepared a fresh node replaces a dead one's binding).
+///
+/// Signature-identical to the daemon's `animus-runtime-shared` twin.
+pub fn update_session_environment(
+    scoped_root: &Path,
+    workflow_id: &str,
+    phase_id: &str,
+    binding: EnvironmentBinding,
+) -> io::Result<()> {
+    mutate(scoped_root, workflow_id, phase_id, |checkpoint| {
+        checkpoint.environment = Some(binding);
+    })
+}
+
+/// Mark the delegated node for this run/phase torn down after a successful
+/// `environment/teardown`. Leaves the binding in place (the handle stays
+/// visible for auditing) but flips `torn_down` so subsequent reconciliation
+/// sweeps do not attempt a second teardown. A no-op if the checkpoint carries
+/// no environment binding. Signature-identical to the daemon's twin.
+pub fn mark_environment_torn_down(scoped_root: &Path, workflow_id: &str, phase_id: &str) -> io::Result<()> {
+    mutate(scoped_root, workflow_id, phase_id, |checkpoint| {
+        if let Some(env) = checkpoint.environment.as_mut() {
+            env.torn_down = true;
+        }
+    })
+}
+
+/// Scan every phase checkpoint of `workflow_id` for a REUSABLE delegated
+/// binding: one whose `environment_id` matches and that has not been torn down.
+/// Returns the first such binding (there is at most ONE node per workflow run,
+/// so any live binding points at the same node). Used on re-dispatch after a
+/// daemon restart to reattach to the persisted node instead of preparing a
+/// fresh one. Liveness is probed by the caller.
+pub fn find_reusable_binding(
+    scoped_root: &Path,
+    workflow_id: &str,
+    environment_id: &str,
+) -> io::Result<Option<EnvironmentBinding>> {
+    let phases_dir = scoped_root.join("runs").join(sanitize(workflow_id)).join("phases");
+    let entries = match fs::read_dir(&phases_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with(".session.json")) {
+            continue;
+        }
+        if let Some(checkpoint) = read_path(&path)? {
+            if let Some(binding) = checkpoint.environment {
+                if !binding.torn_down && binding.environment_id == environment_id {
+                    return Ok(Some(binding));
+                }
+            }
+        }
+    }
+    Ok(None)
 }
 
 pub fn update_session_running_after_resume(
@@ -391,5 +506,132 @@ mod tests {
         // And no leftover .tmp siblings.
         let tmp_count = entries.iter().filter(|name| name.to_string_lossy().ends_with(".tmp")).count();
         assert_eq!(tmp_count, 0, "no .tmp siblings should remain after fsync_rename");
+    }
+
+    fn sample_binding() -> EnvironmentBinding {
+        EnvironmentBinding {
+            environment_id: "animus-environment-railway".to_string(),
+            handle: EnvironmentHandle {
+                id: "node-abc".to_string(),
+                workspace_root: "/work".to_string(),
+                metadata: serde_json::json!({ "railway_service_id": "svc-1", "relay": "wss://relay/x" }),
+            },
+            bound_at: Utc::now().to_rfc3339(),
+            torn_down: false,
+        }
+    }
+
+    // TASK-933 (companion to animus-cli rc.28): the EnvironmentBinding must
+    // survive a full serde round-trip through the on-disk checkpoint — the
+    // daemon reconciler reads this SAME file to teardown-by-handle after a
+    // restart — including the opaque handle metadata.
+    #[test]
+    fn env_binding_persists_and_round_trips_with_the_right_fields() {
+        let temp = tempdir().expect("tempdir");
+        let scoped_root = temp.path();
+        write_session_pending(scoped_root, "wf-env-1", "phase-a", "environment", "run-1", None).expect("pending");
+
+        let cp = read_checkpoint(scoped_root, "wf-env-1", "phase-a").expect("read").expect("present");
+        assert!(cp.environment.is_none(), "a local run carries no environment binding");
+
+        let binding = sample_binding();
+        update_session_environment(scoped_root, "wf-env-1", "phase-a", binding.clone()).expect("persist binding");
+
+        let cp = read_checkpoint(scoped_root, "wf-env-1", "phase-a").expect("read").expect("present");
+        assert_eq!(cp.environment.as_ref(), Some(&binding), "the binding round-trips byte-for-byte");
+        let env = cp.environment.expect("present");
+        assert_eq!(env.environment_id, "animus-environment-railway");
+        assert_eq!(env.handle.id, "node-abc");
+        assert_eq!(
+            env.handle.metadata.pointer("/railway_service_id").and_then(Value::as_str),
+            Some("svc-1"),
+            "opaque handle metadata survives the round-trip"
+        );
+        assert!(!env.torn_down);
+    }
+
+    // The on-disk JSON must be byte-shape-compatible with what rc.28's daemon
+    // reconciler deserializes: exactly the keys environment_id / handle
+    // (id/workspace_root/metadata) / bound_at / torn_down under `environment`.
+    #[test]
+    fn env_binding_json_matches_the_rc28_reader_shape() {
+        let temp = tempdir().expect("tempdir");
+        let scoped_root = temp.path();
+        write_session_pending(scoped_root, "wf-json", "phase-a", "environment", "run-j", None).expect("pending");
+        update_session_environment(scoped_root, "wf-json", "phase-a", sample_binding()).expect("persist");
+
+        let raw = std::fs::read_to_string(phase_session_path(scoped_root, "wf-json", "phase-a")).expect("read raw");
+        let json: Value = serde_json::from_str(&raw).expect("parse");
+        let env = json.get("environment").expect("environment key present");
+        assert!(env.get("environment_id").and_then(Value::as_str).is_some(), "environment_id key");
+        assert!(env.get("bound_at").and_then(Value::as_str).is_some(), "bound_at key");
+        assert_eq!(env.get("torn_down").and_then(Value::as_bool), Some(false), "torn_down key");
+        let handle = env.get("handle").expect("handle key");
+        assert_eq!(handle.get("id").and_then(Value::as_str), Some("node-abc"), "handle.id");
+        assert!(handle.get("workspace_root").and_then(Value::as_str).is_some(), "handle.workspace_root");
+    }
+
+    // TASK-811/933: mark_environment_torn_down flips the flag, is idempotent (a
+    // second call is a harmless no-op), and never touches a checkpoint that has
+    // no binding.
+    #[test]
+    fn teardown_marks_torn_down_idempotently_and_binding_gated() {
+        let temp = tempdir().expect("tempdir");
+        let scoped_root = temp.path();
+        write_session_pending(scoped_root, "wf-env-2", "phase-a", "environment", "run-2", None).expect("pending");
+
+        mark_environment_torn_down(scoped_root, "wf-env-2", "phase-a").expect("no-op ok");
+        let cp = read_checkpoint(scoped_root, "wf-env-2", "phase-a").expect("read").expect("present");
+        assert!(cp.environment.is_none(), "mark with no binding must not fabricate one");
+
+        update_session_environment(scoped_root, "wf-env-2", "phase-a", sample_binding()).expect("persist");
+        mark_environment_torn_down(scoped_root, "wf-env-2", "phase-a").expect("mark");
+        let cp = read_checkpoint(scoped_root, "wf-env-2", "phase-a").expect("read").expect("present");
+        assert!(cp.environment.as_ref().expect("binding").torn_down, "torn_down set after first mark");
+
+        mark_environment_torn_down(scoped_root, "wf-env-2", "phase-a").expect("second mark");
+        let cp = read_checkpoint(scoped_root, "wf-env-2", "phase-a").expect("read").expect("present");
+        assert!(cp.environment.expect("binding").torn_down, "torn_down stays set on the second mark");
+    }
+
+    // Re-dispatch reuse: `find_reusable_binding` returns a live (not torn-down)
+    // binding matching the environment id, ignores torn-down or mismatched ones,
+    // and returns None when there is no reusable node.
+    #[test]
+    fn find_reusable_binding_selects_live_matching_node() {
+        let temp = tempdir().expect("tempdir");
+        let scoped_root = temp.path();
+        write_session_pending(scoped_root, "wf-reuse", "phase-a", "environment", "run-r", None).expect("pending");
+
+        assert!(find_reusable_binding(scoped_root, "wf-reuse", "animus-environment-railway").expect("scan").is_none());
+
+        update_session_environment(scoped_root, "wf-reuse", "phase-a", sample_binding()).expect("persist");
+        let found = find_reusable_binding(scoped_root, "wf-reuse", "animus-environment-railway")
+            .expect("scan")
+            .expect("a live binding is reusable");
+        assert_eq!(found.handle.id, "node-abc");
+
+        assert!(find_reusable_binding(scoped_root, "wf-reuse", "animus-environment-docker").expect("scan").is_none());
+
+        mark_environment_torn_down(scoped_root, "wf-reuse", "phase-a").expect("mark");
+        assert!(find_reusable_binding(scoped_root, "wf-reuse", "animus-environment-railway").expect("scan").is_none());
+    }
+
+    // Backward-compat: a checkpoint JSON written by an OLDER runner that does not
+    // know the `environment` field must still deserialize.
+    #[test]
+    fn legacy_checkpoint_without_environment_field_deserializes() {
+        let legacy = serde_json::json!({
+            "workflow_id": "wf-legacy",
+            "phase_id": "phase-a",
+            "provider": "claude",
+            "run_id": "run-legacy",
+            "status": "running",
+            "started_at": Utc::now().to_rfc3339(),
+        });
+        let cp: SessionCheckpoint =
+            serde_json::from_value(legacy).expect("legacy checkpoint without `environment` must deserialize");
+        assert!(cp.environment.is_none(), "missing environment field defaults to None");
+        assert_eq!(cp.status, SessionCheckpointStatus::Running);
     }
 }

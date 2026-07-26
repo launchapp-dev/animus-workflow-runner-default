@@ -2233,7 +2233,10 @@ environment_routing:
         let backend = Arc::new(FakeBackend::new());
         *backend.exec_stream_outcome.lock().unwrap() = Some(StreamOutcome::Deltas(
             vec![
-                (ExecStream::Stdout, "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"tex".to_string()),
+                (
+                    ExecStream::Stdout,
+                    "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"tex".to_string(),
+                ),
                 (ExecStream::Stdout, "t_delta\",\"text\":\"out-1\"}}\n".to_string()),
                 (ExecStream::Stderr, "err-1".to_string()),
             ],
@@ -2625,8 +2628,14 @@ environment_routing:
             run_id: "run-1".to_string(),
             handle_id: "h-1".to_string(),
         };
-        let run =
-            spawn_brokered_exec(target, command_for_test(), None, 60, "environment-broker:railway".to_string(), "claude".to_string());
+        let run = spawn_brokered_exec(
+            target,
+            command_for_test(),
+            None,
+            60,
+            "environment-broker:railway".to_string(),
+            "claude".to_string(),
+        );
         assert_eq!(run.selected_backend, "environment-broker:railway");
         let events = drain(run).await;
         assert!(
@@ -2655,8 +2664,14 @@ environment_routing:
             run_id: "run-1".to_string(),
             handle_id: "h-1".to_string(),
         };
-        let run =
-            spawn_brokered_exec(target, command_for_test(), None, 60, "environment-broker:railway".to_string(), "claude".to_string());
+        let run = spawn_brokered_exec(
+            target,
+            command_for_test(),
+            None,
+            60,
+            "environment-broker:railway".to_string(),
+            "claude".to_string(),
+        );
         let events = drain(run).await;
         assert!(
             matches!(

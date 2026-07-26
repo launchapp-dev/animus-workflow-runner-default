@@ -30,6 +30,8 @@ fn manifest_flag_prints_workflow_runner_manifest() {
     assert!(output.status.success(), "expected --manifest to exit 0");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let manifest: Value = serde_json::from_str(stdout.trim()).expect("manifest is valid JSON");
+    assert_eq!(manifest["version"], env!("CARGO_PKG_VERSION"));
+    assert!(manifest["protocol_version"].as_str().is_some_and(|version| version.starts_with("1.")));
     assert_eq!(manifest["plugin_kind"], "workflow_runner");
     let methods = manifest["capabilities"].as_array().expect("capabilities array");
     assert!(methods.iter().any(|m| m == "workflow/execute"));

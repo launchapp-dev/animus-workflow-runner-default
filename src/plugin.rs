@@ -279,7 +279,7 @@ pub async fn handle_workflow_execute(request: WorkflowExecuteRequest) -> Result<
     };
 
     let recorder_dyn: crate::workflow_event_emitter::SharedWorkflowEventEmitter = recorder.clone();
-    let internal = execute_workflow_with_hub(params, state.hub.clone(), Some(recorder_dyn)).await?;
+    let internal = execute_workflow_with_hub(params, state.hub.clone(), Some(recorder_dyn), None).await?;
 
     let phase_results = internal.phase_results.into_iter().map(snapshot_from_value).collect();
 
@@ -460,8 +460,7 @@ pub async fn handle_workflow_run_phase(request: WorkflowPhaseRunRequest) -> Resu
     // GitHub App installation token to THAT repo. The broker single-flights the
     // node per run, so this matters on the run's FIRST phase acquire; a bare run
     // without `git_repo` leaves the metadata untouched.
-    let subject_git_repo =
-        crate::phase_command::subject_git_repo(&project_root, "", &request.subject_id).await;
+    let subject_git_repo = crate::phase_command::subject_git_repo(&project_root, "", &request.subject_id).await;
     let brokered_environment: Option<std::sync::Arc<crate::phase_environment::BrokeredEnvironment>> =
         match crate::phase_environment::BrokeredEnvironment::acquire_from_env(subject_git_repo).await {
             Some(result) => Some(std::sync::Arc::new(result.with_context(|| {
@@ -590,6 +589,8 @@ mod tests {
     #[test]
     fn manifest_lists_two_methods() {
         let manifest = plugin_manifest();
+        assert_eq!(manifest.version, env!("CARGO_PKG_VERSION"));
+        assert!(manifest.protocol_version.starts_with("1."));
         assert_eq!(manifest.plugin_kind, "workflow_runner");
         assert_eq!(manifest.capabilities.len(), 2);
         assert!(manifest.capabilities.contains(&"workflow/execute".to_string()));

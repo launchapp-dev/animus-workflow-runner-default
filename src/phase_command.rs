@@ -957,11 +957,8 @@ pub(crate) async fn run_workflow_phase_with_command(
     // on the stdout/stderr strings + exit_code, so it is execution-path-agnostic.
     let (exit_code, stdout, stderr, duration_ms, phase_decision) = match held_environment {
         Some(held) => {
-            let subject_status = subject_record
-                .as_ref()
-                .and_then(|rec| rec.get("status"))
-                .and_then(Value::as_str)
-                .unwrap_or_default();
+            let subject_status =
+                subject_record.as_ref().and_then(|rec| rec.get("status")).and_then(Value::as_str).unwrap_or_default();
             let mut env = env.clone();
             for (key, value) in build_animus_context_env(context, &template_vars, subject_status) {
                 env.insert(key.to_string(), value);

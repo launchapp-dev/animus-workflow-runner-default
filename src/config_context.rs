@@ -103,7 +103,8 @@ impl RuntimeConfigContext {
         {
             return caps;
         }
-        if let Some(caps) = self.agent_runtime_config.phase_execution(phase_id).and_then(|def| def.capabilities.clone()) {
+        if let Some(caps) = self.agent_runtime_config.phase_execution(phase_id).and_then(|def| def.capabilities.clone())
+        {
             return caps;
         }
         self.default_capabilities_for_mode(phase_id)
