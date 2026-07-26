@@ -603,9 +603,7 @@ mod tests {
         let scoped_root = temp.path();
         write_session_pending(scoped_root, "wf-reuse", "phase-a", "environment", "run-r", None).expect("pending");
 
-        assert!(find_reusable_binding(scoped_root, "wf-reuse", "animus-environment-railway")
-            .expect("scan")
-            .is_none());
+        assert!(find_reusable_binding(scoped_root, "wf-reuse", "animus-environment-railway").expect("scan").is_none());
 
         update_session_environment(scoped_root, "wf-reuse", "phase-a", sample_binding()).expect("persist");
         let found = find_reusable_binding(scoped_root, "wf-reuse", "animus-environment-railway")
@@ -613,14 +611,10 @@ mod tests {
             .expect("a live binding is reusable");
         assert_eq!(found.handle.id, "node-abc");
 
-        assert!(find_reusable_binding(scoped_root, "wf-reuse", "animus-environment-docker")
-            .expect("scan")
-            .is_none());
+        assert!(find_reusable_binding(scoped_root, "wf-reuse", "animus-environment-docker").expect("scan").is_none());
 
         mark_environment_torn_down(scoped_root, "wf-reuse", "phase-a").expect("mark");
-        assert!(find_reusable_binding(scoped_root, "wf-reuse", "animus-environment-railway")
-            .expect("scan")
-            .is_none());
+        assert!(find_reusable_binding(scoped_root, "wf-reuse", "animus-environment-railway").expect("scan").is_none());
     }
 
     // Backward-compat: a checkpoint JSON written by an OLDER runner that does not

@@ -13,7 +13,7 @@
 //! When the resolved `environment` plugin advertises the `environment/exec_session`
 //! method (see [`capabilities_advertise_exec_session`]), it is a full standalone
 //! animus: the runner hands it the ENTIRE workflow in ONE
-//! [`EnvironmentClient::exec_session`] call. The node brings up its own daemon,
+//! session RPC. The node brings up its own daemon,
 //! runs every phase through its OWN provider/journal layer, and streams
 //! `environment/journal` notifications home. The runner forwards each journal
 //! event through its normal [`WorkflowEventEmitter`](crate::workflow_event_emitter)
@@ -25,19 +25,14 @@
 //!
 //! ## Feature gate: `remote-animus-session`
 //!
-//! The parent-side `EnvironmentClient::exec_session` + `EnvironmentJournalEvent`
-//! surface (orchestrator-core, REQ-052) and the `environment/exec_session` /
-//! `environment/journal` protocol constants (animus-environment-protocol) are
-//! NOT present in the runner's current pinned `orchestrator-core` rev
-//! (`d03cd174`, the exec_session commit's parent) nor in the pinned
-//! `animus-environment-protocol` tag (`v0.7.0-rc.6`). Until those pins are
-//! advanced, the actual delegation call is compiled ONLY under the
-//! `remote-animus-session` cargo feature. With the feature OFF (the default)
-//! this module is behaviorally inert: [`environment_is_session_capable`] always
-//! returns `false`, so `execute_workflow_with_hub` keeps the byte-for-byte
-//! current per-phase / local paths. With the feature ON (node/CI builds against
-//! a REQ-052 orchestrator-core rev + an environment-protocol tag that ship
-//! `exec_session`), detection goes live and delegation engages.
+//! Animus CLI rc.30 deliberately narrows `orchestrator_core::EnvironmentClient`
+//! to the baseline prepare/exec/teardown contract, while Protocol rc.12 retains
+//! the optional `environment/exec_session` surface. This module therefore owns
+//! the small session-specific resident-host adapter it needs. The adapter uses
+//! the kernel's public plugin-host registry and the same spawn fingerprint as
+//! `EnvironmentClient`, so prepare, exec_session, and teardown still land on one
+//! pinned environment process. The actual delegation path remains compiled only
+//! under the `remote-animus-session` feature.
 //!
 //! The PURE decision logic ([`capabilities_advertise_exec_session`],
 //! [`map_journal_event_kind`], [`session_status_to_workflow_status`]) is compiled
@@ -63,6 +58,211 @@ pub(crate) const METHOD_ENVIRONMENT_EXEC_SESSION: &str = "environment/exec_sessi
 /// `animus_plugin_protocol::PLUGIN_KIND_ENVIRONMENT` (a stable wire string).
 #[cfg(feature = "remote-animus-session")]
 const PLUGIN_KIND_ENVIRONMENT: &str = "environment";
+
+/// Journal notification shape retained by Protocol rc.12 for
+/// `environment/exec_session`. This used to be re-exported by
+/// `orchestrator_core`; keeping the wire-shaped type here decouples the runner
+/// from that removed convenience API.
+#[cfg(feature = "remote-animus-session")]
+#[derive(Debug, serde::Deserialize)]
+struct SessionJournalEvent {
+    handle_id: String,
+    workflow_id: Option<String>,
+    event_kind: String,
+    phase_id: Option<String>,
+    status: Option<String>,
+    ts: String,
+    payload: serde_json::Value,
+    #[allow(dead_code)]
+    terminal: bool,
+}
+
+#[cfg(feature = "remote-animus-session")]
+fn forward_session_journal<F>(notification: &animus_plugin_protocol::RpcNotification, handle_id: &str, on_journal: &F)
+where
+    F: Fn(&SessionJournalEvent),
+{
+    if notification.method != animus_environment_protocol::NOTIFICATION_ENVIRONMENT_JOURNAL {
+        return;
+    }
+    let Some(params) = notification.params.clone() else {
+        return;
+    };
+    if let Ok(event) = serde_json::from_value::<SessionJournalEvent>(params) {
+        if event.handle_id == handle_id {
+            on_journal(&event);
+        }
+    }
+}
+
+/// Session-only environment client for CLI rc.30. Holds a resident-host lease
+/// for its whole lifetime so all stateful environment RPCs share one process.
+#[cfg(feature = "remote-animus-session")]
+struct SessionEnvironmentClient {
+    plugin_name: String,
+    lease: orchestrator_plugin_host::resident_host_registry::ResidentHostLease,
+}
+
+#[cfg(feature = "remote-animus-session")]
+impl SessionEnvironmentClient {
+    async fn resolve(project_root: &Path, environment_id: &str) -> Result<Self> {
+        use anyhow::{anyhow, Context};
+        use orchestrator_plugin_host::resident_host_registry::{
+            binary_mtime_nanos, global_resident_host_registry, spawn_context_fingerprint,
+        };
+        use orchestrator_plugin_host::{PluginHost, PluginSpawnOptions};
+
+        let plugins = orchestrator_plugin_host::discover_by_kind(project_root.to_path_buf(), PLUGIN_KIND_ENVIRONMENT)
+            .with_context(|| format!("discovering environment plugins for {}", project_root.display()))?;
+        let plugin = if let Some(exact) = plugins.iter().find(|plugin| plugin.name == environment_id) {
+            exact.clone()
+        } else if plugins.len() == 1 {
+            plugins.into_iter().next().expect("length checked")
+        } else {
+            let candidates = plugins.iter().map(|plugin| plugin.name.as_str()).collect::<Vec<_>>().join(", ");
+            return Err(anyhow!(
+                "no installed environment plugin matches environment id '{environment_id}'; installed environment plugins: [{candidates}]"
+            ));
+        };
+
+        let forwarded_env: Vec<String> = std::env::vars().map(|(name, _)| name).collect();
+        let spawn_context = spawn_context_fingerprint(&forwarded_env, None, plugin.manifest.notification_buffer_size);
+        let mtime = binary_mtime_nanos(&plugin.path);
+        let plugin_for_spawn = plugin.clone();
+        let lease = global_resident_host_registry()
+            .get_or_spawn(&plugin.path, mtime, &spawn_context, || async move {
+                let options = PluginSpawnOptions::for_manifest(
+                    plugin_for_spawn.name.clone(),
+                    &plugin_for_spawn.manifest.env_required,
+                    forwarded_env,
+                    None,
+                )
+                .with_notification_buffer_hint(plugin_for_spawn.manifest.notification_buffer_size);
+                let host = PluginHost::spawn_with_options(&plugin_for_spawn.path, &[], options)
+                    .await
+                    .with_context(|| format!("spawning environment plugin {}", plugin_for_spawn.name))?;
+                if let Err(error) = host.handshake().await {
+                    let _ = host.clone().shutdown().await;
+                    return Err(error)
+                        .with_context(|| format!("handshake with environment plugin {}", plugin_for_spawn.name));
+                }
+                Ok(host)
+            })
+            .await?;
+
+        Ok(Self { plugin_name: plugin.name, lease })
+    }
+
+    async fn prepare(
+        &self,
+        spec: animus_environment_protocol::EnvironmentSpec,
+    ) -> Result<animus_environment_protocol::EnvironmentHandle> {
+        use std::time::Duration;
+
+        use animus_environment_protocol::{PrepareRequest, PrepareResponse, METHOD_ENVIRONMENT_PREPARE};
+        use anyhow::Context;
+
+        let params =
+            serde_json::to_value(PrepareRequest { spec }).context("serializing environment prepare request")?;
+        let value = self
+            .lease
+            .host()
+            .request_typed_with_timeout(METHOD_ENVIRONMENT_PREPARE, Some(params), Duration::from_secs(360))
+            .await
+            .with_context(|| format!("environment prepare via {}", self.plugin_name))?;
+        let response: PrepareResponse = serde_json::from_value(value)
+            .with_context(|| format!("decoding prepare response from {}", self.plugin_name))?;
+        Ok(response.handle)
+    }
+
+    async fn probe(&self, handle: &animus_environment_protocol::EnvironmentHandle) -> bool {
+        use std::collections::BTreeMap;
+        use std::time::Duration;
+
+        use animus_environment_protocol::{ExecRequest, HarnessCommand, METHOD_ENVIRONMENT_EXEC};
+
+        let request = ExecRequest {
+            handle: handle.clone(),
+            command: HarnessCommand { program: "true".to_string(), args: Vec::new(), env: BTreeMap::new(), cwd: None },
+            stdin: None,
+            timeout_secs: Some(10),
+        };
+        let Ok(params) = serde_json::to_value(request) else {
+            return false;
+        };
+        self.lease
+            .host()
+            .request_typed_with_timeout(METHOD_ENVIRONMENT_EXEC, Some(params), Duration::from_secs(40))
+            .await
+            .is_ok()
+    }
+
+    async fn exec_session<F>(
+        &self,
+        handle: &animus_environment_protocol::EnvironmentHandle,
+        subject_id: String,
+        workflow_ref: Option<String>,
+        dispatch_input: Option<String>,
+        workflow_id: Option<String>,
+        on_journal: F,
+    ) -> Result<animus_environment_protocol::ExecSessionResponse>
+    where
+        F: Fn(&SessionJournalEvent) + Send + Sync,
+    {
+        use animus_environment_protocol::{ExecSessionRequest, ExecSessionResponse, METHOD_ENVIRONMENT_EXEC_SESSION};
+        use anyhow::Context;
+        use tokio::sync::broadcast::error::RecvError;
+
+        let request =
+            ExecSessionRequest { handle: handle.clone(), subject_id, workflow_ref, dispatch_input, workflow_id };
+        let params = serde_json::to_value(request).context("serializing environment exec_session request")?;
+        let mut notifications = self.lease.host().subscribe_notifications();
+        let response = self.lease.host().request_typed(METHOD_ENVIRONMENT_EXEC_SESSION, Some(params));
+        tokio::pin!(response);
+
+        let value = loop {
+            tokio::select! {
+                notification = notifications.recv() => match notification {
+                    Ok(notification) => forward_session_journal(&notification, &handle.id, &on_journal),
+                    Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => break response.await,
+                },
+                result = &mut response => break result,
+            }
+        }
+        .with_context(|| format!("environment exec_session via {}", self.plugin_name))?;
+
+        let buffered = notifications.len();
+        for _ in 0..buffered {
+            let Ok(notification) = notifications.try_recv() else {
+                break;
+            };
+            forward_session_journal(&notification, &handle.id, &on_journal);
+        }
+
+        serde_json::from_value::<ExecSessionResponse>(value)
+            .with_context(|| format!("decoding exec_session response from {}", self.plugin_name))
+    }
+
+    async fn teardown(&self, handle: &animus_environment_protocol::EnvironmentHandle) -> Result<()> {
+        use std::time::Duration;
+
+        use animus_environment_protocol::{TeardownRequest, TeardownResponse, METHOD_ENVIRONMENT_TEARDOWN};
+        use anyhow::Context;
+
+        let params = serde_json::to_value(TeardownRequest { handle: handle.clone() })
+            .context("serializing environment teardown request")?;
+        let value = self
+            .lease
+            .host()
+            .request_typed_with_timeout(METHOD_ENVIRONMENT_TEARDOWN, Some(params), Duration::from_secs(60))
+            .await
+            .with_context(|| format!("environment teardown via {}", self.plugin_name))?;
+        let _: TeardownResponse = serde_json::from_value(value)
+            .with_context(|| format!("decoding teardown response from {}", self.plugin_name))?;
+        Ok(())
+    }
+}
 
 /// Whether a plugin manifest's advertised method list (`capabilities`) contains
 /// `environment/exec_session` -- i.e. the environment can run a WHOLE workflow on
@@ -123,7 +323,15 @@ pub(crate) fn session_status_to_workflow_status(status: &str) -> WorkflowStatus 
 pub(crate) fn is_transcript_event_kind(event_kind: &str) -> bool {
     matches!(
         event_kind,
-        "output_chunk" | "tool_call" | "tool_result" | "thinking" | "started" | "finished" | "metadata" | "error" | "artifact"
+        "output_chunk"
+            | "tool_call"
+            | "tool_result"
+            | "thinking"
+            | "started"
+            | "finished"
+            | "metadata"
+            | "error"
+            | "artifact"
     )
 }
 
@@ -149,11 +357,7 @@ pub(crate) fn rekey_transcript_run_id(orig_run_id: &str, node_workflow_id: &str,
 /// malformed payloads are ignored; a persist error is swallowed so it never
 /// disturbs the delegated run.
 #[cfg(feature = "remote-animus-session")]
-fn persist_session_transcript(
-    project_root: &str,
-    parent_workflow_id: &str,
-    event: &orchestrator_core::EnvironmentJournalEvent,
-) {
+fn persist_session_transcript(project_root: &str, parent_workflow_id: &str, event: &SessionJournalEvent) {
     if !is_transcript_event_kind(&event.event_kind) {
         return;
     }
@@ -193,10 +397,11 @@ pub(crate) fn environment_is_session_capable(project_root: &Path, environment_id
         Ok(plugins) => plugins,
         Err(_) => return false,
     };
-    let selected = plugins
-        .iter()
-        .find(|plugin| plugin.name == environment_id)
-        .or(if plugins.len() == 1 { plugins.first() } else { None });
+    let selected = plugins.iter().find(|plugin| plugin.name == environment_id).or(if plugins.len() == 1 {
+        plugins.first()
+    } else {
+        None
+    });
     selected.map(|plugin| capabilities_advertise_exec_session(&plugin.manifest.capabilities)).unwrap_or(false)
 }
 
@@ -237,7 +442,7 @@ pub(crate) async fn delegate_workflow_via_session(
 }
 
 /// Delegate the ENTIRE workflow to the session-capable environment `environment_id`
-/// via a single [`EnvironmentClient::exec_session`] (REQ-052): prepare a bare
+/// via a single `environment/exec_session` RPC (REQ-052): prepare a bare
 /// node, hand it the subject + workflow ref, forward every `environment/journal`
 /// event home through `event_emitter`, tear the node down, and synthesize a
 /// [`WorkflowExecuteInternalResult`] from the terminal `ExecSessionResponse`.
@@ -245,7 +450,7 @@ pub(crate) async fn delegate_workflow_via_session(
 /// `phases_requested` is the workflow's declared phase ids -- used only to fill
 /// the result summary; the node, not the runner, actually drives them.
 ///
-/// Blocking [`EnvironmentClient`] work runs on a DEDICATED OS thread with its own
+/// Environment-host work runs on a DEDICATED OS thread with its own
 /// multi-thread runtime so the resident-host stdio I/O driver (spawned during
 /// lease acquisition) stays alive across `prepare` -> `exec_session` -> `teardown`
 /// -- the same lifetime hazard `crate::phase_environment::PreparedEnvironment::prepare_off_runtime`
@@ -270,7 +475,6 @@ pub(crate) async fn delegate_workflow_via_session(
     use std::time::Instant;
 
     use anyhow::{anyhow, Context};
-    use orchestrator_core::{EnvironmentClient, EnvironmentJournalEvent};
     use serde_json::Value;
 
     use crate::workflow_event_emitter::RuntimeWorkflowEvent;
@@ -289,7 +493,7 @@ pub(crate) async fn delegate_workflow_via_session(
     let phase_results_sink = phase_results.clone();
     let phases_completed_sink = phases_completed.clone();
 
-    let on_journal = move |event: &EnvironmentJournalEvent| {
+    let on_journal = move |event: &SessionJournalEvent| {
         // Mirror the node's agent-run transcript (output chunks, tool calls, ...)
         // into the PARENT run dir; lifecycle events fall through to the coarse map.
         persist_session_transcript(&project_root_for_journal, &workflow_id_for_events, event);
@@ -354,8 +558,7 @@ pub(crate) async fn delegate_workflow_via_session(
     // live one / terminalize a ghost. `scoped_state_root` + the current phase id
     // are computed HOME-side (before the blocking thread); `None` degrades to the
     // pre-existing no-persist behavior rather than failing the run.
-    let scoped_root_opt: Option<std::path::PathBuf> =
-        protocol::scoped_state_root(Path::new(project_root));
+    let scoped_root_opt: Option<std::path::PathBuf> = protocol::scoped_state_root(Path::new(project_root));
     let binding_phase_id: Option<String> = match hub.workflows().get(workflow_id).await {
         Ok(wf) => wf.phases.get(wf.current_phase_index).map(|phase| phase.phase_id.clone()),
         Err(_) => None,
@@ -367,10 +570,12 @@ pub(crate) async fn delegate_workflow_via_session(
     // liveness is probed inside the thread (needs the resolved client).
     let reuse_candidate: Option<animus_environment_protocol::EnvironmentHandle> =
         match (scoped_root_opt.as_deref(), environment_id) {
-            (Some(scoped_root), env_id) => crate::phase_session::find_reusable_binding(scoped_root, workflow_id, env_id)
-                .ok()
-                .flatten()
-                .map(|binding| binding.handle),
+            (Some(scoped_root), env_id) => {
+                crate::phase_session::find_reusable_binding(scoped_root, workflow_id, env_id)
+                    .ok()
+                    .flatten()
+                    .map(|binding| binding.handle)
+            }
             _ => None,
         };
     let scoped_root_for_thread = scoped_root_opt.clone();
@@ -385,7 +590,8 @@ pub(crate) async fn delegate_workflow_via_session(
                 .build()
                 .context("building dedicated runtime for the remote-animus session host")?;
             runtime.block_on(async move {
-                let client = EnvironmentClient::resolve(Path::new(&project_root_owned), &environment_id_owned)
+                let client = SessionEnvironmentClient::resolve(Path::new(&project_root_owned), &environment_id_owned)
+                    .await
                     .map_err(|err| {
                         anyhow!(
                             "workflow is routed to session-capable environment '{environment_id_owned}' but no \
@@ -394,14 +600,14 @@ pub(crate) async fn delegate_workflow_via_session(
                         )
                     })?;
                 // TASK-933: reuse a still-live persisted node (skip prepare) or
-                // prepare a fresh one. `probe_session_node_alive` is a trivial,
+                // prepare a fresh one. `SessionEnvironmentClient::probe` is a trivial,
                 // side-effect-free `exec` of `true` -- there is no environment
                 // `status` method, so this exec IS the liveness check (mirrors the
                 // rc.28 reconciler's `probe_delegate`).
                 let (handle, reused) = match reuse_candidate {
-                    Some(candidate) if probe_session_node_alive(&client, &candidate) => (candidate, true),
+                    Some(candidate) if client.probe(&candidate).await => (candidate, true),
                     _ => {
-                        let handle = client.prepare(spec).map_err(|err| {
+                        let handle = client.prepare(spec).await.map_err(|err| {
                             anyhow!("remote-animus session prepare failed for '{environment_id_owned}': {err:#}")
                         })?;
                         (handle, false)
@@ -430,9 +636,9 @@ pub(crate) async fn delegate_workflow_via_session(
                     dispatch_input_owned,
                     Some(workflow_id_owned.clone()),
                     on_journal,
-                );
+                ).await;
                 // Best-effort teardown regardless of the session outcome.
-                match client.teardown(&handle) {
+                match client.teardown(&handle).await {
                     Ok(()) => {
                         // TASK-811/933: node reaped -> flip the checkpoint binding
                         // torn_down so the reconciler does not try to re-reap a
@@ -498,20 +704,18 @@ pub(crate) async fn delegate_workflow_via_session(
         // REQ-052 one-id: the node journals INTO this shared row and terminalizes
         // it itself, so it is normally ALREADY terminal here. These are pure
         // BACKSTOPS for the crash/lag case where the node did NOT record its
-        // terminal. `force_failed` / `cancel` NO-OP internally on any
-        // already-terminal status -- the terminal guard lives INSIDE the service
-        // op's load-mutate-save (not a racy caller-side pre-check) -- so they can
-        // never clobber the node's richer terminal (Completed / Escalated /
-        // Cancelled). An error is logged (not swallowed) so a stuck-Running row is
+        // terminal. CLI rc.30 removed `force_failed`; `fail_current_phase` is the
+        // supported non-terminal transition and rejects a terminal row rather
+        // than clobbering its richer status. An error is logged so a stuck row is
         // diagnosable instead of silently inviting orphan re-dispatch.
         WorkflowStatus::Failed | WorkflowStatus::Escalated => {
             if let Err(err) = hub
                 .workflows()
-                .force_failed(workflow_id, format!("remote-animus session ended {}", response.status))
+                .fail_current_phase(workflow_id, format!("remote-animus session ended {}", response.status))
                 .await
             {
                 eprintln!(
-                    "warning: remote-animus session backstop force_failed('{workflow_id}') failed: {err:#} \
+                    "warning: remote-animus session backstop fail_current_phase('{workflow_id}') failed: {err:#} \
                      (shared row may remain Running; daemon reconciliation will retry)"
                 );
             }
@@ -596,30 +800,6 @@ pub(crate) async fn delegate_workflow_via_session(
             "reason": "remote-animus session owns the full workflow (incl. post-success) on the node",
         }),
     })
-}
-
-/// Probe whether a persisted remote-animus node is still reachable: a trivial,
-/// side-effect-free `exec` of `true` with a short timeout. `Ok` (the node
-/// answered, regardless of exit code) = alive; any transport / plugin error =
-/// dead or unreachable. There is no environment `status` method, so this exec IS
-/// the liveness check — it mirrors the rc.28 reconciler's `probe_delegate`. A
-/// dead probe means the re-dispatch prepares a fresh node instead of reusing.
-#[cfg(feature = "remote-animus-session")]
-fn probe_session_node_alive(
-    client: &orchestrator_core::EnvironmentClient,
-    handle: &animus_environment_protocol::EnvironmentHandle,
-) -> bool {
-    use std::collections::BTreeMap;
-    use std::time::Duration;
-
-    const PROBE_TIMEOUT_SECS: u64 = 10;
-    let command = animus_environment_protocol::HarnessCommand {
-        program: "true".to_string(),
-        args: Vec::new(),
-        env: BTreeMap::new(),
-        cwd: None,
-    };
-    client.exec(handle, command, BTreeMap::new(), None, Some(Duration::from_secs(PROBE_TIMEOUT_SECS))).is_ok()
 }
 
 /// Persist the delegated node's [`EnvironmentBinding`](crate::phase_session::EnvironmentBinding)
@@ -715,6 +895,40 @@ mod tests {
         assert!(!capabilities_advertise_exec_session(&[]));
     }
 
+    #[cfg(feature = "remote-animus-session")]
+    #[test]
+    fn rc12_session_journal_notification_decodes_and_filters_by_handle() {
+        use std::sync::Mutex;
+
+        use animus_environment_protocol::NOTIFICATION_ENVIRONMENT_JOURNAL;
+        use animus_plugin_protocol::RpcNotification;
+
+        let received = Mutex::new(Vec::new());
+        let notification = RpcNotification::new(
+            NOTIFICATION_ENVIRONMENT_JOURNAL,
+            Some(serde_json::json!({
+                "handle_id": "node-1",
+                "workflow_id": "wf-node",
+                "event_kind": "phase_completed",
+                "phase_id": "implementation",
+                "status": "completed",
+                "ts": "2026-07-26T00:00:00Z",
+                "payload": { "run_id": "wf-wf-node-implementation" },
+                "terminal": false
+            })),
+        );
+
+        forward_session_journal(&notification, "other-node", &|event| {
+            received.lock().expect("lock").push(event.event_kind.clone());
+        });
+        assert!(received.lock().expect("lock").is_empty());
+
+        forward_session_journal(&notification, "node-1", &|event| {
+            received.lock().expect("lock").push(event.event_kind.clone());
+        });
+        assert_eq!(received.lock().expect("lock").as_slice(), ["phase_completed"]);
+    }
+
     #[test]
     fn journal_kind_maps_only_phase_lifecycle() {
         assert_eq!(map_journal_event_kind("phase_started"), Some(RuntimeWorkflowEventKind::PhaseStarted));
@@ -730,7 +944,17 @@ mod tests {
 
     #[test]
     fn transcript_kinds_exclude_lifecycle() {
-        for kind in ["output_chunk", "tool_call", "tool_result", "thinking", "started", "finished", "metadata", "error", "artifact"] {
+        for kind in [
+            "output_chunk",
+            "tool_call",
+            "tool_result",
+            "thinking",
+            "started",
+            "finished",
+            "metadata",
+            "error",
+            "artifact",
+        ] {
             assert!(is_transcript_event_kind(kind), "{kind} should mirror to the parent transcript");
         }
         for kind in ["phase_started", "phase_completed", "phase_failed", "run_completed", "workflow_completed"] {

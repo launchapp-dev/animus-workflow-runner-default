@@ -38,9 +38,9 @@ pub mod runtime_support;
 pub mod skill_dispatch;
 pub mod workflow_event_emitter;
 pub mod workflow_execute;
-pub mod workflow_session;
 pub mod workflow_helpers;
 pub mod workflow_merge_recovery;
+pub mod workflow_session;
 
 pub use agent_state::{
     append_agent_memory, clear_agent_memory, delete_agent_memory_entry, list_agent_messages, load_agent_memory,

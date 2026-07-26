@@ -355,10 +355,8 @@ pub async fn execute_workflow_with_hub(
             &workflow_ref,
             Some(&subject_kind_str),
         ) {
-            if crate::workflow_session::environment_is_session_capable(
-                Path::new(&params.project_root),
-                &environment.id,
-            ) {
+            if crate::workflow_session::environment_is_session_capable(Path::new(&params.project_root), &environment.id)
+            {
                 let subject_git_repo =
                     crate::phase_command::subject_git_repo(&params.project_root, &subject_kind_str, &subject_id_str)
                         .await;
