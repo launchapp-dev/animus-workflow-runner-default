@@ -1336,7 +1336,7 @@ async fn process_phase_event_stream(
                 AgentRunEvent::ToolResult { result_info, .. } => {
                     let status = if result_info.success { "ok" } else { "err" };
                     logger
-                        .info("llm.tool_result", format!("{} {}", &result_info.tool_name, status))
+                        .info("llm.tool_result", format!("{} {}", result_info.tool_name, status))
                         .run(run_id.0.as_str())
                         .phase(phase_id)
                         .meta(serde_json::json!({
