@@ -38,8 +38,12 @@ fn parse_inherited_workflow_actor(raw: Option<std::ffi::OsString>) -> anyhow::Re
         .with_context(|| format!("{ANIMUS_ACTOR_JSON_ENV} is present but malformed; refusing unscoped workflow run"))
 }
 
+#[derive(Debug)]
 pub struct ExecuteArgs {
+    /// Existing workflow to resume.
     pub workflow_id: Option<String>,
+    /// Kernel-selected id for an idempotent fresh bootstrap.
+    pub new_workflow_id: Option<String>,
     pub task_id: Option<String>,
     pub requirement_id: Option<String>,
     /// Qualified `<kind>:<id>` of a subject of any (incl. runtime-declared)
@@ -72,6 +76,7 @@ impl ExecuteArgs {
         let normalized: Vec<String> = args.flat_map(split_equals).collect();
         let mut args = normalized.into_iter();
         let mut workflow_id = None;
+        let mut new_workflow_id = None;
         let mut task_id = None;
         let mut requirement_id = None;
         let mut subject_id = None;
@@ -91,6 +96,7 @@ impl ExecuteArgs {
             let key = arg.as_str();
             let value = match key {
                 "--workflow-id"
+                | "--new-workflow-id"
                 | "--task-id"
                 | "--requirement-id"
                 | "--subject-id"
@@ -113,6 +119,7 @@ impl ExecuteArgs {
             };
             match key {
                 "--workflow-id" => workflow_id = Some(value),
+                "--new-workflow-id" => new_workflow_id = Some(value),
                 "--task-id" => task_id = Some(value),
                 "--requirement-id" => requirement_id = Some(value),
                 "--subject-id" => subject_id = Some(value),
@@ -134,8 +141,12 @@ impl ExecuteArgs {
         }
 
         let project_root = project_root.ok_or_else(|| "--project-root is required".to_string())?;
+        if workflow_id.is_some() && new_workflow_id.is_some() {
+            return Err("--workflow-id and --new-workflow-id are mutually exclusive".to_string());
+        }
         Ok(Self {
             workflow_id,
+            new_workflow_id,
             task_id,
             requirement_id,
             subject_id,
@@ -198,6 +209,7 @@ async fn run_execute_inner(args: ExecuteArgs) -> anyhow::Result<u8> {
     let subject_id = args
         .workflow_id
         .as_deref()
+        .or(args.new_workflow_id.as_deref())
         .or(args.task_id.as_deref())
         .or(args.requirement_id.as_deref())
         .or(args.subject_id.as_deref())
@@ -208,7 +220,7 @@ async fn run_execute_inner(args: ExecuteArgs) -> anyhow::Result<u8> {
     let startup = RunnerEvent {
         event: "runner_start",
         task_id: subject_id.clone(),
-        workflow_id: args.workflow_id.clone(),
+        workflow_id: args.workflow_id.clone().or_else(|| args.new_workflow_id.clone()),
         workflow_ref: args.workflow_ref.clone(),
         workflow_status: None,
         exit_code: None,
@@ -225,6 +237,7 @@ async fn run_execute_inner(args: ExecuteArgs) -> anyhow::Result<u8> {
     let params = WorkflowExecuteInternalParams {
         project_root: args.project_root.clone(),
         workflow_id: args.workflow_id,
+        bootstrap_workflow_id: args.new_workflow_id,
         task_id: args.task_id,
         requirement_id: args.requirement_id,
         subject_id: args.subject_id,
@@ -410,6 +423,36 @@ mod tests {
         assert!(args.requirement_id.is_none());
         assert!(args.title.is_none());
         assert!(args.subject_id.is_none());
+        assert!(args.new_workflow_id.is_none());
+    }
+
+    #[test]
+    fn execute_args_accepts_kernel_selected_new_workflow_id() {
+        let argv = vec![
+            "--new-workflow-id".to_string(),
+            "wf-authoritative".to_string(),
+            "--task-id".to_string(),
+            "TASK-ONE-ID".to_string(),
+            "--project-root".to_string(),
+            "/tmp/project".to_string(),
+        ];
+        let args = ExecuteArgs::parse(argv.into_iter()).expect("parse");
+        assert_eq!(args.new_workflow_id.as_deref(), Some("wf-authoritative"));
+        assert!(args.workflow_id.is_none());
+    }
+
+    #[test]
+    fn execute_args_rejects_new_and_resume_ids_together() {
+        let argv = vec![
+            "--new-workflow-id".to_string(),
+            "wf-new".to_string(),
+            "--workflow-id".to_string(),
+            "wf-existing".to_string(),
+            "--project-root".to_string(),
+            "/tmp/project".to_string(),
+        ];
+        let error = ExecuteArgs::parse(argv.into_iter()).expect_err("ids are mutually exclusive");
+        assert!(error.contains("mutually exclusive"));
     }
 
     #[test]

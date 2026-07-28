@@ -53,7 +53,11 @@ use crate::workflow_event_emitter::{RuntimeWorkflowEvent, RuntimeWorkflowEventKi
 /// `animus_workflow_runner_protocol::WorkflowExecuteRequest`.
 pub struct WorkflowExecuteInternalParams {
     pub project_root: String,
+    /// Existing workflow to resume.
     pub workflow_id: Option<String>,
+    /// Stable id for an idempotent fresh bootstrap. Queue dispatch supplies
+    /// this before spawn so the queue and journal share one authority.
+    pub bootstrap_workflow_id: Option<String>,
     pub task_id: Option<String>,
     pub requirement_id: Option<String>,
     /// Qualified `<kind>:<id>` for a subject of any (incl. runtime-declared)
@@ -242,7 +246,11 @@ pub async fn execute_workflow_with_hub(
             let input = resolve_input(&params)?;
             let subject = input.subject().cloned();
             let subject_id = subject.as_ref().map(|s| s.id().to_string()).unwrap_or_default();
-            hub.workflows().run(input, params.actor.as_ref()).await.or_else(|run_err| {
+            let run_result = match params.bootstrap_workflow_id.clone() {
+                Some(workflow_id) => hub.workflows().run_with_id(workflow_id, input, params.actor.as_ref()).await,
+                None => hub.workflows().run(input, params.actor.as_ref()).await,
+            };
+            run_result.or_else(|run_err| {
                 // A subjectless run (None) or a genuine custom subject has no
                 // existing-subject fallback to search, so surface the real
                 // `run_err` instead of masking it as "no workflow found".
