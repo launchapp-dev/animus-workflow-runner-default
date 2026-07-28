@@ -1156,14 +1156,9 @@ pub async fn execute_workflow_with_hub(
                 // ao-cli #299 journal mapping persists them, instead of the bare
                 // error string the generic arm below produces.
                 if let Some(cmd_fail) = err.downcast_ref::<crate::phase_command::CommandPhaseFailedError>() {
-                    if let Some(diagnostic) =
-                        non_retryable_command_publication_diagnostic(&phase_id, cmd_fail)
-                    {
-                        let (commit, tree) = unpublished_git_identity(
-                            &params.project_root,
-                            &execution_cwd,
-                            held_environment,
-                        );
+                    if let Some(diagnostic) = non_retryable_command_publication_diagnostic(&phase_id, cmd_fail) {
+                        let (commit, tree) =
+                            unpublished_git_identity(&params.project_root, &execution_cwd, held_environment);
                         let instructions = crate::phase_git::publication_denial_escalation(
                             &diagnostic,
                             commit.as_deref(),
@@ -1470,28 +1465,17 @@ mod publication_cleanup_tests {
 
         // Exercise the same interception point as the real runner, before it
         // hands a Rework verdict to complete_current_phase_with_decision.
-        assert!(intercept_non_retryable_publication_denial(
-            "code-open-pr",
-            &mut outcome,
-            Some(commit),
-            Some(tree),
-        ));
+        assert!(intercept_non_retryable_publication_denial("code-open-pr", &mut outcome, Some(commit), Some(tree),));
         if matches!(
             &outcome,
             PhaseExecutionOutcome::Completed {
-                phase_decision: Some(PhaseDecision {
-                    verdict: PhaseDecisionVerdict::Rework,
-                    ..
-                }),
+                phase_decision: Some(PhaseDecision { verdict: PhaseDecisionVerdict::Rework, .. }),
                 ..
             }
         ) {
             code_reworks += 1;
         }
-        if cleanup_is_allowed(
-            true,
-            &serde_json::json!({"publication_durable": false}),
-        ) {
+        if cleanup_is_allowed(true, &serde_json::json!({"publication_durable": false})) {
             teardowns += 1;
         }
 
@@ -1581,14 +1565,10 @@ mod publication_cleanup_tests {
         )
         .expect("persist hold");
 
-        let checkpoint =
-            crate::phase_session::read_checkpoint(state.path(), "workflow-1", "code-open-pr")
-                .expect("read hold")
-                .expect("checkpoint");
-        assert_eq!(
-            checkpoint.status,
-            crate::phase_session::SessionCheckpointStatus::Blocked
-        );
+        let checkpoint = crate::phase_session::read_checkpoint(state.path(), "workflow-1", "code-open-pr")
+            .expect("read hold")
+            .expect("checkpoint");
+        assert_eq!(checkpoint.status, crate::phase_session::SessionCheckpointStatus::Blocked);
         let binding = checkpoint.environment.expect("durable environment binding");
         assert_eq!(binding.handle, handle);
         assert!(!binding.torn_down);
@@ -2296,9 +2276,7 @@ fn persist_runner_publication_hold(
         return;
     };
     let Some(scoped_root) = protocol::scoped_state_root(Path::new(project_root)) else {
-        eprintln!(
-            "warning: could not resolve state root while retaining publication environment for {workflow_id}"
-        );
+        eprintln!("warning: could not resolve state root while retaining publication environment for {workflow_id}");
         return;
     };
     let binding = crate::phase_session::EnvironmentBinding {
@@ -2307,17 +2285,10 @@ fn persist_runner_publication_hold(
         bound_at: chrono::Utc::now().to_rfc3339(),
         torn_down: false,
     };
-    if let Err(err) = persist_runner_publication_binding(
-        &scoped_root,
-        workflow_id,
-        phase_id,
-        environment.id(),
-        binding,
-        reason,
-    ) {
-        eprintln!(
-            "warning: failed to persist held publication environment for {workflow_id}/{phase_id}: {err}"
-        );
+    if let Err(err) =
+        persist_runner_publication_binding(&scoped_root, workflow_id, phase_id, environment.id(), binding, reason)
+    {
+        eprintln!("warning: failed to persist held publication environment for {workflow_id}/{phase_id}: {err}");
     }
 }
 
@@ -2329,22 +2300,13 @@ fn persist_runner_publication_binding(
     binding: crate::phase_session::EnvironmentBinding,
     reason: Option<&str>,
 ) -> std::io::Result<()> {
-    use crate::phase_session::{
-        update_session_blocked, update_session_environment, write_session_pending,
-    };
+    use crate::phase_session::{update_session_blocked, update_session_environment, write_session_pending};
     // Agent phases normally already own this checkpoint. If the publication
     // command failed before one was created, seed the same reconciler-readable
     // shape rather than leaving the environment handle memory-only.
     if update_session_environment(scoped_root, workflow_id, phase_id, binding.clone()).is_err() {
-        write_session_pending(
-            scoped_root,
-            workflow_id,
-            phase_id,
-            environment_id,
-            workflow_id,
-            None,
-        )
-        .and_then(|_| update_session_environment(scoped_root, workflow_id, phase_id, binding))?;
+        write_session_pending(scoped_root, workflow_id, phase_id, environment_id, workflow_id, None)
+            .and_then(|_| update_session_environment(scoped_root, workflow_id, phase_id, binding))?;
     }
     update_session_blocked(
         scoped_root,

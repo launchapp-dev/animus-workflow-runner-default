@@ -343,11 +343,7 @@ pub(crate) fn is_non_retryable_publication_denial(input: &str) -> bool {
     .any(|needle| message.contains(needle))
 }
 
-pub(crate) fn publication_denial_escalation(
-    diagnostic: &str,
-    commit: Option<&str>,
-    tree: Option<&str>,
-) -> String {
+pub(crate) fn publication_denial_escalation(diagnostic: &str, commit: Option<&str>, tree: Option<&str>) -> String {
     let diagnostic = redact_git_diagnostic(diagnostic);
     let commit = commit.filter(|value| !value.trim().is_empty()).unwrap_or("unavailable");
     let tree = tree.filter(|value| !value.trim().is_empty()).unwrap_or("unavailable");
@@ -672,9 +668,7 @@ mod publication_tests {
         assert!(is_non_retryable_publication_denial(
             "remote: error: GH013: Repository rule violations found for refs/heads/main"
         ));
-        assert!(!is_non_retryable_publication_denial(
-            "! [rejected] reviewed -> reviewed (non-fast-forward)"
-        ));
+        assert!(!is_non_retryable_publication_denial("! [rejected] reviewed -> reviewed (non-fast-forward)"));
         assert!(!is_non_retryable_publication_denial(
             "fatal: unable to access 'https://github.com/o/r': Could not resolve host"
         ));

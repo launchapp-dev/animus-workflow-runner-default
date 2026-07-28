@@ -563,8 +563,7 @@ fn session_succeeded(status: WorkflowStatus) -> bool {
 
 #[cfg_attr(not(feature = "remote-animus-session"), allow(dead_code))]
 fn session_should_teardown(status: WorkflowStatus, publication_durable: bool) -> bool {
-    matches!(status, WorkflowStatus::Cancelled)
-        || (matches!(status, WorkflowStatus::Completed) && publication_durable)
+    matches!(status, WorkflowStatus::Cancelled) || (matches!(status, WorkflowStatus::Completed) && publication_durable)
 }
 
 #[cfg(feature = "remote-animus-session")]
