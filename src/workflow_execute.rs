@@ -464,12 +464,10 @@ pub async fn execute_workflow_with_hub(
     // Fail closed: every early return preserves the environment. Only a
     // positive, server-verified publication proof opens the cleanup gate.
     let publication_required = workflow_requires_publication(&workflow_ref);
-    let cleanup_allowed =
-        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(!publication_required));
-    let _prepared_environment_guard = prepared_environment.clone().map(|environment| PreparedEnvironmentGuard {
-        environment,
-        cleanup_allowed: cleanup_allowed.clone(),
-    });
+    let cleanup_allowed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(!publication_required));
+    let _prepared_environment_guard = prepared_environment
+        .clone()
+        .map(|environment| PreparedEnvironmentGuard { environment, cleanup_allowed: cleanup_allowed.clone() });
     let held_environment: Option<&dyn crate::phase_environment::HeldEnvironment> = match &brokered_environment {
         Some(brokered) => Some(brokered.as_ref() as &dyn crate::phase_environment::HeldEnvironment),
         None => {
@@ -1187,8 +1185,15 @@ pub async fn execute_workflow_with_hub(
     if workflow.status == WorkflowStatus::Completed {
         post_success = if publication_required {
             if let Some(ref t) = task {
-                execute_post_success_actions(&params.project_root, t, &workflow, &workflow_config, &execution_cwd)
-                    .await
+                execute_post_success_actions(
+                    &params.project_root,
+                    t,
+                    &workflow,
+                    &workflow_config,
+                    &execution_cwd,
+                    held_environment,
+                )
+                .await
             } else {
                 serde_json::json!({
                     "status": "failed",
@@ -1203,10 +1208,8 @@ pub async fn execute_workflow_with_hub(
             })
         };
 
-        cleanup_allowed.store(
-            cleanup_is_allowed(publication_required, &post_success),
-            std::sync::atomic::Ordering::SeqCst,
-        );
+        cleanup_allowed
+            .store(cleanup_is_allowed(publication_required, &post_success), std::sync::atomic::Ordering::SeqCst);
 
         if !cleanup_is_allowed(publication_required, &post_success) {
             let reason = post_success_failure_reason(&post_success)
@@ -1285,18 +1288,24 @@ mod publication_cleanup_tests {
 
     #[test]
     fn unpublished_commit_blocks_environment_cleanup() {
-        assert!(!cleanup_is_allowed(true, &serde_json::json!({
-            "status": "failed",
-            "publication_durable": false,
-        })));
+        assert!(!cleanup_is_allowed(
+            true,
+            &serde_json::json!({
+                "status": "failed",
+                "publication_durable": false,
+            })
+        ));
     }
 
     #[test]
     fn durable_recovery_ref_allows_cleanup() {
-        assert!(cleanup_is_allowed(true, &serde_json::json!({
-            "status": "conflict",
-            "publication_durable": true,
-        })));
+        assert!(cleanup_is_allowed(
+            true,
+            &serde_json::json!({
+                "status": "conflict",
+                "publication_durable": true,
+            })
+        ));
     }
 
     #[test]
@@ -1793,6 +1802,7 @@ async fn execute_post_success_actions(
     workflow: &OrchestratorWorkflow,
     workflow_config: &orchestrator_core::WorkflowConfig,
     execution_cwd: &str,
+    held_environment: Option<&dyn crate::phase_environment::HeldEnvironment>,
 ) -> Value {
     let workflow_ref = workflow.workflow_ref.as_deref().unwrap_or(workflow_config.default_workflow_ref.as_str());
     let workflow_def = workflow_config
@@ -1807,44 +1817,95 @@ async fn execute_post_success_actions(
 
     let workflow_ref_id = workflow_def.map(|def| def.id).unwrap_or_else(|| workflow_ref.to_string());
 
-    let _ = task;
-    if !crate::phase_git::is_git_repo(execution_cwd) {
-        return serde_json::json!({
-            "status": "failed",
-            "reason": "coding publication requires a git repository",
-            "publication_durable": false,
-            "workflow_ref": workflow_ref_id,
-        });
-    }
-
-    let branch = match crate::phase_git::current_branch(execution_cwd) {
-        Ok(branch) if !branch.is_empty() => branch,
-        Ok(_) => {
+    let branch = if let Some(environment) = held_environment {
+        match environment.exec_command(
+            Path::new(project_root),
+            "git",
+            &["branch".to_string(), "--show-current".to_string()],
+            &std::collections::BTreeMap::new(),
+            Some(execution_cwd),
+            None,
+            Some(std::time::Duration::from_secs(60)),
+        ) {
+            Ok(output) if output.exit_code == 0 && !output.stdout.trim().is_empty() => output.stdout.trim().to_string(),
+            Ok(output) if output.exit_code == 0 => {
+                return serde_json::json!({
+                    "status": "failed",
+                    "publication_durable": false,
+                    "reason": "cannot publish a detached HEAD",
+                    "workflow_ref": workflow_ref_id,
+                });
+            }
+            Ok(output) => {
+                return serde_json::json!({
+                    "status": "failed",
+                    "publication_durable": false,
+                    "reason": crate::phase_git::redact_git_diagnostic(&output.stderr),
+                    "workflow_ref": workflow_ref_id,
+                });
+            }
+            Err(error) => {
+                return serde_json::json!({
+                    "status": "failed",
+                    "publication_durable": false,
+                    "reason": crate::phase_git::redact_git_diagnostic(&error.to_string()),
+                    "workflow_ref": workflow_ref_id,
+                });
+            }
+        }
+    } else {
+        if !crate::phase_git::is_git_repo(execution_cwd) {
             return serde_json::json!({
                 "status": "failed",
+                "reason": "coding publication requires a git repository",
                 "publication_durable": false,
-                "reason": "cannot publish a detached HEAD",
                 "workflow_ref": workflow_ref_id,
             });
         }
-        Err(error) => {
-            return serde_json::json!({
-                "status": "failed",
-                "publication_durable": false,
-                "reason": error.to_string(),
-                "workflow_ref": workflow_ref_id,
-            });
+        match crate::phase_git::current_branch(execution_cwd) {
+            Ok(branch) if !branch.is_empty() => branch,
+            Ok(_) => {
+                return serde_json::json!({
+                    "status": "failed",
+                    "publication_durable": false,
+                    "reason": "cannot publish a detached HEAD",
+                    "workflow_ref": workflow_ref_id,
+                });
+            }
+            Err(error) => {
+                return serde_json::json!({
+                    "status": "failed",
+                    "publication_durable": false,
+                    "reason": error.to_string(),
+                    "workflow_ref": workflow_ref_id,
+                });
+            }
         }
     };
 
     let durable_root = Path::new(project_root).join(".animus").join("publication-recovery").join(&workflow.id);
-    match crate::phase_git::publish_head_durably(
-        execution_cwd,
-        "origin",
-        &branch,
-        &workflow.id,
-        &durable_root,
-    ) {
+    let publication = if let Some(environment) = held_environment {
+        crate::phase_git::publish_head_durably_with("origin", &branch, &workflow.id, |args| {
+            let output = environment.exec_command(
+                Path::new(project_root),
+                "git",
+                &args,
+                &std::collections::BTreeMap::new(),
+                Some(execution_cwd),
+                None,
+                Some(std::time::Duration::from_secs(180)),
+            )?;
+            Ok(crate::phase_git::PublicationCommandOutput {
+                success: output.exit_code == 0 && !output.timed_out,
+                stdout: output.stdout,
+                stderr: output.stderr,
+            })
+        })
+    } else {
+        crate::phase_git::publish_head_durably(execution_cwd, "origin", &branch, &workflow.id, &durable_root)
+    };
+
+    match publication {
         Ok(proof) if proof.is_durable() && proof.recovery_ref.is_none() => serde_json::json!({
             "status": "completed",
             "publication_durable": true,
@@ -1853,7 +1914,19 @@ async fn execute_post_success_actions(
         }),
         Ok(proof) if proof.is_durable() => {
             let recovery_ref = proof.recovery_ref.as_deref().expect("recovery proof has a recovery ref");
-            match ensure_recovery_pull_request(execution_cwd, recovery_ref, &proof.commit, &task.title).await {
+            let recovery_pr = if let Some(environment) = held_environment {
+                ensure_recovery_pull_request_in_environment(
+                    project_root,
+                    execution_cwd,
+                    environment,
+                    recovery_ref,
+                    &proof.commit,
+                    &task.title,
+                )
+            } else {
+                ensure_recovery_pull_request(execution_cwd, recovery_ref, &proof.commit, &task.title).await
+            };
+            match recovery_pr {
                 Ok(url) => serde_json::json!({
                     "status": "completed",
                     "publication_durable": true,
@@ -1887,6 +1960,75 @@ async fn execute_post_success_actions(
     }
 }
 
+fn ensure_recovery_pull_request_in_environment(
+    project_root: &str,
+    execution_cwd: &str,
+    environment: &dyn crate::phase_environment::HeldEnvironment,
+    recovery_ref: &str,
+    expected_commit: &str,
+    title: &str,
+) -> Result<String> {
+    let head = recovery_ref.strip_prefix("refs/heads/").unwrap_or(recovery_ref);
+    let create_args = vec![
+        "pr".to_string(),
+        "create".to_string(),
+        "--head".to_string(),
+        head.to_string(),
+        "--title".to_string(),
+        title.to_string(),
+        "--body".to_string(),
+        "Animus recovered this exact reviewed commit after a concurrent non-fast-forward publication collision."
+            .to_string(),
+    ];
+    let create = environment.exec_command(
+        Path::new(project_root),
+        "gh",
+        &create_args,
+        &std::collections::BTreeMap::new(),
+        Some(execution_cwd),
+        None,
+        Some(std::time::Duration::from_secs(120)),
+    )?;
+    if create.exit_code != 0 && !create.stderr.to_ascii_lowercase().contains("already exists") {
+        anyhow::bail!(
+            "recovery pull-request creation failed: {}",
+            crate::phase_git::redact_git_diagnostic(&create.stderr)
+        );
+    }
+
+    let view_args = vec![
+        "pr".to_string(),
+        "view".to_string(),
+        head.to_string(),
+        "--json".to_string(),
+        "headRefOid,url".to_string(),
+        "--jq".to_string(),
+        "[.headRefOid,.url]|@tsv".to_string(),
+    ];
+    let view = environment.exec_command(
+        Path::new(project_root),
+        "gh",
+        &view_args,
+        &std::collections::BTreeMap::new(),
+        Some(execution_cwd),
+        None,
+        Some(std::time::Duration::from_secs(120)),
+    )?;
+    if view.exit_code != 0 || view.timed_out {
+        anyhow::bail!(
+            "recovery pull-request verification failed: {}",
+            crate::phase_git::redact_git_diagnostic(&view.stderr)
+        );
+    }
+    let mut fields = view.stdout.trim().splitn(2, '\t');
+    let actual_commit = fields.next().unwrap_or_default();
+    let url = fields.next().unwrap_or_default();
+    if actual_commit != expected_commit {
+        anyhow::bail!("recovery pull-request head does not match the reviewed commit");
+    }
+    Ok(url.to_string())
+}
+
 async fn ensure_recovery_pull_request(
     cwd: &str,
     recovery_ref: &str,
@@ -1913,7 +2055,10 @@ async fn ensure_recovery_pull_request(
     // `gh pr create` is not idempotent, so an existing-PR result proceeds to
     // the authoritative `pr view` exact-head check.
     if !create.status.success() && !create_stderr.to_ascii_lowercase().contains("already exists") {
-        anyhow::bail!("recovery pull-request creation failed: {}", crate::phase_git::redact_git_diagnostic(&create_stderr));
+        anyhow::bail!(
+            "recovery pull-request creation failed: {}",
+            crate::phase_git::redact_git_diagnostic(&create_stderr)
+        );
     }
 
     let view = tokio::process::Command::new("gh")

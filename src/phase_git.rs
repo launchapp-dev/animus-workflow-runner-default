@@ -115,6 +115,163 @@ impl PublicationProof {
     }
 }
 
+/// Transport-neutral result for a Git command. Environment-routed publication
+/// uses this shape so the publication protocol can run in the checkout's node
+/// without depending on a host-local repository.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PublicationCommandOutput {
+    pub success: bool,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+pub(crate) fn proof_shape_is_valid(proof: &PublicationProof) -> bool {
+    let Some(remote_ref) = proof.remote_ref.as_deref() else {
+        return false;
+    };
+    proof.remote == "origin"
+        && remote_ref.starts_with("refs/heads/")
+        && proof.commit.len() == 40
+        && proof.tree.len() == 40
+        && proof.commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && proof.tree.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn command_text<F>(run_git: &mut F, args: Vec<String>, operation: &str) -> Result<String>
+where
+    F: FnMut(Vec<String>) -> Result<PublicationCommandOutput>,
+{
+    let output = run_git(args)?;
+    if !output.success {
+        anyhow::bail!("{operation} failed: {}", redact_git_diagnostic(&output.stderr));
+    }
+    Ok(output.stdout.trim().to_string())
+}
+
+/// Independently verify a terminal publication proof using Git commands in the
+/// same checkout/environment that produced it. Fetching the claimed remote ref
+/// makes the reachability and tree checks server-backed instead of trusting the
+/// serialized journal payload or an unrelated host object database.
+pub(crate) fn verify_publication_proof_with<F>(proof: &PublicationProof, mut run_git: F) -> Result<bool>
+where
+    F: FnMut(Vec<String>) -> Result<PublicationCommandOutput>,
+{
+    if !proof_shape_is_valid(proof) {
+        return Ok(false);
+    }
+    let remote_ref = proof.remote_ref.as_deref().expect("shape checked remote ref");
+    let verify_ref = format!("refs/animus/proof/{}", &proof.commit[..12]);
+    let refspec = format!("+{remote_ref}:{verify_ref}");
+    let fetched = run_git(vec!["fetch".into(), "--no-tags".into(), proof.remote.clone(), refspec])?;
+    if !fetched.success {
+        return Ok(false);
+    }
+
+    let ancestor =
+        run_git(vec!["merge-base".into(), "--is-ancestor".into(), proof.commit.clone(), verify_ref.clone()])?.success;
+    let actual_commit = command_text(
+        &mut run_git,
+        vec!["rev-parse".into(), format!("{}^{{commit}}", proof.commit)],
+        "verify publication commit",
+    );
+    let actual_tree = command_text(
+        &mut run_git,
+        vec!["rev-parse".into(), format!("{}^{{tree}}", proof.commit)],
+        "verify publication tree",
+    );
+    let _ = run_git(vec!["update-ref".into(), "-d".into(), verify_ref]);
+
+    Ok(ancestor
+        && matches!(
+            (actual_commit, actual_tree),
+            (Ok(actual_commit), Ok(actual_tree))
+                if actual_commit == proof.commit && actual_tree == proof.tree
+        ))
+}
+
+/// Publish a clean committed checkout through an arbitrary Git command
+/// transport. This is the environment-safe counterpart to
+/// [`publish_head_durably`]. If both server refs reject the commit, the caller
+/// must retain the environment; no host-local fallback can preserve node-only
+/// objects.
+pub(crate) fn publish_head_durably_with<F>(
+    remote: &str,
+    branch: &str,
+    run_id: &str,
+    mut run_git: F,
+) -> Result<PublicationProof>
+where
+    F: FnMut(Vec<String>) -> Result<PublicationCommandOutput>,
+{
+    let inside = command_text(
+        &mut run_git,
+        vec!["rev-parse".into(), "--is-inside-work-tree".into()],
+        "detect publication repository",
+    )?;
+    if inside != "true" {
+        anyhow::bail!("publication requires a git repository");
+    }
+    let pending =
+        command_text(&mut run_git, vec!["status".into(), "--porcelain".into()], "inspect publication worktree")?;
+    if !pending.is_empty() {
+        anyhow::bail!("publication requires a clean committed worktree");
+    }
+
+    let commit =
+        command_text(&mut run_git, vec!["rev-parse".into(), "HEAD^{commit}".into()], "resolve publication commit")?;
+    let tree = command_text(&mut run_git, vec!["rev-parse".into(), "HEAD^{tree}".into()], "resolve publication tree")?;
+    let branch = sanitize_branch(branch);
+    if branch.is_empty() {
+        anyhow::bail!("publication branch is empty or invalid");
+    }
+
+    let target_ref = format!("refs/heads/{branch}");
+    let push = run_git(vec!["push".into(), remote.into(), format!("{commit}:{target_ref}")])?;
+    let target_proof = PublicationProof {
+        commit: commit.clone(),
+        tree: tree.clone(),
+        remote: remote.to_string(),
+        remote_ref: Some(target_ref),
+        recovery_ref: None,
+        bundle_path: None,
+        diagnostic: (!push.success).then(|| "concurrent publication already installed the same commit".to_string()),
+    };
+    if verify_publication_proof_with(&target_proof, &mut run_git).unwrap_or(false) {
+        return Ok(target_proof);
+    }
+
+    let short = &commit[..12.min(commit.len())];
+    let run = sanitize_ref_component(run_id);
+    let recovery_ref = format!("refs/heads/animus/recovery/{branch}-{run}-{short}");
+    let recovery = run_git(vec!["push".into(), remote.into(), format!("{commit}:{recovery_ref}")])?;
+    let recovery_proof = PublicationProof {
+        commit,
+        tree,
+        remote: remote.to_string(),
+        remote_ref: Some(recovery_ref.clone()),
+        recovery_ref: Some(recovery_ref),
+        bundle_path: None,
+        diagnostic: Some(format!(
+            "target branch changed concurrently; exact reviewed commit preserved on a recovery ref ({})",
+            redact_git_diagnostic(&push.stderr).trim()
+        )),
+    };
+    if recovery.success && verify_publication_proof_with(&recovery_proof, &mut run_git).unwrap_or(false) {
+        return Ok(recovery_proof);
+    }
+
+    Ok(PublicationProof {
+        remote_ref: None,
+        recovery_ref: None,
+        diagnostic: Some(format!(
+            "publication and recovery-ref push failed: {}; recovery: {}; environment retained",
+            redact_git_diagnostic(&push.stderr).trim(),
+            redact_git_diagnostic(&recovery.stderr).trim()
+        )),
+        ..recovery_proof
+    })
+}
+
 fn git_output(cwd: &str, args: &[&str]) -> Result<Output> {
     ProcessCommand::new("git")
         .arg("-C")
@@ -147,15 +304,13 @@ pub fn redact_git_diagnostic(input: &str) -> String {
     // Authorization headers commonly contain a scheme and then the actual
     // credential. Redact both so `Authorization: Bearer secret` cannot leave
     // `secret` behind after replacing only the first non-whitespace token.
-    let authorization_header = AUTHORIZATION_HEADER.get_or_init(|| {
-        regex::Regex::new(r"(?i)\bauthorization\s*[:=]\s*[^\r\n]+").expect("valid regex")
-    });
+    let authorization_header = AUTHORIZATION_HEADER
+        .get_or_init(|| regex::Regex::new(r"(?i)\bauthorization\s*[:=]\s*[^\r\n]+").expect("valid regex"));
     value = authorization_header.replace_all(&value, "authorization=[REDACTED]").into_owned();
 
     // Also cover token-bearing environment-style fragments emitted by helpers.
-    let named_secrets = NAMED_SECRETS.get_or_init(|| {
-        regex::Regex::new(r"(?i)\b(token|password|oauth)[=:]\s*[^\s]+").expect("valid regex")
-    });
+    let named_secrets = NAMED_SECRETS
+        .get_or_init(|| regex::Regex::new(r"(?i)\b(token|password|oauth)[=:]\s*[^\s]+").expect("valid regex"));
     value = named_secrets.replace_all(&value, "$1=[REDACTED]").into_owned();
     value
 }
@@ -169,12 +324,7 @@ fn sanitize_ref_component(value: &str) -> String {
 }
 
 fn sanitize_branch(value: &str) -> String {
-    value
-        .split('/')
-        .map(sanitize_ref_component)
-        .filter(|component| !component.is_empty())
-        .collect::<Vec<_>>()
-        .join("/")
+    value.split('/').map(sanitize_ref_component).filter(|component| !component.is_empty()).collect::<Vec<_>>().join("/")
 }
 
 fn remote_ref_reaches(cwd: &str, remote: &str, remote_ref: &str, commit: &str) -> Result<bool> {
@@ -237,16 +387,8 @@ pub fn verify_publication_proof(cwd: &str, proof: &PublicationProof) -> Result<b
     // Resolve both identities from the object fetched from the claimed remote
     // ref. Do not let an unrelated, pre-existing local object satisfy proof
     // verification merely because it has the claimed object id.
-    let actual_commit = git_text(
-        cwd,
-        &["rev-parse", &format!("{verify_ref}^{{commit}}")],
-        "verify publication commit",
-    );
-    let actual_tree = git_text(
-        cwd,
-        &["rev-parse", &format!("{verify_ref}^{{tree}}")],
-        "verify publication tree",
-    );
+    let actual_commit = git_text(cwd, &["rev-parse", &format!("{verify_ref}^{{commit}}")], "verify publication commit");
+    let actual_tree = git_text(cwd, &["rev-parse", &format!("{verify_ref}^{{tree}}")], "verify publication tree");
     let _ = git_output(cwd, &["update-ref", "-d", &verify_ref]);
     Ok(matches!(
         (actual_commit, actual_tree),
@@ -405,6 +547,28 @@ mod publication_tests {
     }
 
     #[test]
+    fn environment_transport_publishes_when_host_has_no_checkout() {
+        let (root, _remote, work) = fixture();
+        let host = tempfile::tempdir().unwrap();
+        assert!(!is_git_repo(host.path().to_str().unwrap()));
+
+        let proof = publish_head_durably_with("origin", "reviewed", "remote-run", |args| {
+            let output = ProcessCommand::new("git").arg("-C").arg(&work).args(&args).output()?;
+            Ok(PublicationCommandOutput {
+                success: output.status.success(),
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            })
+        })
+        .unwrap();
+
+        assert!(proof.is_durable());
+        assert_eq!(proof.remote_ref.as_deref(), Some("refs/heads/reviewed"));
+        assert!(verify_publication_proof(work.to_str().unwrap(), &proof).unwrap());
+        assert!(root.path().join("remote.git").is_dir());
+    }
+
+    #[test]
     fn divergent_concurrent_run_is_preserved_without_force_push() {
         let (root, remote, work) = fixture();
         let other = root.path().join("other");
@@ -421,7 +585,8 @@ mod publication_tests {
             publish_head_durably(work.to_str().unwrap(), "origin", "reviewed", "run/collision", root.path()).unwrap();
         assert!(proof.is_durable());
         assert!(proof.recovery_ref.as_deref().unwrap().starts_with("refs/heads/animus/recovery/"));
-        let target = git_text(work.to_str().unwrap(), &["ls-remote", "origin", "refs/heads/reviewed"], "target").unwrap();
+        let target =
+            git_text(work.to_str().unwrap(), &["ls-remote", "origin", "refs/heads/reviewed"], "target").unwrap();
         assert!(!target.starts_with(&proof.commit), "collision target must not be overwritten");
     }
 

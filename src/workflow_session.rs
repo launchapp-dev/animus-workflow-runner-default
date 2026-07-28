@@ -324,6 +324,45 @@ impl SessionEnvironmentClient {
         self.request_once(METHOD_ENVIRONMENT_EXEC, params, Some(Duration::from_secs(40))).await.is_ok()
     }
 
+    async fn exec_git(
+        &self,
+        handle: &animus_environment_protocol::EnvironmentHandle,
+        args: Vec<String>,
+    ) -> Result<crate::phase_git::PublicationCommandOutput> {
+        use std::collections::BTreeMap;
+        use std::time::Duration;
+
+        use animus_environment_protocol::{ExecRequest, ExecResponse, HarnessCommand, METHOD_ENVIRONMENT_EXEC};
+        use anyhow::Context;
+
+        let request = ExecRequest {
+            handle: handle.clone(),
+            command: HarnessCommand {
+                program: "git".to_string(),
+                args,
+                env: BTreeMap::new(),
+                // The delegated Animus owns the checkout at its workspace root.
+                // Never pass the unrelated home runner's absolute cwd here.
+                cwd: None,
+            },
+            stdin: None,
+            timeout_secs: Some(180),
+        };
+        let params = serde_json::to_value(request).context("serializing environment git verification request")?;
+        let value = self
+            .request_once(METHOD_ENVIRONMENT_EXEC, params, Some(Duration::from_secs(210)))
+            .await
+            .map_err(SessionHostCallError::into_anyhow)
+            .with_context(|| format!("git verification via {}", self.plugin_name))?;
+        let response: ExecResponse = serde_json::from_value(value)
+            .with_context(|| format!("decoding git verification response from {}", self.plugin_name))?;
+        Ok(crate::phase_git::PublicationCommandOutput {
+            success: response.exit_code == Some(0) && !response.timed_out,
+            stdout: response.stdout,
+            stderr: response.stderr,
+        })
+    }
+
     async fn exec_session<F>(
         &self,
         handle: &animus_environment_protocol::EnvironmentHandle,
@@ -396,6 +435,58 @@ impl SessionEnvironmentClient {
             .with_context(|| format!("decoding teardown response from {}", self.plugin_name))?;
         Ok(())
     }
+}
+
+#[cfg(feature = "remote-animus-session")]
+#[async_trait::async_trait]
+trait SessionPublicationCommands: Sync {
+    async fn run_git(&self, args: Vec<String>) -> Result<crate::phase_git::PublicationCommandOutput>;
+}
+
+#[cfg(feature = "remote-animus-session")]
+struct BoundSessionPublication<'a> {
+    client: &'a SessionEnvironmentClient,
+    handle: &'a animus_environment_protocol::EnvironmentHandle,
+}
+
+#[cfg(feature = "remote-animus-session")]
+#[async_trait::async_trait]
+impl SessionPublicationCommands for BoundSessionPublication<'_> {
+    async fn run_git(&self, args: Vec<String>) -> Result<crate::phase_git::PublicationCommandOutput> {
+        self.client.exec_git(self.handle, args).await
+    }
+}
+
+#[cfg(feature = "remote-animus-session")]
+async fn verify_session_publication<E>(executor: &E, proof: &crate::phase_git::PublicationProof) -> Result<bool>
+where
+    E: SessionPublicationCommands,
+{
+    if !crate::phase_git::proof_shape_is_valid(proof) {
+        return Ok(false);
+    }
+    let remote_ref = proof.remote_ref.as_deref().expect("shape checked remote ref");
+    let verify_ref = format!("refs/animus/session-proof/{}", &proof.commit[..12]);
+    let fetched = executor
+        .run_git(vec!["fetch".into(), "--no-tags".into(), proof.remote.clone(), format!("+{remote_ref}:{verify_ref}")])
+        .await?;
+    if !fetched.success {
+        return Ok(false);
+    }
+
+    let ancestor = executor
+        .run_git(vec!["merge-base".into(), "--is-ancestor".into(), proof.commit.clone(), verify_ref.clone()])
+        .await?
+        .success;
+    let actual_commit = executor.run_git(vec!["rev-parse".into(), format!("{}^{{commit}}", proof.commit)]).await?;
+    let actual_tree = executor.run_git(vec!["rev-parse".into(), format!("{}^{{tree}}", proof.commit)]).await?;
+    let _ = executor.run_git(vec!["update-ref".into(), "-d".into(), verify_ref]).await;
+
+    Ok(ancestor
+        && actual_commit.success
+        && actual_tree.success
+        && actual_commit.stdout.trim() == proof.commit
+        && actual_tree.stdout.trim() == proof.tree)
 }
 
 /// Attach the SDK's well-known top-level actor field after serializing the
@@ -480,9 +571,7 @@ fn terminal_publication_proof(
     event: &SessionJournalEvent,
     workflow_id: &str,
 ) -> Option<crate::phase_git::PublicationProof> {
-    if !event.terminal
-        || event.event_kind != "workflow_completed"
-        || event.workflow_id.as_deref() != Some(workflow_id)
+    if !event.terminal || event.event_kind != "workflow_completed" || event.workflow_id.as_deref() != Some(workflow_id)
     {
         return None;
     }
@@ -666,9 +755,8 @@ pub(crate) async fn delegate_workflow_via_session(
     // the driver reads back after the session ends.
     let phase_results: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
     let phases_completed = Arc::new(AtomicUsize::new(0));
-    let publication_durable = Arc::new(AtomicBool::new(
-        !crate::workflow_execute::workflow_requires_publication(workflow_ref),
-    ));
+    let publication_durable =
+        Arc::new(AtomicBool::new(!crate::workflow_execute::workflow_requires_publication(workflow_ref)));
     let publication_proof: Arc<Mutex<Option<crate::phase_git::PublicationProof>>> = Arc::new(Mutex::new(None));
 
     // Clones captured by the (Fn + Send + Sync) journal callback.
@@ -741,7 +829,6 @@ pub(crate) async fn delegate_workflow_via_session(
     let actor_owned = actor.cloned();
     let publication_durable_for_thread = publication_durable.clone();
     let publication_proof_for_thread = publication_proof.clone();
-    let execution_cwd_owned = execution_cwd.to_string();
 
     // TASK-933 (companion to animus-cli rc.28): this delegated node is otherwise
     // invisible to the daemon after a restart -- the home runner holds the handle
@@ -838,10 +925,13 @@ pub(crate) async fn delegate_workflow_via_session(
                         .lock()
                         .ok()
                         .and_then(|guard| guard.clone());
-                    let verified = proof
-                        .as_ref()
-                        .and_then(|proof| crate::phase_git::verify_publication_proof(&execution_cwd_owned, proof).ok())
-                        == Some(true);
+                    let verified = if let Some(proof) = proof.as_ref() {
+                        verify_session_publication(&BoundSessionPublication { client: &client, handle: &handle }, proof)
+                            .await
+                            .unwrap_or(false)
+                    } else {
+                        false
+                    };
                     publication_durable_for_thread.store(verified, std::sync::atomic::Ordering::SeqCst);
                 }
                 // A paused node session remains resumable: keep its prepared
@@ -894,12 +984,11 @@ pub(crate) async fn delegate_workflow_via_session(
     let node_workflow_status = session_status_to_workflow_status(&response.status);
     // A node saying "completed" is insufficient. The parent reports success
     // only when the session protocol also carried positive publication proof.
-    let workflow_status =
-        if node_workflow_status == WorkflowStatus::Completed && !publication_durable {
-            WorkflowStatus::Failed
-        } else {
-            node_workflow_status
-        };
+    let workflow_status = if node_workflow_status == WorkflowStatus::Completed && !publication_durable {
+        WorkflowStatus::Failed
+    } else {
+        node_workflow_status
+    };
 
     // REQ-052 exact-once: the delegated node already ran every phase; drive the
     // PARENT's persisted workflow state machine to terminal so its `journal_runs`
@@ -970,12 +1059,8 @@ pub(crate) async fn delegate_workflow_via_session(
     // Running with a live binding so resume/reconciliation can reattach to the
     // prepared node rather than manufacturing a failed/completed checkpoint.
     if let (Some(scoped_root), Some(phase_id)) = (scoped_root_opt.as_deref(), binding_phase_id.as_deref()) {
-        let _ = crate::phase_session::update_publication_durable(
-            scoped_root,
-            workflow_id,
-            phase_id,
-            publication_durable,
-        );
+        let _ =
+            crate::phase_session::update_publication_durable(scoped_root, workflow_id, phase_id, publication_durable);
         let _ = finalize_session_checkpoint(scoped_root, workflow_id, phase_id, workflow_status, &response.status);
     }
 
@@ -1394,8 +1479,12 @@ mod tests {
             "bundle_path": null, "diagnostic": null
         });
         let event = |event_kind: &str, terminal: bool, workflow_id: &str| SessionJournalEvent {
-            handle_id: "node".into(), workflow_id: Some(workflow_id.into()), event_kind: event_kind.into(),
-            phase_id: None, status: None, ts: String::new(),
+            handle_id: "node".into(),
+            workflow_id: Some(workflow_id.into()),
+            event_kind: event_kind.into(),
+            phase_id: None,
+            status: None,
+            ts: String::new(),
             payload: serde_json::json!({"post_success": {"publication_durable": true, "proof": proof.clone()}}),
             terminal,
         };
@@ -1403,6 +1492,98 @@ mod tests {
         assert!(terminal_publication_proof(&event("workflow_completed", false, "run"), "run").is_none());
         assert!(terminal_publication_proof(&event("workflow_completed", true, "other"), "run").is_none());
         assert!(terminal_publication_proof(&event("workflow_completed", true, "run"), "run").is_some());
+    }
+
+    #[cfg(feature = "remote-animus-session")]
+    #[tokio::test]
+    async fn session_proof_is_verified_in_node_checkout_before_exactly_one_teardown() {
+        use std::process::Command;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct NodeGit {
+            cwd: std::path::PathBuf,
+        }
+
+        #[async_trait::async_trait]
+        impl SessionPublicationCommands for NodeGit {
+            async fn run_git(&self, args: Vec<String>) -> Result<crate::phase_git::PublicationCommandOutput> {
+                let output = Command::new("git").arg("-C").arg(&self.cwd).args(args).output()?;
+                Ok(crate::phase_git::PublicationCommandOutput {
+                    success: output.status.success(),
+                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                })
+            }
+        }
+
+        fn git(cwd: &Path, args: &[&str]) {
+            assert!(Command::new("git").arg("-C").arg(cwd).args(args).status().unwrap().success());
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let host = root.path().join("host-without-checkout");
+        let remote = root.path().join("remote.git");
+        let node = root.path().join("node-checkout");
+        std::fs::create_dir(&host).unwrap();
+        git(root.path(), &["init", "--bare", remote.to_str().unwrap()]);
+        git(root.path(), &["init", "-b", "reviewed", node.to_str().unwrap()]);
+        git(&node, &["config", "user.name", "Node"]);
+        git(&node, &["config", "user.email", "node@example.invalid"]);
+        std::fs::write(node.join("reviewed.txt"), "reviewed\n").unwrap();
+        git(&node, &["add", "."]);
+        git(&node, &["commit", "-m", "reviewed"]);
+        git(&node, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        git(&node, &["push", "origin", "HEAD:refs/heads/reviewed"]);
+
+        assert!(!crate::phase_git::is_git_repo(host.to_str().unwrap()));
+        let commit = String::from_utf8(
+            Command::new("git")
+                .args(["-C", node.to_str().unwrap(), "rev-parse", "HEAD^{commit}"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        let tree = String::from_utf8(
+            Command::new("git")
+                .args(["-C", node.to_str().unwrap(), "rev-parse", "HEAD^{tree}"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        let proof = crate::phase_git::PublicationProof {
+            commit,
+            tree,
+            remote: "origin".to_string(),
+            remote_ref: Some("refs/heads/reviewed".to_string()),
+            recovery_ref: None,
+            bundle_path: None,
+            diagnostic: None,
+        };
+        let executor = NodeGit { cwd: node };
+
+        let verified = verify_session_publication(&executor, &proof).await.unwrap();
+        let teardowns = AtomicUsize::new(0);
+        if session_should_teardown(WorkflowStatus::Completed, verified) {
+            teardowns.fetch_add(1, Ordering::SeqCst);
+        }
+        assert!(verified);
+        assert_eq!(teardowns.load(Ordering::SeqCst), 1);
+
+        let mut forged = proof;
+        forged.tree = "0".repeat(40);
+        let forged_verified = verify_session_publication(&executor, &forged).await.unwrap();
+        let forged_teardowns = AtomicUsize::new(0);
+        if session_should_teardown(WorkflowStatus::Completed, forged_verified) {
+            forged_teardowns.fetch_add(1, Ordering::SeqCst);
+        }
+        assert!(!forged_verified);
+        assert_eq!(forged_teardowns.load(Ordering::SeqCst), 0);
     }
 
     #[cfg(feature = "remote-animus-session")]
