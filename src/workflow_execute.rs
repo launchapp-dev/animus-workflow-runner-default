@@ -842,7 +842,14 @@ pub async fn execute_workflow_with_hub(
                         &phase_id,
                         prepared_environment.as_deref(),
                         hold_reason,
-                    );
+                    )
+                    .with_context(|| {
+                        format!(
+                            "publication authorization was denied, but the retained environment hold for \
+                             workflow {} could not be persisted",
+                            workflow.id
+                        )
+                    })?;
                 }
 
                 // Eval gate. Runs only when the phase produced a Completed
@@ -1210,7 +1217,14 @@ pub async fn execute_workflow_with_hub(
                             &phase_id,
                             prepared_environment.as_deref(),
                             Some(&instructions),
-                        );
+                        )
+                        .with_context(|| {
+                            format!(
+                                "publication authorization was denied, but the retained environment hold for \
+                                 workflow {} could not be persisted",
+                                workflow.id
+                            )
+                        })?;
                         let manual_outcome = PhaseExecutionOutcome::ManualPending {
                             instructions: instructions.clone(),
                             approval_note_required: true,
@@ -1819,6 +1833,41 @@ mod publication_cleanup_tests {
         assert!(diagnostic.contains("refusing to prepare a replacement"));
         assert_eq!(backend.prepare_calls.load(Ordering::SeqCst), 0);
         assert_eq!(backend.teardown_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn failed_publication_hold_write_is_terminal_not_a_false_durable_pause() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let corrupt_root = temp.path().join("not-a-directory");
+        std::fs::write(&corrupt_root, b"corrupt state root").expect("seed corrupt root");
+        let binding = crate::phase_session::EnvironmentBinding {
+            environment_id: "animus-environment-railway".to_string(),
+            handle: EnvironmentHandle {
+                id: "node-a".to_string(),
+                workspace_root: "/workspace".to_string(),
+                metadata: Value::Null,
+            },
+            bound_at: "2026-07-28T00:00:00Z".to_string(),
+            torn_down: false,
+        };
+
+        let err = persist_runner_publication_binding(
+            &corrupt_root,
+            "workflow-corrupt",
+            "code-open-pr",
+            "animus-environment-railway",
+            binding,
+            Some("repository policy denied"),
+        )
+        .expect_err("a corrupt state root must fail the hold atomically");
+        assert!(
+            matches!(err.kind(), std::io::ErrorKind::NotADirectory | std::io::ErrorKind::Other),
+            "unexpected persistence error: {err}"
+        );
+        assert!(
+            !corrupt_root.join("runs/workflow-corrupt/phases/code-open-pr.session.json").exists(),
+            "no false durable pause checkpoint may be emitted"
+        );
     }
 }
 
@@ -2513,14 +2562,18 @@ fn persist_runner_publication_hold(
     phase_id: &str,
     environment: Option<&crate::phase_environment::PreparedEnvironment>,
     reason: Option<&str>,
-) {
+) -> Result<()> {
     let Some(environment) = environment else {
         // Broker-owned environments already have a durable lease owner.
-        return;
+        return Ok(());
     };
     let Some(scoped_root) = protocol::scoped_state_root(Path::new(project_root)) else {
-        eprintln!("warning: could not resolve state root while retaining publication environment for {workflow_id}");
-        return;
+        anyhow::bail!(
+            "could not resolve state root while retaining publication environment {} (handle {}) for workflow {}",
+            environment.id(),
+            environment.handle().id,
+            workflow_id
+        );
     };
     let binding = crate::phase_session::EnvironmentBinding {
         environment_id: environment.id().to_string(),
@@ -2528,11 +2581,14 @@ fn persist_runner_publication_hold(
         bound_at: chrono::Utc::now().to_rfc3339(),
         torn_down: false,
     };
-    if let Err(err) =
-        persist_runner_publication_binding(&scoped_root, workflow_id, phase_id, environment.id(), binding, reason)
-    {
-        eprintln!("warning: failed to persist held publication environment for {workflow_id}/{phase_id}: {err}");
-    }
+    persist_runner_publication_binding(&scoped_root, workflow_id, phase_id, environment.id(), binding, reason)
+        .with_context(|| {
+            format!(
+                "failed to persist held publication environment {} (handle {}) for {workflow_id}/{phase_id}",
+                environment.id(),
+                environment.handle().id
+            )
+        })
 }
 
 fn persist_runner_publication_binding(
