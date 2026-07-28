@@ -64,6 +64,11 @@ pub struct SessionCheckpoint {
     /// ship independently.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment: Option<EnvironmentBinding>,
+    /// Positive evidence that the node made the reviewed commit reachable from
+    /// a remote ref. `None` is deliberately distinct from `false`: both keep a
+    /// delegated environment alive, while only `Some(true)` permits teardown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication_durable: Option<bool>,
 }
 
 /// The delegated environment context (Railway/container/remote node) a run is
@@ -129,9 +134,21 @@ pub fn write_session_pending(
         blocked_reason: None,
         request,
         environment: None,
+        publication_durable: None,
     };
     write_atomic(&path, &checkpoint)?;
     Ok(checkpoint)
+}
+
+pub fn update_publication_durable(
+    scoped_root: &Path,
+    workflow_id: &str,
+    phase_id: &str,
+    publication_durable: bool,
+) -> io::Result<()> {
+    mutate(scoped_root, workflow_id, phase_id, |checkpoint| {
+        checkpoint.publication_durable = Some(publication_durable);
+    })
 }
 
 // Marks a checkpoint Running WITHOUT setting provider_session_id. The

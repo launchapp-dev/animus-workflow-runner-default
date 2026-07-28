@@ -166,11 +166,21 @@ impl Drop for WorkflowRunnerPidGuard {
 /// when the workflow run ends — success, failure, or ANY early return. Teardown
 /// is idempotent, so an explicit end-of-run teardown and this Drop backstop
 /// coexist safely.
-struct PreparedEnvironmentGuard(std::sync::Arc<crate::phase_environment::PreparedEnvironment>);
+struct PreparedEnvironmentGuard {
+    environment: std::sync::Arc<crate::phase_environment::PreparedEnvironment>,
+    cleanup_allowed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
 
 impl Drop for PreparedEnvironmentGuard {
     fn drop(&mut self) {
-        self.0.teardown();
+        if self.cleanup_allowed.load(std::sync::atomic::Ordering::SeqCst) {
+            self.environment.teardown();
+        } else {
+            eprintln!(
+                "warning: preserving environment {} because git publication was not proven durable",
+                self.environment.id()
+            );
+        }
     }
 }
 
@@ -451,7 +461,13 @@ pub async fn execute_workflow_with_hub(
             }
         };
     // Only the runner-owned node needs a teardown guard; the broker owns its own.
-    let _prepared_environment_guard = prepared_environment.clone().map(PreparedEnvironmentGuard);
+    // Fail closed: every early return preserves the environment. Only a
+    // positive, server-verified publication proof opens the cleanup gate.
+    let publication_required = workflow_requires_publication(&workflow_ref);
+    let cleanup_allowed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(!publication_required));
+    let _prepared_environment_guard = prepared_environment
+        .clone()
+        .map(|environment| PreparedEnvironmentGuard { environment, cleanup_allowed: cleanup_allowed.clone() });
     let held_environment: Option<&dyn crate::phase_environment::HeldEnvironment> = match &brokered_environment {
         Some(brokered) => Some(brokered.as_ref() as &dyn crate::phase_environment::HeldEnvironment),
         None => {
@@ -1167,37 +1183,71 @@ pub async fn execute_workflow_with_hub(
         "reason": "workflow did not complete all phases",
     });
     if workflow.status == WorkflowStatus::Completed {
-        project_requirement_success_status(hub.clone(), &workflow_subject, &workflow_ref).await?;
-        post_success = if let Some(ref t) = task {
-            execute_post_success_actions(&params.project_root, t, &workflow, &workflow_config, &execution_cwd).await
+        post_success = if publication_required {
+            if let Some(ref t) = task {
+                execute_post_success_actions(
+                    &params.project_root,
+                    t,
+                    &workflow,
+                    &workflow_config,
+                    &execution_cwd,
+                    held_environment,
+                )
+                .await
+            } else {
+                serde_json::json!({
+                    "status": "failed",
+                    "publication_durable": false,
+                    "reason": "coding publication requires a task subject",
+                })
+            }
         } else {
             serde_json::json!({
                 "status": "skipped",
-                "reason": "post-success actions require a task subject",
+                "reason": "workflow does not require coding publication",
             })
         };
 
-        match post_success["status"].as_str() {
-            Some("conflict") => {
-                let reason = post_success_failure_reason(&post_success)
-                    .unwrap_or_else(|| "post-success merge conflict".to_string());
-                workflow = hub.workflows().mark_merge_conflict(&workflow.id, reason).await?;
-                reported_workflow_status = workflow.status;
+        cleanup_allowed
+            .store(cleanup_is_allowed(publication_required, &post_success), std::sync::atomic::Ordering::SeqCst);
+
+        if !cleanup_is_allowed(publication_required, &post_success) {
+            let reason = post_success_failure_reason(&post_success)
+                .unwrap_or_else(|| "workflow completed without durable publication evidence".to_string());
+            workflow = hub.workflows().mark_completed_failed(&workflow.id, reason).await?;
+            reported_workflow_status = workflow.status;
+        } else {
+            match post_success["status"].as_str() {
+                Some("completed") | Some("skipped") => {
+                    project_requirement_success_status(hub.clone(), &workflow_subject, &workflow_ref).await?;
+                }
+                Some("conflict") => {
+                    let reason = post_success_failure_reason(&post_success)
+                        .unwrap_or_else(|| "post-success merge conflict".to_string());
+                    workflow = hub.workflows().mark_merge_conflict(&workflow.id, reason).await?;
+                    reported_workflow_status = workflow.status;
+                }
+                Some("failed") => {
+                    let reason = post_success_failure_reason(&post_success)
+                        .unwrap_or_else(|| "post-success action failed".to_string());
+                    workflow = hub.workflows().mark_completed_failed(&workflow.id, reason).await?;
+                    reported_workflow_status = workflow.status;
+                }
+                _ => {}
             }
-            Some("failed") => {
-                let reason = post_success_failure_reason(&post_success)
-                    .unwrap_or_else(|| "post-success action failed".to_string());
-                workflow = hub.workflows().mark_completed_failed(&workflow.id, reason).await?;
-                reported_workflow_status = workflow.status;
-            }
-            _ => {}
         }
     }
 
     match reported_workflow_status {
         WorkflowStatus::Completed => emit_runtime(
             RuntimeWorkflowEventKind::WorkflowCompleted,
-            serde_json::json!({ "final_status": "completed" }),
+            serde_json::json!({
+                "final_status": "completed",
+                // Delegating parents consume this as the session protocol's
+                // positive cleanup/success gate.
+                "publication_durable": cleanup_is_allowed(publication_required, &post_success),
+                "post_success": post_success.clone(),
+            }),
         ),
         WorkflowStatus::Failed | WorkflowStatus::Escalated => emit_runtime(
             RuntimeWorkflowEventKind::WorkflowFailed,
@@ -1222,6 +1272,56 @@ pub async fn execute_workflow_with_hub(
         phase_results: results,
         post_success,
     })
+}
+
+pub(crate) fn workflow_requires_publication(workflow_ref: &str) -> bool {
+    workflow_ref.rsplit(['/', ':']).next() == Some("coding")
+}
+
+fn cleanup_is_allowed(publication_required: bool, post_success: &Value) -> bool {
+    !publication_required || post_success.get("publication_durable").and_then(Value::as_bool) == Some(true)
+}
+
+#[cfg(test)]
+mod publication_cleanup_tests {
+    use super::*;
+
+    #[test]
+    fn unpublished_commit_blocks_environment_cleanup() {
+        assert!(!cleanup_is_allowed(
+            true,
+            &serde_json::json!({
+                "status": "failed",
+                "publication_durable": false,
+            })
+        ));
+    }
+
+    #[test]
+    fn durable_recovery_ref_allows_cleanup() {
+        assert!(cleanup_is_allowed(
+            true,
+            &serde_json::json!({
+                "status": "conflict",
+                "publication_durable": true,
+            })
+        ));
+    }
+
+    #[test]
+    fn missing_publication_evidence_blocks_cleanup() {
+        assert!(!cleanup_is_allowed(true, &serde_json::json!({ "status": "skipped" })));
+        assert!(!cleanup_is_allowed(true, &Value::Null));
+        assert!(cleanup_is_allowed(false, &Value::Null));
+    }
+
+    #[test]
+    fn publication_semantics_are_scoped_to_coding() {
+        assert!(workflow_requires_publication("coding"));
+        assert!(workflow_requires_publication("launchapp/coding"));
+        assert!(workflow_requires_publication("pack:coding"));
+        assert!(!workflow_requires_publication("planning"));
+    }
 }
 
 async fn load_existing_workflow(
@@ -1702,6 +1802,7 @@ async fn execute_post_success_actions(
     workflow: &OrchestratorWorkflow,
     workflow_config: &orchestrator_core::WorkflowConfig,
     execution_cwd: &str,
+    held_environment: Option<&dyn crate::phase_environment::HeldEnvironment>,
 ) -> Value {
     let workflow_ref = workflow.workflow_ref.as_deref().unwrap_or(workflow_config.default_workflow_ref.as_str());
     let workflow_def = workflow_config
@@ -1716,19 +1817,270 @@ async fn execute_post_success_actions(
 
     let workflow_ref_id = workflow_def.map(|def| def.id).unwrap_or_else(|| workflow_ref.to_string());
 
-    // `post_success.merge` (auto-push / auto-PR / auto-merge / worktree
-    // cleanup) was removed from Animus in v0.5.x: the kernel's
-    // `WorkflowDefinition` no longer carries a `post_success` block, the
-    // `MergeStrategy` config type and the in-kernel `BuiltinGitProvider`
-    // were deleted, and the YAML parser now rejects `post_success.merge`
-    // outright. Merge/PR behavior is no longer a workflow-runner
-    // responsibility, so post-success actions are a no-op.
-    let _ = (project_root, task, execution_cwd);
-    serde_json::json!({
-        "status": "skipped",
-        "reason": "post_success actions removed in v0.5.x (merge/PR no longer a workflow-runner responsibility)",
-        "workflow_ref": workflow_ref_id,
-    })
+    let branch = if let Some(environment) = held_environment {
+        match environment.exec_command(
+            Path::new(project_root),
+            "git",
+            &["branch".to_string(), "--show-current".to_string()],
+            &std::collections::BTreeMap::new(),
+            Some(execution_cwd),
+            None,
+            Some(std::time::Duration::from_secs(60)),
+        ) {
+            Ok(output) if output.exit_code == 0 && !output.stdout.trim().is_empty() => output.stdout.trim().to_string(),
+            Ok(output) if output.exit_code == 0 => {
+                return serde_json::json!({
+                    "status": "failed",
+                    "publication_durable": false,
+                    "reason": "cannot publish a detached HEAD",
+                    "workflow_ref": workflow_ref_id,
+                });
+            }
+            Ok(output) => {
+                return serde_json::json!({
+                    "status": "failed",
+                    "publication_durable": false,
+                    "reason": crate::phase_git::redact_git_diagnostic(&output.stderr),
+                    "workflow_ref": workflow_ref_id,
+                });
+            }
+            Err(error) => {
+                return serde_json::json!({
+                    "status": "failed",
+                    "publication_durable": false,
+                    "reason": crate::phase_git::redact_git_diagnostic(&error.to_string()),
+                    "workflow_ref": workflow_ref_id,
+                });
+            }
+        }
+    } else {
+        if !crate::phase_git::is_git_repo(execution_cwd) {
+            return serde_json::json!({
+                "status": "failed",
+                "reason": "coding publication requires a git repository",
+                "publication_durable": false,
+                "workflow_ref": workflow_ref_id,
+            });
+        }
+        match crate::phase_git::current_branch(execution_cwd) {
+            Ok(branch) if !branch.is_empty() => branch,
+            Ok(_) => {
+                return serde_json::json!({
+                    "status": "failed",
+                    "publication_durable": false,
+                    "reason": "cannot publish a detached HEAD",
+                    "workflow_ref": workflow_ref_id,
+                });
+            }
+            Err(error) => {
+                return serde_json::json!({
+                    "status": "failed",
+                    "publication_durable": false,
+                    "reason": error.to_string(),
+                    "workflow_ref": workflow_ref_id,
+                });
+            }
+        }
+    };
+
+    let durable_root = Path::new(project_root).join(".animus").join("publication-recovery").join(&workflow.id);
+    let publication = if let Some(environment) = held_environment {
+        crate::phase_git::publish_head_durably_with("origin", &branch, &workflow.id, |args| {
+            let output = environment.exec_command(
+                Path::new(project_root),
+                "git",
+                &args,
+                &std::collections::BTreeMap::new(),
+                Some(execution_cwd),
+                None,
+                Some(std::time::Duration::from_secs(180)),
+            )?;
+            Ok(crate::phase_git::PublicationCommandOutput {
+                success: output.exit_code == 0 && !output.timed_out,
+                stdout: output.stdout,
+                stderr: output.stderr,
+            })
+        })
+    } else {
+        crate::phase_git::publish_head_durably(execution_cwd, "origin", &branch, &workflow.id, &durable_root)
+    };
+
+    match publication {
+        Ok(proof) if proof.is_durable() && proof.recovery_ref.is_none() => serde_json::json!({
+            "status": "completed",
+            "publication_durable": true,
+            "workflow_ref": workflow_ref_id,
+            "proof": proof,
+        }),
+        Ok(proof) if proof.is_durable() => {
+            let recovery_ref = proof.recovery_ref.as_deref().expect("recovery proof has a recovery ref");
+            let recovery_pr = if let Some(environment) = held_environment {
+                ensure_recovery_pull_request_in_environment(
+                    project_root,
+                    execution_cwd,
+                    environment,
+                    recovery_ref,
+                    &proof.commit,
+                    &task.title,
+                )
+            } else {
+                ensure_recovery_pull_request(execution_cwd, recovery_ref, &proof.commit, &task.title).await
+            };
+            match recovery_pr {
+                Ok(url) => serde_json::json!({
+                    "status": "completed",
+                    "publication_durable": true,
+                    "reason": proof.diagnostic,
+                    "recovery_pull_request": url,
+                    "workflow_ref": workflow_ref_id,
+                    "proof": proof,
+                }),
+                Err(error) => serde_json::json!({
+                    "status": "failed",
+                    "publication_durable": true,
+                    "reason": crate::phase_git::redact_git_diagnostic(&error.to_string()),
+                    "workflow_ref": workflow_ref_id,
+                    "proof": proof,
+                }),
+            }
+        }
+        Ok(proof) => serde_json::json!({
+            "status": "failed",
+            "publication_durable": false,
+            "reason": proof.diagnostic,
+            "workflow_ref": workflow_ref_id,
+            "proof": proof,
+        }),
+        Err(error) => serde_json::json!({
+            "status": "failed",
+            "publication_durable": false,
+            "reason": crate::phase_git::redact_git_diagnostic(&error.to_string()),
+            "workflow_ref": workflow_ref_id,
+        }),
+    }
+}
+
+fn ensure_recovery_pull_request_in_environment(
+    project_root: &str,
+    execution_cwd: &str,
+    environment: &dyn crate::phase_environment::HeldEnvironment,
+    recovery_ref: &str,
+    expected_commit: &str,
+    title: &str,
+) -> Result<String> {
+    let head = recovery_ref.strip_prefix("refs/heads/").unwrap_or(recovery_ref);
+    let create_args = vec![
+        "pr".to_string(),
+        "create".to_string(),
+        "--head".to_string(),
+        head.to_string(),
+        "--title".to_string(),
+        title.to_string(),
+        "--body".to_string(),
+        "Animus recovered this exact reviewed commit after a concurrent non-fast-forward publication collision."
+            .to_string(),
+    ];
+    let create = environment.exec_command(
+        Path::new(project_root),
+        "gh",
+        &create_args,
+        &std::collections::BTreeMap::new(),
+        Some(execution_cwd),
+        None,
+        Some(std::time::Duration::from_secs(120)),
+    )?;
+    if create.exit_code != 0 && !create.stderr.to_ascii_lowercase().contains("already exists") {
+        anyhow::bail!(
+            "recovery pull-request creation failed: {}",
+            crate::phase_git::redact_git_diagnostic(&create.stderr)
+        );
+    }
+
+    let view_args = vec![
+        "pr".to_string(),
+        "view".to_string(),
+        head.to_string(),
+        "--json".to_string(),
+        "headRefOid,url".to_string(),
+        "--jq".to_string(),
+        "[.headRefOid,.url]|@tsv".to_string(),
+    ];
+    let view = environment.exec_command(
+        Path::new(project_root),
+        "gh",
+        &view_args,
+        &std::collections::BTreeMap::new(),
+        Some(execution_cwd),
+        None,
+        Some(std::time::Duration::from_secs(120)),
+    )?;
+    if view.exit_code != 0 || view.timed_out {
+        anyhow::bail!(
+            "recovery pull-request verification failed: {}",
+            crate::phase_git::redact_git_diagnostic(&view.stderr)
+        );
+    }
+    let mut fields = view.stdout.trim().splitn(2, '\t');
+    let actual_commit = fields.next().unwrap_or_default();
+    let url = fields.next().unwrap_or_default();
+    if actual_commit != expected_commit {
+        anyhow::bail!("recovery pull-request head does not match the reviewed commit");
+    }
+    Ok(url.to_string())
+}
+
+async fn ensure_recovery_pull_request(
+    cwd: &str,
+    recovery_ref: &str,
+    expected_commit: &str,
+    title: &str,
+) -> Result<String> {
+    let head = recovery_ref.strip_prefix("refs/heads/").unwrap_or(recovery_ref);
+    let create = tokio::process::Command::new("gh")
+        .args([
+            "pr",
+            "create",
+            "--head",
+            head,
+            "--title",
+            title,
+            "--body",
+            "Animus recovered this exact reviewed commit after a concurrent non-fast-forward publication collision.",
+        ])
+        .current_dir(cwd)
+        .output()
+        .await
+        .context("starting recovery pull-request publication")?;
+    let create_stderr = String::from_utf8_lossy(&create.stderr);
+    // `gh pr create` is not idempotent, so an existing-PR result proceeds to
+    // the authoritative `pr view` exact-head check.
+    if !create.status.success() && !create_stderr.to_ascii_lowercase().contains("already exists") {
+        anyhow::bail!(
+            "recovery pull-request creation failed: {}",
+            crate::phase_git::redact_git_diagnostic(&create_stderr)
+        );
+    }
+
+    let view = tokio::process::Command::new("gh")
+        .args(["pr", "view", head, "--json", "headRefOid,url", "--jq", "[.headRefOid,.url]|@tsv"])
+        .current_dir(cwd)
+        .output()
+        .await
+        .context("verifying recovery pull-request head")?;
+    if !view.status.success() {
+        anyhow::bail!(
+            "recovery pull-request verification failed: {}",
+            crate::phase_git::redact_git_diagnostic(&String::from_utf8_lossy(&view.stderr))
+        );
+    }
+    let stdout = String::from_utf8_lossy(&view.stdout);
+    let mut fields = stdout.trim().splitn(2, '\t');
+    let actual_commit = fields.next().unwrap_or_default();
+    let url = fields.next().unwrap_or_default();
+    if actual_commit != expected_commit {
+        anyhow::bail!("recovery pull-request head does not match the reviewed commit");
+    }
+    Ok(url.to_string())
 }
 
 #[cfg(test)]
