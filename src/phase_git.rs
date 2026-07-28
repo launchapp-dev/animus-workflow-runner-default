@@ -315,6 +315,54 @@ pub fn redact_git_diagnostic(input: &str) -> String {
     value
 }
 
+/// Whether a failed Git publication was rejected by a server-side
+/// authorization or repository policy that requires operator action.
+///
+/// This deliberately excludes non-fast-forward and transport failures: those
+/// retain the existing recovery-ref and retry behavior. Callers must also
+/// scope this classifier to a publication phase so an unrelated command that
+/// happens to contain one of these phrases is not paused.
+pub(crate) fn is_non_retryable_publication_denial(input: &str) -> bool {
+    let message = input.to_ascii_lowercase();
+    [
+        "refusing to allow a github app to create or update workflow",
+        "workflows permission",
+        "resource not accessible by integration",
+        "permission to ",
+        "protected branch hook declined",
+        "protected branch update failed",
+        "repository rule violations",
+        "push declined due to repository rule",
+        "changes must be made through a pull request",
+        "not allowed to push",
+        "insufficient permission",
+        "insufficient scope",
+        "write access to repository not granted",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
+pub(crate) fn publication_denial_escalation(
+    diagnostic: &str,
+    commit: Option<&str>,
+    tree: Option<&str>,
+) -> String {
+    let diagnostic = redact_git_diagnostic(diagnostic);
+    let commit = commit.filter(|value| !value.trim().is_empty()).unwrap_or("unavailable");
+    let tree = tree.filter(|value| !value.trim().is_empty()).unwrap_or("unavailable");
+    format!(
+        "Git publication is blocked by a non-retryable authorization or repository-policy denial. \
+         The execution environment is retained and no code rework was consumed. \
+         Unpublished commit: {commit}; tree: {tree}. \
+         Redacted remote diagnostic: {diagnostic}. \
+         Remediation: grant the publishing GitHub App/token permission to update the rejected ref \
+         (including Actions workflows permission when workflow files changed), or adjust the \
+         repository/branch policy, then explicitly resume publication. The environment must remain \
+         held until durable publication or explicit workflow cancellation."
+    )
+}
+
 fn sanitize_ref_component(value: &str) -> String {
     let cleaned: String = value
         .chars()
@@ -613,6 +661,37 @@ mod publication_tests {
         assert!(!redacted.contains("hunter2"));
         assert!(!redacted.contains("ghp_still-secret"));
         assert!(redacted.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn publication_authorization_denials_are_non_retryable_but_collisions_and_transport_are_not() {
+        assert!(is_non_retryable_publication_denial(
+            "remote: refusing to allow a GitHub App to create or update workflow `.github/workflows/ci.yml` \
+             without `workflows` permission"
+        ));
+        assert!(is_non_retryable_publication_denial(
+            "remote: error: GH013: Repository rule violations found for refs/heads/main"
+        ));
+        assert!(!is_non_retryable_publication_denial(
+            "! [rejected] reviewed -> reviewed (non-fast-forward)"
+        ));
+        assert!(!is_non_retryable_publication_denial(
+            "fatal: unable to access 'https://github.com/o/r': Could not resolve host"
+        ));
+    }
+
+    #[test]
+    fn authorization_escalation_is_redacted_and_preserves_exact_git_identity() {
+        let escalation = publication_denial_escalation(
+            "fatal: https://secret-token@github.com/o/r Authorization: Bearer ghp_secret; workflows permission",
+            Some("1111111111111111111111111111111111111111"),
+            Some("2222222222222222222222222222222222222222"),
+        );
+        assert!(!escalation.contains("secret-token"));
+        assert!(!escalation.contains("ghp_secret"));
+        assert!(escalation.contains("1111111111111111111111111111111111111111"));
+        assert!(escalation.contains("2222222222222222222222222222222222222222"));
+        assert!(escalation.contains("explicit workflow cancellation"));
     }
 
     #[test]

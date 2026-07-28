@@ -162,10 +162,9 @@ impl Drop for WorkflowRunnerPidGuard {
     }
 }
 
-/// Guarantees the per-run environment node (REQUIREMENT-048) is torn down ONCE
-/// when the workflow run ends — success, failure, or ANY early return. Teardown
-/// is idempotent, so an explicit end-of-run teardown and this Drop backstop
-/// coexist safely.
+/// Owns the per-run environment node (REQUIREMENT-048) and tears it down once
+/// the cleanup gate proves publication durable (or the workflow is explicitly
+/// cancelled). Failures and early returns preserve unpublished work.
 struct PreparedEnvironmentGuard {
     environment: std::sync::Arc<crate::phase_environment::PreparedEnvironment>,
     cleanup_allowed: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -411,9 +410,9 @@ pub async fn execute_workflow_with_hub(
     // run up front and NEVER falls back to an owned prepare.
     //
     // Otherwise the runner OWNS the node (standalone CLI / non-brokered daemon):
-    // it prepares a single BARE node and tears it down ONCE at the end (success,
-    // failure, or early exit) via `_prepared_environment_guard`. A local workflow
-    // resolves to `None` and every phase keeps the byte-for-byte local path.
+    // it prepares a single BARE node and tears it down ONCE after durable
+    // publication or explicit cancellation via `_prepared_environment_guard`.
+    // A local workflow resolves to `None` and every phase keeps the byte-for-byte local path.
     // Preparation runs OFF the async runtime (the `EnvironmentClient` surface is
     // blocking); a prepare failure fails the run up front rather than executing
     // locally.
@@ -776,6 +775,36 @@ pub async fn execute_workflow_with_hub(
 
         match run_result {
             Ok(mut result) => {
+                // A publication authorization/policy denial is deterministic
+                // and operator-actionable, not an implementation defect. The
+                // coding workflow historically interpreted code-open-pr's
+                // ordinary non-zero/rework result as a reason to run
+                // code-implement and code-check again until max_reworks was
+                // exhausted. Convert only this class of publication failure to
+                // the existing durable human-pause path before the workflow
+                // state machine sees the rework verdict.
+                if non_retryable_publication_diagnostic(&phase_id, &result.outcome).is_some() {
+                    let (commit, tree) =
+                        unpublished_git_identity(&params.project_root, &execution_cwd, held_environment);
+                    intercept_non_retryable_publication_denial(
+                        &phase_id,
+                        &mut result.outcome,
+                        commit.as_deref(),
+                        tree.as_deref(),
+                    );
+                    let hold_reason = match &result.outcome {
+                        PhaseExecutionOutcome::ManualPending { instructions, .. } => Some(instructions.as_str()),
+                        _ => None,
+                    };
+                    persist_runner_publication_hold(
+                        &params.project_root,
+                        &workflow.id,
+                        &phase_id,
+                        prepared_environment.as_deref(),
+                        hold_reason,
+                    );
+                }
+
                 // Eval gate. Runs only when the phase produced a Completed
                 // outcome with an advancing verdict (Advance/Unknown) and the
                 // phase declares `evals.checks`. The gate may rewrite the
@@ -1018,7 +1047,7 @@ pub async fn execute_workflow_with_hub(
                         phase_idx = next_phase_index;
                         continue;
                     }
-                    PhaseExecutionOutcome::ManualPending { .. } => {
+                    PhaseExecutionOutcome::ManualPending { instructions, .. } => {
                         // #318 (TASK-276): route the pause-annotation projection
                         // through the subject router when a `subject_backend`
                         // plugin owns `task` (portal), matching the daemon's
@@ -1034,7 +1063,10 @@ pub async fn execute_workflow_with_hub(
                             hub.clone(),
                             task_store.as_ref(),
                             &params.project_root,
-                            WorkflowEvent::Pause { workflow_id: workflow.id.clone(), reason_detail: None },
+                            WorkflowEvent::Pause {
+                                workflow_id: workflow.id.clone(),
+                                reason_detail: Some(instructions.clone()),
+                            },
                         )
                         .await?;
                         workflow = outcome
@@ -1054,6 +1086,7 @@ pub async fn execute_workflow_with_hub(
                             serde_json::json!({
                                 "phase_id": phase_id,
                                 "phase_status": "manual_pending",
+                                "human_escalation": instructions,
                             }),
                         );
                         let mut manual_result = serde_json::json!({
@@ -1123,6 +1156,74 @@ pub async fn execute_workflow_with_hub(
                 // ao-cli #299 journal mapping persists them, instead of the bare
                 // error string the generic arm below produces.
                 if let Some(cmd_fail) = err.downcast_ref::<crate::phase_command::CommandPhaseFailedError>() {
+                    if let Some(diagnostic) =
+                        non_retryable_command_publication_diagnostic(&phase_id, cmd_fail)
+                    {
+                        let (commit, tree) = unpublished_git_identity(
+                            &params.project_root,
+                            &execution_cwd,
+                            held_environment,
+                        );
+                        let instructions = crate::phase_git::publication_denial_escalation(
+                            &diagnostic,
+                            commit.as_deref(),
+                            tree.as_deref(),
+                        );
+                        persist_runner_publication_hold(
+                            &params.project_root,
+                            &workflow.id,
+                            &phase_id,
+                            prepared_environment.as_deref(),
+                            Some(&instructions),
+                        );
+                        let manual_outcome = PhaseExecutionOutcome::ManualPending {
+                            instructions: instructions.clone(),
+                            approval_note_required: true,
+                        };
+                        let task_store = orchestrator_daemon_runtime::resolve_task_projection_store(
+                            &params.project_root,
+                            hub.clone(),
+                        )
+                        .await;
+                        let outcome = dispatch_workflow_event(
+                            hub.clone(),
+                            task_store.as_ref(),
+                            &params.project_root,
+                            WorkflowEvent::Pause {
+                                workflow_id: workflow.id.clone(),
+                                reason_detail: Some(instructions.clone()),
+                            },
+                        )
+                        .await?;
+                        workflow = outcome.workflow.ok_or_else(|| {
+                            anyhow!("workflow '{}' not found for publication authorization pause", workflow.id)
+                        })?;
+                        reported_workflow_status = workflow.status;
+                        emit(PhaseEvent::Completed {
+                            phase_id: &phase_id,
+                            duration: phase_elapsed,
+                            success: true,
+                            error: None,
+                            model: None,
+                            tool: None,
+                        });
+                        emit_runtime(
+                            RuntimeWorkflowEventKind::PhaseCompleted,
+                            serde_json::json!({
+                                "phase_id": phase_id,
+                                "phase_status": "manual_pending",
+                                "human_escalation": instructions,
+                            }),
+                        );
+                        results.push(serde_json::json!({
+                            "phase_id": phase_id,
+                            "status": "manual_pending",
+                            "duration_secs": phase_elapsed.as_secs(),
+                            "workflow_status": format!("{:?}", workflow.status).to_ascii_lowercase(),
+                            "outcome": manual_outcome,
+                        }));
+                        break;
+                    }
                     workflow = hub.workflows().fail_current_phase(&workflow.id, cmd_fail.message.clone()).await?;
                     reported_workflow_status = workflow.status;
                     emit(PhaseEvent::Completed {
@@ -1238,6 +1339,13 @@ pub async fn execute_workflow_with_hub(
         }
     }
 
+    // Cancellation is the sole operator-controlled escape hatch from the
+    // publication hold. A paused authorization denial keeps this false;
+    // durable publication sets it above; explicit cancellation releases it.
+    if reported_workflow_status == WorkflowStatus::Cancelled {
+        cleanup_allowed.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     match reported_workflow_status {
         WorkflowStatus::Completed => emit_runtime(
             RuntimeWorkflowEventKind::WorkflowCompleted,
@@ -1285,6 +1393,27 @@ fn cleanup_is_allowed(publication_required: bool, post_success: &Value) -> bool 
 #[cfg(test)]
 mod publication_cleanup_tests {
     use super::*;
+    use orchestrator_core::{PhaseDecision, WorkflowDecisionRisk};
+
+    fn publication_outcome(verdict: PhaseDecisionVerdict, reason: &str) -> PhaseExecutionOutcome {
+        PhaseExecutionOutcome::Completed {
+            commit_message: None,
+            phase_decision: Some(PhaseDecision {
+                kind: "phase_decision".to_string(),
+                phase_id: "code-open-pr".to_string(),
+                verdict,
+                verdict_key: None,
+                confidence: 1.0,
+                risk: WorkflowDecisionRisk::Low,
+                reason: reason.to_string(),
+                evidence: Vec::new(),
+                guardrail_violations: Vec::new(),
+                commit_message: None,
+                target_phase: None,
+            }),
+            result_payload: None,
+        }
+    }
 
     #[test]
     fn unpublished_commit_blocks_environment_cleanup() {
@@ -1321,6 +1450,152 @@ mod publication_cleanup_tests {
         assert!(workflow_requires_publication("launchapp/coding"));
         assert!(workflow_requires_publication("pack:coding"));
         assert!(!workflow_requires_publication("planning"));
+    }
+
+    #[test]
+    fn runner_stops_after_one_authorization_denial_without_rework_or_teardown() {
+        let commit = "1111111111111111111111111111111111111111";
+        let tree = "2222222222222222222222222222222222222222";
+        let mut publication_attempts = 0;
+        let mut code_reworks = 0;
+        let mut teardowns = 0;
+        let mut outcome = publication_outcome(
+            PhaseDecisionVerdict::Rework,
+            "remote: https://x-access-token:ghs_super_secret@github.com/o/r.git \
+             refusing to allow a GitHub App to create or update workflow \
+             `.github/workflows/ci.yml` without `workflows` permission; \
+             Authorization: Bearer ghs_another_secret",
+        );
+        publication_attempts += 1;
+
+        // Exercise the same interception point as the real runner, before it
+        // hands a Rework verdict to complete_current_phase_with_decision.
+        assert!(intercept_non_retryable_publication_denial(
+            "code-open-pr",
+            &mut outcome,
+            Some(commit),
+            Some(tree),
+        ));
+        if matches!(
+            &outcome,
+            PhaseExecutionOutcome::Completed {
+                phase_decision: Some(PhaseDecision {
+                    verdict: PhaseDecisionVerdict::Rework,
+                    ..
+                }),
+                ..
+            }
+        ) {
+            code_reworks += 1;
+        }
+        if cleanup_is_allowed(
+            true,
+            &serde_json::json!({"publication_durable": false}),
+        ) {
+            teardowns += 1;
+        }
+
+        let PhaseExecutionOutcome::ManualPending { instructions, .. } = outcome else {
+            panic!("authorization denial must leave the runner at the human escalation gate");
+        };
+        assert_eq!(publication_attempts, 1);
+        assert_eq!(code_reworks, 0);
+        assert_eq!(teardowns, 0, "unpublished environment must remain held");
+        assert!(instructions.contains(commit));
+        assert!(instructions.contains(tree));
+        assert!(instructions.contains("grant the publishing GitHub App/token permission"));
+        assert!(!instructions.contains("ghs_super_secret"));
+        assert!(!instructions.contains("ghs_another_secret"));
+        assert!(instructions.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn successful_runner_publication_performs_exactly_one_teardown() {
+        let mut teardowns = 0;
+        let post_success = serde_json::json!({"publication_durable": true});
+
+        // The runner owns one guard for its one prepared environment. Dropping
+        // that guard consults this gate once after successful publication.
+        if cleanup_is_allowed(true, &post_success) {
+            teardowns += 1;
+        }
+
+        assert_eq!(teardowns, 1);
+    }
+
+    #[test]
+    fn transient_and_non_fast_forward_publication_failures_keep_existing_rework_recovery() {
+        for reason in [
+            "! [rejected] reviewed -> reviewed (non-fast-forward)",
+            "fatal: unable to access github.com: connection timed out",
+        ] {
+            let outcome = publication_outcome(PhaseDecisionVerdict::Rework, reason);
+            assert!(non_retryable_publication_diagnostic("code-open-pr", &outcome).is_none());
+        }
+    }
+
+    #[test]
+    fn terminal_command_authorization_denial_is_intercepted_from_stderr() {
+        let failure = crate::phase_command::CommandPhaseFailedError {
+            message: "command 'git push' exited with status 1".to_string(),
+            program: Some("git".to_string()),
+            exit_code: Some(1),
+            stderr_excerpt: Some(
+                "remote: refusing to allow a GitHub App to create or update workflow \
+                 `.github/workflows/ci.yml` without `workflows` permission"
+                    .to_string(),
+            ),
+        };
+
+        let diagnostic = non_retryable_command_publication_diagnostic("code-open-pr", &failure)
+            .expect("the terminal command stderr must reach publication-denial classification");
+        assert!(diagnostic.contains("workflows` permission"));
+        assert!(non_retryable_command_publication_diagnostic("code-check", &failure).is_none());
+    }
+
+    #[test]
+    fn authorization_denial_persists_a_recoverable_redacted_environment_hold() {
+        let state = tempfile::tempdir().expect("state root");
+        let reason = crate::phase_git::publication_denial_escalation(
+            "https://x-access-token:ghs_secret@github.com/o/r: workflows permission denied",
+            Some("1111111111111111111111111111111111111111"),
+            Some("2222222222222222222222222222222222222222"),
+        );
+        let handle = animus_environment_protocol::EnvironmentHandle {
+            id: "held-node-1".to_string(),
+            workspace_root: "/workspace".to_string(),
+            metadata: serde_json::json!({"relay_id": "relay-1"}),
+        };
+        persist_runner_publication_binding(
+            state.path(),
+            "workflow-1",
+            "code-open-pr",
+            "animus-environment-railway",
+            crate::phase_session::EnvironmentBinding {
+                environment_id: "animus-environment-railway".to_string(),
+                handle: handle.clone(),
+                bound_at: "2026-07-28T00:00:00Z".to_string(),
+                torn_down: false,
+            },
+            Some(&reason),
+        )
+        .expect("persist hold");
+
+        let checkpoint =
+            crate::phase_session::read_checkpoint(state.path(), "workflow-1", "code-open-pr")
+                .expect("read hold")
+                .expect("checkpoint");
+        assert_eq!(
+            checkpoint.status,
+            crate::phase_session::SessionCheckpointStatus::Blocked
+        );
+        let binding = checkpoint.environment.expect("durable environment binding");
+        assert_eq!(binding.handle, handle);
+        assert!(!binding.torn_down);
+        let persisted_reason = checkpoint.blocked_reason.expect("human remediation");
+        assert!(persisted_reason.contains("explicit workflow cancellation"));
+        assert!(!persisted_reason.contains("ghs_secret"));
+        assert!(persisted_reason.contains("[REDACTED]"));
     }
 }
 
@@ -1958,6 +2233,159 @@ async fn execute_post_success_actions(
             "workflow_ref": workflow_ref_id,
         }),
     }
+}
+
+fn non_retryable_publication_diagnostic(phase_id: &str, outcome: &PhaseExecutionOutcome) -> Option<String> {
+    if !phase_id.eq_ignore_ascii_case("code-open-pr") {
+        return None;
+    }
+    let PhaseExecutionOutcome::Completed { phase_decision: Some(decision), result_payload, .. } = outcome else {
+        return None;
+    };
+    if !matches!(decision.verdict, PhaseDecisionVerdict::Rework | PhaseDecisionVerdict::Fail) {
+        return None;
+    }
+    let mut diagnostic = decision.reason.clone();
+    if let Some(payload) = result_payload {
+        diagnostic.push('\n');
+        diagnostic.push_str(&payload.to_string());
+    }
+    crate::phase_git::is_non_retryable_publication_denial(&diagnostic).then_some(diagnostic)
+}
+
+fn non_retryable_command_publication_diagnostic(
+    phase_id: &str,
+    error: &crate::phase_command::CommandPhaseFailedError,
+) -> Option<String> {
+    if !phase_id.eq_ignore_ascii_case("code-open-pr") {
+        return None;
+    }
+    let mut diagnostic = error.message.clone();
+    if let Some(stderr) = error.stderr_excerpt.as_deref().filter(|value| !value.trim().is_empty()) {
+        diagnostic.push('\n');
+        diagnostic.push_str(stderr);
+    }
+    crate::phase_git::is_non_retryable_publication_denial(&diagnostic).then_some(diagnostic)
+}
+
+fn intercept_non_retryable_publication_denial(
+    phase_id: &str,
+    outcome: &mut PhaseExecutionOutcome,
+    commit: Option<&str>,
+    tree: Option<&str>,
+) -> bool {
+    let Some(diagnostic) = non_retryable_publication_diagnostic(phase_id, outcome) else {
+        return false;
+    };
+    *outcome = PhaseExecutionOutcome::ManualPending {
+        instructions: crate::phase_git::publication_denial_escalation(&diagnostic, commit, tree),
+        approval_note_required: true,
+    };
+    true
+}
+
+fn persist_runner_publication_hold(
+    project_root: &str,
+    workflow_id: &str,
+    phase_id: &str,
+    environment: Option<&crate::phase_environment::PreparedEnvironment>,
+    reason: Option<&str>,
+) {
+    let Some(environment) = environment else {
+        // Broker-owned environments already have a durable lease owner.
+        return;
+    };
+    let Some(scoped_root) = protocol::scoped_state_root(Path::new(project_root)) else {
+        eprintln!(
+            "warning: could not resolve state root while retaining publication environment for {workflow_id}"
+        );
+        return;
+    };
+    let binding = crate::phase_session::EnvironmentBinding {
+        environment_id: environment.id().to_string(),
+        handle: environment.handle().clone(),
+        bound_at: chrono::Utc::now().to_rfc3339(),
+        torn_down: false,
+    };
+    if let Err(err) = persist_runner_publication_binding(
+        &scoped_root,
+        workflow_id,
+        phase_id,
+        environment.id(),
+        binding,
+        reason,
+    ) {
+        eprintln!(
+            "warning: failed to persist held publication environment for {workflow_id}/{phase_id}: {err}"
+        );
+    }
+}
+
+fn persist_runner_publication_binding(
+    scoped_root: &Path,
+    workflow_id: &str,
+    phase_id: &str,
+    environment_id: &str,
+    binding: crate::phase_session::EnvironmentBinding,
+    reason: Option<&str>,
+) -> std::io::Result<()> {
+    use crate::phase_session::{
+        update_session_blocked, update_session_environment, write_session_pending,
+    };
+    // Agent phases normally already own this checkpoint. If the publication
+    // command failed before one was created, seed the same reconciler-readable
+    // shape rather than leaving the environment handle memory-only.
+    if update_session_environment(scoped_root, workflow_id, phase_id, binding.clone()).is_err() {
+        write_session_pending(
+            scoped_root,
+            workflow_id,
+            phase_id,
+            environment_id,
+            workflow_id,
+            None,
+        )
+        .and_then(|_| update_session_environment(scoped_root, workflow_id, phase_id, binding))?;
+    }
+    update_session_blocked(
+        scoped_root,
+        workflow_id,
+        phase_id,
+        reason.unwrap_or("Git publication requires operator authorization"),
+    )
+}
+
+fn unpublished_git_identity(
+    project_root: &str,
+    execution_cwd: &str,
+    held_environment: Option<&dyn crate::phase_environment::HeldEnvironment>,
+) -> (Option<String>, Option<String>) {
+    let resolve = |revision: &str| -> Option<String> {
+        let value = if let Some(environment) = held_environment {
+            let output = environment
+                .exec_command(
+                    Path::new(project_root),
+                    "git",
+                    &["rev-parse".to_string(), revision.to_string()],
+                    &std::collections::BTreeMap::new(),
+                    Some(execution_cwd),
+                    None,
+                    Some(std::time::Duration::from_secs(60)),
+                )
+                .ok()?;
+            (output.exit_code == 0 && !output.timed_out).then(|| output.stdout.trim().to_string())
+        } else {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(execution_cwd)
+                .args(["rev-parse", revision])
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        };
+        value.filter(|value| !value.is_empty())
+    };
+    (resolve("HEAD^{commit}"), resolve("HEAD^{tree}"))
 }
 
 fn ensure_recovery_pull_request_in_environment(

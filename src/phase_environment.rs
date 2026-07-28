@@ -401,6 +401,13 @@ impl PreparedEnvironment {
         &self.id
     }
 
+    /// Serializable identity needed by restart reconciliation when publication
+    /// is paused. The caller persists this handle before releasing the resident
+    /// host so a later process can reattach to or explicitly reap the node.
+    pub(crate) fn handle(&self) -> &EnvironmentHandle {
+        &self.handle
+    }
+
     /// Execute a phase's harness command INSIDE the held node — `exec_stream` on
     /// the SAME pinned client + handle, with NO prepare and NO teardown (those
     /// bracket the whole run). Returns a [`SessionRun`] whose event stream
