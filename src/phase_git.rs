@@ -234,14 +234,17 @@ pub fn verify_publication_proof(cwd: &str, proof: &PublicationProof) -> Result<b
     if !fetched.status.success() {
         return Ok(false);
     }
+    // Resolve both identities from the object fetched from the claimed remote
+    // ref. Do not let an unrelated, pre-existing local object satisfy proof
+    // verification merely because it has the claimed object id.
     let actual_commit = git_text(
         cwd,
-        &["rev-parse", &format!("{}^{{commit}}", proof.commit)],
+        &["rev-parse", &format!("{verify_ref}^{{commit}}")],
         "verify publication commit",
     );
     let actual_tree = git_text(
         cwd,
-        &["rev-parse", &format!("{}^{{tree}}", proof.commit)],
+        &["rev-parse", &format!("{verify_ref}^{{tree}}")],
         "verify publication tree",
     );
     let _ = git_output(cwd, &["update-ref", "-d", &verify_ref]);
@@ -449,7 +452,7 @@ mod publication_tests {
 
     #[test]
     fn delegated_proof_is_revalidated_by_git_and_rejects_tampering() {
-        let (root, _remote, work) = fixture();
+        let (root, remote, work) = fixture();
         let proof = publish_head_durably(work.to_str().unwrap(), "origin", "reviewed", "run-a", root.path()).unwrap();
         assert!(verify_publication_proof(work.to_str().unwrap(), &proof).unwrap());
 
@@ -457,8 +460,24 @@ mod publication_tests {
         forged.tree = "0000000000000000000000000000000000000000".to_string();
         assert!(!verify_publication_proof(work.to_str().unwrap(), &forged).unwrap());
 
-        forged = proof;
+        forged = proof.clone();
         forged.remote = "/tmp/attacker-controlled.git".to_string();
         assert!(!verify_publication_proof(work.to_str().unwrap(), &forged).unwrap());
+
+        let other = root.path().join("other");
+        git(root.path(), &["clone", remote.to_str().unwrap(), other.to_str().unwrap()]);
+        git(&other, &["config", "user.name", "Other"]);
+        git(&other, &["config", "user.email", "other@example.invalid"]);
+        git(&other, &["checkout", "--orphan", "replacement"]);
+        git(&other, &["rm", "-rf", "--ignore-unmatch", "."]);
+        std::fs::write(other.join("reviewed.txt"), "replacement\n").unwrap();
+        git(&other, &["add", "."]);
+        git(&other, &["commit", "-m", "replace reviewed head"]);
+        git(&other, &["push", "--force", "origin", "HEAD:refs/heads/reviewed"]);
+
+        assert!(
+            !verify_publication_proof(work.to_str().unwrap(), &proof).unwrap(),
+            "a proof is stale once its remote ref no longer reaches the reviewed commit"
+        );
     }
 }
