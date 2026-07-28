@@ -250,6 +250,7 @@ pub async fn handle_workflow_execute(request: WorkflowExecuteRequest) -> Result<
     let params = WorkflowExecuteInternalParams {
         project_root: project_root_str.clone(),
         workflow_id: request.workflow_id.clone(),
+        bootstrap_workflow_id: None,
         task_id,
         requirement_id,
         // The stdio plugin path resolves its subject envelope via
