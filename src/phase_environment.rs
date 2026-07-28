@@ -303,6 +303,41 @@ pub struct PreparedEnvironment {
 }
 
 impl PreparedEnvironment {
+    pub(crate) fn attach_with_backend(
+        backend: Arc<dyn EnvironmentExecBackend>,
+        backend_label: String,
+        environment: &ResolvedEnvironment,
+        handle: EnvironmentHandle,
+    ) -> Result<Self> {
+        let probe = HarnessCommand { program: "true".to_string(), args: Vec::new(), env: BTreeMap::new(), cwd: None };
+        let response = backend.exec(&handle, probe, None, Some(Duration::from_secs(10))).with_context(|| {
+            format!(
+                "retained publication environment '{}' (handle {}) is unavailable; refusing to prepare a \
+                     replacement because it would lose the unpublished commit",
+                environment.id, handle.id
+            )
+        })?;
+        if response.timed_out || response.exit_code != Some(0) {
+            anyhow::bail!(
+                "retained publication environment '{}' (handle {}) failed its liveness probe \
+                 (exit_code={:?}, timed_out={}); refusing to prepare a replacement because it would lose the \
+                 unpublished commit",
+                environment.id,
+                handle.id,
+                response.exit_code,
+                response.timed_out
+            );
+        }
+        Ok(Self {
+            backend,
+            handle,
+            id: environment.id.clone(),
+            backend_label,
+            torn_down: AtomicBool::new(false),
+            runtime: None,
+        })
+    }
+
     /// Resolve the environment plugin and prepare a BARE node for the whole run.
     /// Blocking (the [`EnvironmentClient`] surface is blocking) — call via
     /// [`Self::prepare_off_runtime`] from an async context.
@@ -326,7 +361,7 @@ impl PreparedEnvironment {
     /// [`EnvironmentClient`]; tests inject a fake). Builds a BARE
     /// [`EnvironmentSpec`] (no repos) and applies any routing-rule `spec`
     /// overrides.
-    fn prepare_with_backend(
+    pub(crate) fn prepare_with_backend(
         backend: Arc<dyn EnvironmentExecBackend>,
         backend_label: String,
         environment: &ResolvedEnvironment,
@@ -394,6 +429,46 @@ impl PreparedEnvironment {
             let _ = tx.send(result);
         });
         rx.await.map_err(|_| anyhow!("environment prepare thread terminated unexpectedly"))?
+    }
+
+    /// Reattach to a retained publication node on a dedicated host runtime.
+    /// A retained handle is authoritative: when it cannot be probed, fail
+    /// loudly instead of preparing an empty replacement and losing the exact
+    /// unpublished commit/tree that caused the hold.
+    pub(crate) async fn attach_off_runtime(
+        project_root: &Path,
+        environment: &ResolvedEnvironment,
+        handle: EnvironmentHandle,
+    ) -> Result<Self> {
+        let project_root = project_root.to_path_buf();
+        let environment = environment.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let result = (|| {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+                    .context("building dedicated runtime for the retained environment host")?;
+                let client = runtime.block_on(async {
+                    EnvironmentClient::resolve(&project_root, &environment.id).map_err(|err| {
+                        anyhow!(
+                            "workflow has a retained publication environment '{}' but its plugin could not be \
+                             resolved: {err}",
+                            environment.id
+                        )
+                    })
+                })?;
+                let backend_label = format!("environment:{}", client.plugin_name());
+                let mut prepared = runtime.block_on(async {
+                    Self::attach_with_backend(Arc::new(client), backend_label, &environment, handle)
+                })?;
+                prepared.runtime = Some(runtime);
+                Ok::<_, anyhow::Error>(prepared)
+            })();
+            let _ = tx.send(result);
+        });
+        rx.await.map_err(|_| anyhow!("environment attach thread terminated unexpectedly"))?
     }
 
     /// The resolved environment plugin id.

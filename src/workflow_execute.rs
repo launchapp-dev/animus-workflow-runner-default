@@ -422,6 +422,7 @@ pub async fn execute_workflow_with_hub(
     // `metadata.github_repo` so the environment plugin repo-scopes the GitHub App
     // installation token to THAT repo (correct installation, least privilege). A
     // bare non-coding run without `git_repo` leaves the metadata untouched.
+    let publication_required = workflow_requires_publication(&workflow_ref);
     let subject_git_repo =
         crate::phase_command::subject_git_repo(&params.project_root, &subject_kind_str, &subject_id_str).await;
     let brokered_environment: Option<std::sync::Arc<crate::phase_environment::BrokeredEnvironment>> =
@@ -442,18 +443,58 @@ pub async fn execute_workflow_with_hub(
                 Some(&subject_kind_str),
             ) {
                 Some(environment) => {
-                    let prepared = crate::phase_environment::PreparedEnvironment::prepare_off_runtime(
-                        Path::new(&params.project_root),
-                        &environment,
-                        subject_git_repo.clone(),
-                    )
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "failed to prepare per-run environment '{}' for workflow {}",
-                            environment.id, workflow.id
+                    let retained = if publication_required {
+                        match protocol::scoped_state_root(Path::new(&params.project_root)) {
+                            Some(scoped_root) => crate::phase_session::find_retained_publication_binding(
+                                &scoped_root,
+                                &workflow.id,
+                                &environment.id,
+                            )
+                            .with_context(|| {
+                                format!("reading retained publication binding for workflow {}", workflow.id)
+                            })?,
+                            None => None,
+                        }
+                    } else {
+                        None
+                    };
+                    let prepared = match retained {
+                        Some(binding) => {
+                            let handle_id = binding.handle.id.clone();
+                            let prepared = crate::phase_environment::PreparedEnvironment::attach_off_runtime(
+                                Path::new(&params.project_root),
+                                &environment,
+                                binding.handle,
+                            )
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "failed to reattach retained publication environment '{}' (handle {}) for \
+                                     workflow {}; operator intervention is required and no replacement node was \
+                                     prepared",
+                                    environment.id, handle_id, workflow.id
+                                )
+                            })?;
+                            eprintln!(
+                                "info: reattached retained publication environment '{}' (handle {}) for workflow \
+                                 {}; skipped prepare",
+                                environment.id, handle_id, workflow.id
+                            );
+                            prepared
+                        }
+                        None => crate::phase_environment::PreparedEnvironment::prepare_off_runtime(
+                            Path::new(&params.project_root),
+                            &environment,
+                            subject_git_repo.clone(),
                         )
-                    })?;
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "failed to prepare per-run environment '{}' for workflow {}",
+                                environment.id, workflow.id
+                            )
+                        })?,
+                    };
                     Some(std::sync::Arc::new(prepared))
                 }
                 None => None,
@@ -462,7 +503,6 @@ pub async fn execute_workflow_with_hub(
     // Only the runner-owned node needs a teardown guard; the broker owns its own.
     // Fail closed: every early return preserves the environment. Only a
     // positive, server-verified publication proof opens the cleanup gate.
-    let publication_required = workflow_requires_publication(&workflow_ref);
     let cleanup_allowed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(!publication_required));
     let _prepared_environment_guard = prepared_environment
         .clone()
@@ -1388,7 +1428,89 @@ fn cleanup_is_allowed(publication_required: bool, post_success: &Value) -> bool 
 #[cfg(test)]
 mod publication_cleanup_tests {
     use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use animus_environment_protocol::{EnvironmentHandle, EnvironmentSpec, ExecResponse, ExecStream, HarnessCommand};
     use orchestrator_core::{PhaseDecision, WorkflowDecisionRisk};
+
+    struct RestartPublicationBackend {
+        prepare_calls: AtomicUsize,
+        teardown_calls: AtomicUsize,
+        commit: String,
+        tree: String,
+        probe_live: bool,
+    }
+
+    impl RestartPublicationBackend {
+        fn new(commit: &str, tree: &str) -> Self {
+            Self {
+                prepare_calls: AtomicUsize::new(0),
+                teardown_calls: AtomicUsize::new(0),
+                commit: commit.to_string(),
+                tree: tree.to_string(),
+                probe_live: true,
+            }
+        }
+
+        fn response(stdout: impl Into<String>) -> ExecResponse {
+            ExecResponse { exit_code: Some(0), stdout: stdout.into(), stderr: String::new(), timed_out: false }
+        }
+    }
+
+    impl crate::phase_environment::EnvironmentExecBackend for RestartPublicationBackend {
+        fn prepare(&self, _spec: EnvironmentSpec) -> Result<EnvironmentHandle> {
+            self.prepare_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(EnvironmentHandle {
+                id: "node-a".to_string(),
+                workspace_root: "/workspace".to_string(),
+                metadata: serde_json::json!({"service_id": "svc-a"}),
+            })
+        }
+
+        fn exec_stream(
+            &self,
+            _handle: &EnvironmentHandle,
+            _command: HarnessCommand,
+            _stdin: Option<String>,
+            _timeout: Option<Duration>,
+            _on_output: &(dyn Fn(ExecStream, &str) + Send + Sync),
+        ) -> Result<ExecResponse> {
+            Ok(Self::response(""))
+        }
+
+        fn exec(
+            &self,
+            handle: &EnvironmentHandle,
+            command: HarnessCommand,
+            _stdin: Option<String>,
+            _timeout: Option<Duration>,
+        ) -> Result<ExecResponse> {
+            anyhow::ensure!(handle.id == "node-a", "unexpected replacement node");
+            match (command.program.as_str(), command.args.as_slice()) {
+                ("true", []) if self.probe_live => Ok(Self::response("")),
+                ("true", []) => Ok(ExecResponse {
+                    exit_code: Some(1),
+                    stdout: String::new(),
+                    stderr: "node is gone".to_string(),
+                    timed_out: false,
+                }),
+                ("git", [verb, revision]) if verb == "rev-parse" && revision == "HEAD^{commit}" => {
+                    Ok(Self::response(format!("{}\n", self.commit)))
+                }
+                ("git", [verb, revision]) if verb == "rev-parse" && revision == "HEAD^{tree}" => {
+                    Ok(Self::response(format!("{}\n", self.tree)))
+                }
+                _ => anyhow::bail!("unexpected command during retained-node test: {command:?}"),
+            }
+        }
+
+        fn teardown(&self, handle: &EnvironmentHandle) -> Result<()> {
+            anyhow::ensure!(handle.id == "node-a", "unexpected teardown target");
+            self.teardown_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
 
     fn publication_outcome(verdict: PhaseDecisionVerdict, reason: &str) -> PhaseExecutionOutcome {
         PhaseExecutionOutcome::Completed {
@@ -1576,6 +1698,127 @@ mod publication_cleanup_tests {
         assert!(persisted_reason.contains("explicit workflow cancellation"));
         assert!(!persisted_reason.contains("ghs_secret"));
         assert!(persisted_reason.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn restart_resume_reattaches_exact_unpublished_node_without_second_prepare() {
+        let state = tempfile::tempdir().expect("state root");
+        let commit = "1111111111111111111111111111111111111111";
+        let tree = "2222222222222222222222222222222222222222";
+        let backend = Arc::new(RestartPublicationBackend::new(commit, tree));
+        let environment = crate::phase_environment::ResolvedEnvironment {
+            id: "animus-environment-railway".to_string(),
+            spec_overrides: None,
+        };
+
+        // Runner process A prepares node A and reaches a non-retryable
+        // publication denial. Its guard must preserve the unpublished node.
+        let first = Arc::new(
+            crate::phase_environment::PreparedEnvironment::prepare_with_backend(
+                backend.clone(),
+                "environment:test".to_string(),
+                &environment,
+                None,
+            )
+            .expect("prepare node A"),
+        );
+        let first_cleanup = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let first_guard = PreparedEnvironmentGuard { environment: first.clone(), cleanup_allowed: first_cleanup };
+        persist_runner_publication_binding(
+            state.path(),
+            "workflow-restart",
+            "code-open-pr",
+            &environment.id,
+            crate::phase_session::EnvironmentBinding {
+                environment_id: environment.id.clone(),
+                handle: first.handle().clone(),
+                bound_at: "2026-07-28T00:00:00Z".to_string(),
+                torn_down: false,
+            },
+            Some("repository policy denied"),
+        )
+        .expect("persist publication hold");
+        drop(first_guard);
+        drop(first);
+        assert_eq!(backend.prepare_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.teardown_calls.load(Ordering::SeqCst), 0, "denial preserves node A");
+
+        // Fresh runner process B loads the durable hold and attaches to its
+        // exact handle. The liveness probe succeeds; no second prepare occurs.
+        let binding =
+            crate::phase_session::find_retained_publication_binding(state.path(), "workflow-restart", &environment.id)
+                .expect("read hold")
+                .expect("retained binding");
+        let resumed = Arc::new(
+            crate::phase_environment::PreparedEnvironment::attach_with_backend(
+                backend.clone(),
+                "environment:test".to_string(),
+                &environment,
+                binding.handle,
+            )
+            .expect("reattach node A"),
+        );
+        assert_eq!(resumed.handle().id, "node-a");
+        assert_eq!(backend.prepare_calls.load(Ordering::SeqCst), 1, "resume must skip prepare");
+
+        let git = |revision: &str| {
+            crate::phase_environment::HeldEnvironment::exec_command(
+                resumed.as_ref(),
+                Path::new("/project"),
+                "git",
+                &["rev-parse".to_string(), revision.to_string()],
+                &BTreeMap::new(),
+                None,
+                None,
+                Some(Duration::from_secs(10)),
+            )
+            .expect("read retained git identity")
+            .stdout
+            .trim()
+            .to_string()
+        };
+        assert_eq!(git("HEAD^{commit}"), commit);
+        assert_eq!(git("HEAD^{tree}"), tree);
+
+        // Durable publication opens the guard exactly once; explicit repeated
+        // teardown remains idempotent.
+        let resumed_cleanup = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let resumed_guard = PreparedEnvironmentGuard { environment: resumed.clone(), cleanup_allowed: resumed_cleanup };
+        drop(resumed_guard);
+        resumed.teardown();
+        assert_eq!(backend.teardown_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn dead_retained_publication_node_fails_loudly_without_replacement_prepare() {
+        let backend = Arc::new(RestartPublicationBackend {
+            probe_live: false,
+            ..RestartPublicationBackend::new("commit", "tree")
+        });
+        let environment = crate::phase_environment::ResolvedEnvironment {
+            id: "animus-environment-railway".to_string(),
+            spec_overrides: None,
+        };
+        let held = EnvironmentHandle {
+            id: "node-a".to_string(),
+            workspace_root: "/workspace".to_string(),
+            metadata: Value::Null,
+        };
+
+        let err = match crate::phase_environment::PreparedEnvironment::attach_with_backend(
+            backend.clone(),
+            "environment:test".to_string(),
+            &environment,
+            held,
+        ) {
+            Ok(_) => panic!("a dead retained node must not be replaced"),
+            Err(err) => err,
+        };
+        let diagnostic = format!("{err:#}");
+        assert!(diagnostic.contains("retained publication environment"));
+        assert!(diagnostic.contains("refusing to prepare a replacement"));
+        assert_eq!(backend.prepare_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(backend.teardown_calls.load(Ordering::SeqCst), 0);
     }
 }
 
