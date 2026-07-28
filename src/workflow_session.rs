@@ -471,8 +471,23 @@ fn session_succeeded(status: WorkflowStatus) -> bool {
 }
 
 #[cfg_attr(not(feature = "remote-animus-session"), allow(dead_code))]
-fn session_should_teardown(status: WorkflowStatus) -> bool {
-    !matches!(status, WorkflowStatus::Paused)
+fn session_should_teardown(status: WorkflowStatus, publication_durable: bool) -> bool {
+    matches!(status, WorkflowStatus::Completed) && publication_durable
+}
+
+#[cfg(feature = "remote-animus-session")]
+fn terminal_publication_proof(
+    event: &SessionJournalEvent,
+    workflow_id: &str,
+) -> Option<crate::phase_git::PublicationProof> {
+    if !event.terminal
+        || event.event_kind != "workflow_completed"
+        || event.workflow_id.as_deref() != Some(workflow_id)
+    {
+        return None;
+    }
+    let proof = event.payload.pointer("/post_success/proof")?;
+    serde_json::from_value(proof.clone()).ok()
 }
 
 /// Agent-run transcript event kinds -- the fine-grained session stream that
@@ -636,7 +651,7 @@ pub(crate) async fn delegate_workflow_via_session(
     actor: Option<&Actor>,
     event_emitter: Option<&SharedWorkflowEventEmitter>,
 ) -> Result<WorkflowExecuteInternalResult> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
@@ -651,6 +666,10 @@ pub(crate) async fn delegate_workflow_via_session(
     // the driver reads back after the session ends.
     let phase_results: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
     let phases_completed = Arc::new(AtomicUsize::new(0));
+    let publication_durable = Arc::new(AtomicBool::new(
+        !crate::workflow_execute::workflow_requires_publication(workflow_ref),
+    ));
+    let publication_proof: Arc<Mutex<Option<crate::phase_git::PublicationProof>>> = Arc::new(Mutex::new(None));
 
     // Clones captured by the (Fn + Send + Sync) journal callback.
     let emitter = event_emitter.cloned();
@@ -658,8 +677,14 @@ pub(crate) async fn delegate_workflow_via_session(
     let project_root_for_journal = project_root.to_string();
     let phase_results_sink = phase_results.clone();
     let phases_completed_sink = phases_completed.clone();
+    let publication_proof_sink = publication_proof.clone();
 
     let on_journal = move |event: &SessionJournalEvent| {
+        if let Some(proof) = terminal_publication_proof(event, &workflow_id_for_events) {
+            if let Ok(mut sink) = publication_proof_sink.lock() {
+                *sink = Some(proof);
+            }
+        }
         // Mirror the node's agent-run transcript (output chunks, tool calls, ...)
         // into the PARENT run dir; lifecycle events fall through to the coarse map.
         persist_session_transcript(&project_root_for_journal, &workflow_id_for_events, event);
@@ -714,6 +739,9 @@ pub(crate) async fn delegate_workflow_via_session(
     // re-keys to a no-op. `None`-tolerant on the wire (old env plugins ignore it).
     let workflow_id_owned = workflow_id.to_string();
     let actor_owned = actor.cloned();
+    let publication_durable_for_thread = publication_durable.clone();
+    let publication_proof_for_thread = publication_proof.clone();
+    let execution_cwd_owned = execution_cwd.to_string();
 
     // TASK-933 (companion to animus-cli rc.28): this delegated node is otherwise
     // invisible to the daemon after a restart -- the home runner holds the handle
@@ -805,13 +833,27 @@ pub(crate) async fn delegate_workflow_via_session(
                     actor_owned.as_ref(),
                     on_journal,
                 ).await;
+                if response.is_ok() && !publication_durable_for_thread.load(std::sync::atomic::Ordering::SeqCst) {
+                    let proof = publication_proof_for_thread
+                        .lock()
+                        .ok()
+                        .and_then(|guard| guard.clone());
+                    let verified = proof
+                        .as_ref()
+                        .and_then(|proof| crate::phase_git::verify_publication_proof(&execution_cwd_owned, proof).ok())
+                        == Some(true);
+                    publication_durable_for_thread.store(verified, std::sync::atomic::Ordering::SeqCst);
+                }
                 // A paused node session remains resumable: keep its prepared
                 // environment and live binding. All terminal outcomes (and an
                 // exec error) still get best-effort teardown.
+                let durable = publication_durable_for_thread.load(std::sync::atomic::Ordering::SeqCst);
                 let should_teardown = response
                     .as_ref()
-                    .map(|response| session_should_teardown(session_status_to_workflow_status(&response.status)))
-                    .unwrap_or(true);
+                    .map(|response| {
+                        session_should_teardown(session_status_to_workflow_status(&response.status), durable)
+                    })
+                    .unwrap_or(false);
                 if should_teardown {
                     match client.teardown(&handle).await {
                         Ok(()) => {
@@ -847,8 +889,17 @@ pub(crate) async fn delegate_workflow_via_session(
     });
 
     let response = rx.await.map_err(|_| anyhow!("remote-animus session thread terminated unexpectedly"))??;
+    let publication_durable = publication_durable.load(Ordering::SeqCst);
 
-    let workflow_status = session_status_to_workflow_status(&response.status);
+    let node_workflow_status = session_status_to_workflow_status(&response.status);
+    // A node saying "completed" is insufficient. The parent reports success
+    // only when the session protocol also carried positive publication proof.
+    let workflow_status =
+        if node_workflow_status == WorkflowStatus::Completed && !publication_durable {
+            WorkflowStatus::Failed
+        } else {
+            node_workflow_status
+        };
 
     // REQ-052 exact-once: the delegated node already ran every phase; drive the
     // PARENT's persisted workflow state machine to terminal so its `journal_runs`
@@ -919,6 +970,12 @@ pub(crate) async fn delegate_workflow_via_session(
     // Running with a live binding so resume/reconciliation can reattach to the
     // prepared node rather than manufacturing a failed/completed checkpoint.
     if let (Some(scoped_root), Some(phase_id)) = (scoped_root_opt.as_deref(), binding_phase_id.as_deref()) {
+        let _ = crate::phase_session::update_publication_durable(
+            scoped_root,
+            workflow_id,
+            phase_id,
+            publication_durable,
+        );
         let _ = finalize_session_checkpoint(scoped_root, workflow_id, phase_id, workflow_status, &response.status);
     }
 
@@ -929,7 +986,11 @@ pub(crate) async fn delegate_workflow_via_session(
             WorkflowStatus::Completed => emitter.emit(RuntimeWorkflowEvent {
                 workflow_id: workflow_id.to_string(),
                 kind: RuntimeWorkflowEventKind::WorkflowCompleted,
-                payload: serde_json::json!({ "final_status": "completed", "source": "environment_session" }),
+                payload: serde_json::json!({
+                    "final_status": "completed",
+                    "source": "environment_session",
+                    "publication_durable": publication_durable,
+                }),
                 occurred_at: chrono::Utc::now(),
             }),
             WorkflowStatus::Failed | WorkflowStatus::Escalated => emitter.emit(RuntimeWorkflowEvent {
@@ -965,7 +1026,8 @@ pub(crate) async fn delegate_workflow_via_session(
         // The remote node runs the whole workflow including any merge/PR the
         // `coding` workflow performs, so home-side post-success is a no-op.
         post_success: serde_json::json!({
-            "status": "skipped",
+            "status": if publication_durable { "completed" } else { "failed" },
+            "publication_durable": publication_durable,
             "reason": "remote-animus session owns the full workflow (incl. post-success) on the node",
         }),
     })
@@ -1317,9 +1379,30 @@ mod tests {
         {
             assert!(!session_succeeded(status), "{status:?} must not be reported as success");
         }
-        assert!(!session_should_teardown(WorkflowStatus::Paused));
-        assert!(session_should_teardown(WorkflowStatus::Completed));
-        assert!(session_should_teardown(WorkflowStatus::Failed));
+        assert!(!session_should_teardown(WorkflowStatus::Paused, true));
+        assert!(session_should_teardown(WorkflowStatus::Completed, true));
+        assert!(!session_should_teardown(WorkflowStatus::Completed, false));
+        assert!(!session_should_teardown(WorkflowStatus::Failed, false));
+    }
+
+    #[test]
+    #[cfg(feature = "remote-animus-session")]
+    fn publication_proof_only_comes_from_matching_terminal_completion() {
+        let proof = serde_json::json!({
+            "commit": "1".repeat(40), "tree": "2".repeat(40), "remote": "origin",
+            "remote_ref": "refs/heads/coding", "recovery_ref": null,
+            "bundle_path": null, "diagnostic": null
+        });
+        let event = |event_kind: &str, terminal: bool, workflow_id: &str| SessionJournalEvent {
+            handle_id: "node".into(), workflow_id: Some(workflow_id.into()), event_kind: event_kind.into(),
+            phase_id: None, status: None, ts: String::new(),
+            payload: serde_json::json!({"post_success": {"publication_durable": true, "proof": proof.clone()}}),
+            terminal,
+        };
+        assert!(terminal_publication_proof(&event("phase_completed", true, "run"), "run").is_none());
+        assert!(terminal_publication_proof(&event("workflow_completed", false, "run"), "run").is_none());
+        assert!(terminal_publication_proof(&event("workflow_completed", true, "other"), "run").is_none());
+        assert!(terminal_publication_proof(&event("workflow_completed", true, "run"), "run").is_some());
     }
 
     #[cfg(feature = "remote-animus-session")]
