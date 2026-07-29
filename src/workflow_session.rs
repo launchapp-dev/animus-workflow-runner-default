@@ -563,7 +563,7 @@ fn session_succeeded(status: WorkflowStatus) -> bool {
 
 #[cfg_attr(not(feature = "remote-animus-session"), allow(dead_code))]
 fn session_should_teardown(status: WorkflowStatus, publication_durable: bool) -> bool {
-    matches!(status, WorkflowStatus::Completed) && publication_durable
+    matches!(status, WorkflowStatus::Cancelled) || (matches!(status, WorkflowStatus::Completed) && publication_durable)
 }
 
 #[cfg(feature = "remote-animus-session")]
@@ -1457,7 +1457,7 @@ mod tests {
     }
 
     #[test]
-    fn only_completed_session_is_successful_and_paused_is_not_torn_down() {
+    fn only_durably_completed_or_explicitly_cancelled_session_is_torn_down() {
         assert!(session_succeeded(WorkflowStatus::Completed));
         for status in
             [WorkflowStatus::Paused, WorkflowStatus::Failed, WorkflowStatus::Escalated, WorkflowStatus::Cancelled]
@@ -1468,6 +1468,10 @@ mod tests {
         assert!(session_should_teardown(WorkflowStatus::Completed, true));
         assert!(!session_should_teardown(WorkflowStatus::Completed, false));
         assert!(!session_should_teardown(WorkflowStatus::Failed, false));
+        assert!(
+            session_should_teardown(WorkflowStatus::Cancelled, false),
+            "explicit cancellation is the operator escape hatch for a held unpublished environment"
+        );
     }
 
     #[test]

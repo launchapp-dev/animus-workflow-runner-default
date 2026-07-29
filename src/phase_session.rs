@@ -246,6 +246,44 @@ pub fn find_reusable_binding(
     Ok(None)
 }
 
+/// Find the authoritative node retained after a non-retryable publication
+/// denial. Unlike generic restart reuse, this only accepts a blocked checkpoint
+/// without positive publication evidence. Its handle must never be replaced by
+/// a newly prepared node: the retained workspace is where the reviewed,
+/// unpublished commit and tree live.
+pub fn find_retained_publication_binding(
+    scoped_root: &Path,
+    workflow_id: &str,
+    environment_id: &str,
+) -> io::Result<Option<EnvironmentBinding>> {
+    let phases_dir = scoped_root.join("runs").join(sanitize(workflow_id)).join("phases");
+    let entries = match fs::read_dir(&phases_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with(".session.json")) {
+            continue;
+        }
+        if let Some(checkpoint) = read_path(&path)? {
+            let is_publication_hold =
+                checkpoint.status == SessionCheckpointStatus::Blocked && checkpoint.publication_durable != Some(true);
+            if !is_publication_hold {
+                continue;
+            }
+            if let Some(binding) = checkpoint.environment {
+                if !binding.torn_down && binding.environment_id == environment_id {
+                    return Ok(Some(binding));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
 pub fn update_session_running_after_resume(
     scoped_root: &Path,
     workflow_id: &str,
@@ -632,6 +670,36 @@ mod tests {
 
         mark_environment_torn_down(scoped_root, "wf-reuse", "phase-a").expect("mark");
         assert!(find_reusable_binding(scoped_root, "wf-reuse", "animus-environment-railway").expect("scan").is_none());
+    }
+
+    #[test]
+    fn retained_publication_binding_requires_blocked_unpublished_checkpoint() {
+        let temp = tempdir().expect("tempdir");
+        let scoped_root = temp.path();
+        write_session_pending(scoped_root, "wf-held", "code-open-pr", "environment", "run-held", None)
+            .expect("pending");
+        update_session_environment(scoped_root, "wf-held", "code-open-pr", sample_binding()).expect("binding");
+
+        assert!(
+            find_retained_publication_binding(scoped_root, "wf-held", "animus-environment-railway")
+                .expect("scan pending")
+                .is_none(),
+            "an active checkpoint is not a publication hold"
+        );
+
+        update_session_blocked(scoped_root, "wf-held", "code-open-pr", "repository policy denied").expect("block");
+        let retained = find_retained_publication_binding(scoped_root, "wf-held", "animus-environment-railway")
+            .expect("scan blocked")
+            .expect("blocked unpublished binding");
+        assert_eq!(retained.handle.id, "node-abc");
+
+        update_publication_durable(scoped_root, "wf-held", "code-open-pr", true).expect("durable");
+        assert!(
+            find_retained_publication_binding(scoped_root, "wf-held", "animus-environment-railway")
+                .expect("scan durable")
+                .is_none(),
+            "positive publication proof releases the hold"
+        );
     }
 
     // Backward-compat: a checkpoint JSON written by an OLDER runner that does not
