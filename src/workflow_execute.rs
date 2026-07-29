@@ -1897,14 +1897,14 @@ fn validate_existing_workflow_subject(workflow: &OrchestratorWorkflow, params: &
     let subject = workflow.subject.as_ref();
     if let Some(task_id) = params.task_id.as_deref() {
         let workflow_task_id = subject.and_then(|s| s.task_id()).unwrap_or(workflow.task_id.as_str());
-        if workflow_task_id != task_id {
+        if !builtin_subject_ids_match(workflow_task_id, task_id, SUBJECT_KIND_TASK) {
             return Err(anyhow!("workflow '{}' is for task '{}' not '{}'", workflow.id, workflow_task_id, task_id));
         }
     }
 
     if let Some(requirement_id) = params.requirement_id.as_deref() {
         match subject.and_then(|s| s.requirement_id()) {
-            Some(id) if id == requirement_id => {}
+            Some(id) if builtin_subject_ids_match(id, requirement_id, SUBJECT_KIND_REQUIREMENT) => {}
             Some(id) => {
                 return Err(anyhow!("workflow '{}' is for requirement '{}' not '{}'", workflow.id, id, requirement_id));
             }
@@ -1926,6 +1926,112 @@ fn validate_existing_workflow_subject(workflow: &OrchestratorWorkflow, params: &
     }
 
     Ok(())
+}
+
+/// Compare a built-in subject id across the two canonical wire shapes used by
+/// dispatch and execution. Queue/plugin dispatches persist built-in subjects as
+/// `<kind>:<native>` so their dedupe key is stable, while the kind-specific
+/// runner selectors (`--task-id` / `--requirement-id`) intentionally carry the
+/// bare native id. A resume targets an existing row, so rejecting those two
+/// representations as different strands the shared one-id workflow before its
+/// first phase.
+///
+/// Only the expected built-in kind (or its short dotted alias) is stripped.
+/// Unrelated prefixes remain significant and therefore still fail closed.
+fn builtin_subject_ids_match(persisted: &str, requested: &str, kind: &str) -> bool {
+    fn native<'a>(id: &'a str, kind: &str) -> &'a str {
+        let Some((prefix, remainder)) = id.split_once(':') else {
+            return id;
+        };
+        if remainder.is_empty() {
+            return id;
+        }
+        let short_kind = kind.rsplit('.').next().unwrap_or(kind);
+        if prefix.eq_ignore_ascii_case(kind) || prefix.eq_ignore_ascii_case(short_kind) {
+            remainder
+        } else {
+            id
+        }
+    }
+
+    native(persisted, kind) == native(requested, kind)
+}
+
+#[cfg(test)]
+mod existing_workflow_subject_tests {
+    use super::*;
+
+    fn running_workflow(subject: SubjectRef) -> OrchestratorWorkflow {
+        OrchestratorWorkflow {
+            id: "workflow-one-id".to_string(),
+            task_id: subject.id().to_string(),
+            workflow_ref: Some("coding".to_string()),
+            subject: Some(subject),
+            input: None,
+            vars: HashMap::new(),
+            status: WorkflowStatus::Running,
+            current_phase_index: 0,
+            phases: Vec::new(),
+            machine_state: Default::default(),
+            current_phase: None,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            failure_reason: None,
+            checkpoint_metadata: Default::default(),
+            rework_counts: HashMap::new(),
+            total_reworks: 0,
+            decision_history: Vec::new(),
+        }
+    }
+
+    fn resume_params(task_id: Option<&str>, requirement_id: Option<&str>) -> WorkflowExecuteParams {
+        WorkflowExecuteParams {
+            project_root: "/node".to_string(),
+            workflow_id: Some("workflow-one-id".to_string()),
+            bootstrap_workflow_id: None,
+            task_id: task_id.map(str::to_string),
+            requirement_id: requirement_id.map(str::to_string),
+            subject_id: None,
+            title: None,
+            description: None,
+            workflow_ref: Some("coding".to_string()),
+            input: None,
+            vars: HashMap::new(),
+            model: None,
+            tool: None,
+            phase_timeout_secs: None,
+            phase_filter: None,
+            phase_routing: None,
+            mcp_config: None,
+            actor: None,
+        }
+    }
+
+    #[test]
+    fn qualified_persisted_task_matches_bare_runner_selector() {
+        assert!(builtin_subject_ids_match("task:TASK-1131", "TASK-1131", SUBJECT_KIND_TASK));
+        assert!(builtin_subject_ids_match("TASK-1131", "task:TASK-1131", SUBJECT_KIND_TASK));
+
+        let workflow = running_workflow(SubjectRef::task("task:TASK-1131"));
+        validate_existing_workflow_subject(&workflow, &resume_params(Some("TASK-1131"), None))
+            .expect("one-id resume accepts the bridge's bare task selector");
+    }
+
+    #[test]
+    fn qualified_persisted_requirement_matches_bare_runner_selector() {
+        assert!(builtin_subject_ids_match("requirement:REQUIREMENT-064", "REQUIREMENT-064", SUBJECT_KIND_REQUIREMENT,));
+
+        let workflow = running_workflow(SubjectRef::requirement("requirement:REQUIREMENT-064"));
+        validate_existing_workflow_subject(&workflow, &resume_params(None, Some("REQUIREMENT-064")))
+            .expect("one-id resume accepts the bridge's bare requirement selector");
+    }
+
+    #[test]
+    fn unrelated_kind_prefix_and_different_native_id_fail_closed() {
+        assert!(!builtin_subject_ids_match("blog:TASK-1131", "TASK-1131", SUBJECT_KIND_TASK));
+        assert!(!builtin_subject_ids_match("task:TASK-1131", "TASK-991", SUBJECT_KIND_TASK));
+        assert!(!builtin_subject_ids_match("task:", "", SUBJECT_KIND_TASK));
+    }
 }
 
 fn resolve_input(params: &WorkflowExecuteParams) -> Result<WorkflowRunInput> {
