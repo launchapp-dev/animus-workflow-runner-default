@@ -1334,10 +1334,10 @@ pub async fn execute_workflow_with_hub(
     });
     if workflow.status == WorkflowStatus::Completed {
         post_success = if publication_required {
-            if let Some(ref t) = task {
+            if let Some(task_title) = publication_task_title(&workflow_subject, task.as_ref(), &subject_context) {
                 execute_post_success_actions(
                     &params.project_root,
-                    t,
+                    task_title,
                     &workflow,
                     &workflow_config,
                     &execution_cwd,
@@ -2449,9 +2449,62 @@ fn post_success_failure_reason(post_success: &Value) -> Option<String> {
         })
 }
 
+/// Return the task title used by coding publication after the workflow has
+/// completed.
+///
+/// A standalone run node resolves Portal-owned tasks through the subject
+/// backend. That produces an authoritative task [`SubjectRef`] and a populated
+/// [`SubjectContext`], but it intentionally does not materialize an in-tree
+/// [`OrchestratorTask`] projection. Requiring `context.task` here therefore
+/// turns a successfully completed delegated coding run into a false failure.
+/// The subject kind is the authorization boundary; the concrete projection is
+/// only a preferred source for the human-readable recovery-PR title.
+fn publication_task_title<'a>(
+    workflow_subject: &SubjectRef,
+    task: Option<&'a OrchestratorTask>,
+    subject_context: &'a SubjectContext,
+) -> Option<&'a str> {
+    workflow_subject
+        .kind()
+        .eq_ignore_ascii_case(SUBJECT_KIND_TASK)
+        .then(|| task.map_or(subject_context.subject_title.as_str(), |task| task.title.as_str()))
+}
+
+#[cfg(test)]
+mod publication_task_subject_tests {
+    use super::*;
+
+    fn plugin_resolved_context(kind: &str, id: &str, title: &str) -> SubjectContext {
+        SubjectContext {
+            subject_kind: kind.to_string(),
+            subject_id: id.to_string(),
+            subject_title: title.to_string(),
+            subject_description: "delegated subject".to_string(),
+            attributes: HashMap::from([(SUBJECT_ATTR_PLUGIN_RESOLVED.to_string(), "true".to_string())]),
+            task: None,
+        }
+    }
+
+    #[test]
+    fn plugin_resolved_task_without_projection_can_publish() {
+        let subject = SubjectRef::task("TASK-1131");
+        let context = plugin_resolved_context(SUBJECT_KIND_TASK, "TASK-1131", "Portal restart canary");
+
+        assert_eq!(publication_task_title(&subject, None, &context), Some("Portal restart canary"));
+    }
+
+    #[test]
+    fn non_task_subject_cannot_cross_coding_publication_boundary() {
+        let subject = SubjectRef::requirement("REQUIREMENT-064");
+        let context = plugin_resolved_context(SUBJECT_KIND_REQUIREMENT, "REQUIREMENT-064", "Onboarding PRD");
+
+        assert_eq!(publication_task_title(&subject, None, &context), None);
+    }
+}
+
 async fn execute_post_success_actions(
     project_root: &str,
-    task: &OrchestratorTask,
+    task_title: &str,
     workflow: &OrchestratorWorkflow,
     workflow_config: &orchestrator_core::WorkflowConfig,
     execution_cwd: &str,
@@ -2574,10 +2627,10 @@ async fn execute_post_success_actions(
                     environment,
                     recovery_ref,
                     &proof.commit,
-                    &task.title,
+                    task_title,
                 )
             } else {
-                ensure_recovery_pull_request(execution_cwd, recovery_ref, &proof.commit, &task.title).await
+                ensure_recovery_pull_request(execution_cwd, recovery_ref, &proof.commit, task_title).await
             };
             match recovery_pr {
                 Ok(url) => serde_json::json!({
