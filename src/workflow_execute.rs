@@ -29,6 +29,7 @@ use crate::config_context::RuntimeConfigContext;
 use crate::ensure_execution_cwd::ensure_execution_cwd;
 use crate::phase_evals::{decide_eval_gate, force_rework, run_phase_evals, EvalGateDecision};
 use crate::phase_executor::{run_workflow_phase, PhaseExecuteOverrides, PhaseExecutionOutcome, PhaseRunParams};
+use crate::phase_failover::{classify_phase_failure, failure_metadata, finding_fingerprint, PhaseFailureKind};
 use crate::phase_output::{
     is_phase_completed, persist_phase_output, phase_output_dir, read_persisted_decision, PersistedPhaseOutput,
 };
@@ -362,6 +363,7 @@ pub async fn execute_workflow_with_hub(
     if phases_to_run.is_empty() {
         return Err(anyhow!("workflow has no phases to execute"));
     }
+    let coding_rework_contract = phases_to_run.iter().any(|phase| phase.eq_ignore_ascii_case("code-implement"));
 
     if let Err(err) = hub.daemon().start(Default::default()).await {
         eprintln!("warning: failed to auto-start runner for workflow execute: {err}");
@@ -971,6 +973,12 @@ pub async fn execute_workflow_with_hub(
                     }
                 }
 
+                let rework_failure = if coding_rework_contract {
+                    enforce_coding_rework_convergence(&workflow, &phase_id, &mut result.outcome)
+                } else {
+                    None
+                };
+
                 if let PhaseExecutionOutcome::Completed { phase_decision: Some(ref decision), .. } = &result.outcome {
                     emit(PhaseEvent::Decision { phase_id: &phase_id, decision });
                     // codex P2 round 2: also forward the verdict through the
@@ -986,16 +994,17 @@ pub async fn execute_workflow_with_hub(
                     // undiagnosable from the run log. TASK-447.
                     const DECISION_REASON_MAX: usize = 4000;
                     let reason_excerpt: String = decision.reason.chars().take(DECISION_REASON_MAX).collect();
-                    emit_runtime(
-                        RuntimeWorkflowEventKind::PhaseCompleted,
-                        serde_json::json!({
-                            "phase_id": phase_id,
-                            "phase_status": "decision",
-                            "verdict": format!("{:?}", decision.verdict).to_ascii_lowercase(),
-                            "confidence": decision.confidence,
-                            "reason": reason_excerpt,
-                        }),
-                    );
+                    let mut decision_payload = serde_json::json!({
+                        "phase_id": phase_id,
+                        "phase_status": "decision",
+                        "verdict": format!("{:?}", decision.verdict).to_ascii_lowercase(),
+                        "confidence": decision.confidence,
+                        "reason": reason_excerpt,
+                    });
+                    if let Some(failure) = rework_failure.as_ref() {
+                        decision_payload["failure"] = failure.clone();
+                    }
+                    emit_runtime(RuntimeWorkflowEventKind::PhaseCompleted, decision_payload);
                 }
 
                 // Skip persistence for ManualPending: the .completed marker
@@ -1103,13 +1112,14 @@ pub async fn execute_workflow_with_hub(
                             model: result.model.clone(),
                             tool: result.tool.clone(),
                         });
-                        emit_runtime(
-                            RuntimeWorkflowEventKind::PhaseCompleted,
-                            serde_json::json!({
-                                "phase_id": phase_id,
-                                "phase_status": status,
-                            }),
-                        );
+                        let mut completion_payload = serde_json::json!({
+                            "phase_id": phase_id,
+                            "phase_status": status,
+                        });
+                        if let Some(failure) = rework_failure.as_ref() {
+                            completion_payload["failure"] = failure.clone();
+                        }
+                        emit_runtime(RuntimeWorkflowEventKind::PhaseCompleted, completion_payload);
                         let mut result_value = serde_json::json!({
                             "phase_id": phase_id,
                             "status": status,
@@ -1129,6 +1139,9 @@ pub async fn execute_workflow_with_hub(
                         }
                         if let Some(summary) = eval_summary.take() {
                             result_value["evals"] = summary;
+                        }
+                        if let Some(failure) = rework_failure.as_ref() {
+                            result_value["failure"] = failure.clone();
                         }
                         results.push(result_value);
 
@@ -1177,14 +1190,15 @@ pub async fn execute_workflow_with_hub(
                             model: None,
                             tool: None,
                         });
-                        emit_runtime(
-                            RuntimeWorkflowEventKind::PhaseCompleted,
-                            serde_json::json!({
-                                "phase_id": phase_id,
-                                "phase_status": "manual_pending",
-                                "human_escalation": instructions,
-                            }),
-                        );
+                        let mut manual_payload = serde_json::json!({
+                            "phase_id": phase_id,
+                            "phase_status": "manual_pending",
+                            "human_escalation": instructions,
+                        });
+                        if let Some(failure) = rework_failure.as_ref() {
+                            manual_payload["failure"] = failure.clone();
+                        }
+                        emit_runtime(RuntimeWorkflowEventKind::PhaseCompleted, manual_payload);
                         let mut manual_result = serde_json::json!({
                             "phase_id": phase_id,
                             "status": "manual_pending",
@@ -1195,6 +1209,9 @@ pub async fn execute_workflow_with_hub(
                         });
                         if let Some(summary) = eval_summary.take() {
                             manual_result["evals"] = summary;
+                        }
+                        if let Some(failure) = rework_failure.as_ref() {
+                            manual_result["failure"] = failure.clone();
                         }
                         results.push(manual_result);
                         break;
@@ -1218,13 +1235,15 @@ pub async fn execute_workflow_with_hub(
                 // a real phase failure when triaging. (Automatic next-tick
                 // retry would require scheduler changes outside this PR.)
                 if err.downcast_ref::<crate::phase_executor::DispatchRetryableError>().is_some() {
-                    workflow = hub.workflows().fail_current_phase(&workflow.id, err.to_string()).await?;
+                    let error_message = err.to_string();
+                    let failure = failure_metadata(&error_message);
+                    workflow = hub.workflows().fail_current_phase(&workflow.id, error_message.clone()).await?;
                     reported_workflow_status = workflow.status;
                     emit(PhaseEvent::Completed {
                         phase_id: &phase_id,
                         duration: phase_elapsed,
                         success: false,
-                        error: Some(err.to_string()),
+                        error: Some(error_message.clone()),
                         model: None,
                         tool: None,
                     });
@@ -1233,7 +1252,8 @@ pub async fn execute_workflow_with_hub(
                         serde_json::json!({
                             "phase_id": phase_id,
                             "phase_status": "dispatch_retry",
-                            "error": err.to_string(),
+                            "error": error_message,
+                            "failure": failure,
                         }),
                     );
                     results.push(serde_json::json!({
@@ -1241,7 +1261,8 @@ pub async fn execute_workflow_with_hub(
                         "status": "dispatch_retry",
                         "duration_secs": phase_elapsed.as_secs(),
                         "workflow_status": format!("{:?}", workflow.status).to_ascii_lowercase(),
-                        "error": err.to_string(),
+                        "error": error_message,
+                        "failure": failure,
                     }));
                     break;
                 }
@@ -1332,6 +1353,12 @@ pub async fn execute_workflow_with_hub(
                         }));
                         break;
                     }
+                    let mut diagnostic = cmd_fail.message.clone();
+                    if let Some(stderr) = cmd_fail.stderr_excerpt.as_deref() {
+                        diagnostic.push('\n');
+                        diagnostic.push_str(stderr);
+                    }
+                    let failure = failure_metadata(&diagnostic);
                     workflow = hub.workflows().fail_current_phase(&workflow.id, cmd_fail.message.clone()).await?;
                     reported_workflow_status = workflow.status;
                     emit(PhaseEvent::Completed {
@@ -1342,10 +1369,10 @@ pub async fn execute_workflow_with_hub(
                         model: None,
                         tool: None,
                     });
-                    emit_runtime(
-                        RuntimeWorkflowEventKind::PhaseFailed,
-                        crate::phase_command::command_phase_failed_event_payload(&phase_id, cmd_fail),
-                    );
+                    let mut command_payload =
+                        crate::phase_command::command_phase_failed_event_payload(&phase_id, cmd_fail);
+                    command_payload["failure"] = failure.clone();
+                    emit_runtime(RuntimeWorkflowEventKind::PhaseFailed, command_payload);
                     results.push(serde_json::json!({
                         "phase_id": phase_id,
                         "status": "failed",
@@ -1353,16 +1380,19 @@ pub async fn execute_workflow_with_hub(
                         "workflow_status": format!("{:?}", workflow.status).to_ascii_lowercase(),
                         "error": cmd_fail.message,
                         "exit_code": cmd_fail.exit_code,
+                        "failure": failure,
                     }));
                     break;
                 }
-                workflow = hub.workflows().fail_current_phase(&workflow.id, err.to_string()).await?;
+                let error_message = err.to_string();
+                let failure = failure_metadata(&error_message);
+                workflow = hub.workflows().fail_current_phase(&workflow.id, error_message.clone()).await?;
                 reported_workflow_status = workflow.status;
                 emit(PhaseEvent::Completed {
                     phase_id: &phase_id,
                     duration: phase_elapsed,
                     success: false,
-                    error: Some(err.to_string()),
+                    error: Some(error_message.clone()),
                     model: None,
                     tool: None,
                 });
@@ -1371,7 +1401,8 @@ pub async fn execute_workflow_with_hub(
                     serde_json::json!({
                         "phase_id": phase_id,
                         "phase_status": "failed",
-                        "error": err.to_string(),
+                        "error": error_message,
+                        "failure": failure,
                     }),
                 );
                 results.push(serde_json::json!({
@@ -1379,7 +1410,8 @@ pub async fn execute_workflow_with_hub(
                     "status": "failed",
                     "duration_secs": phase_elapsed.as_secs(),
                     "workflow_status": format!("{:?}", workflow.status).to_ascii_lowercase(),
-                    "error": err.to_string(),
+                    "error": error_message,
+                    "failure": failure,
                 }));
                 break;
             }
@@ -3015,6 +3047,218 @@ fn phase_rework_context(outcome: &PhaseExecutionOutcome) -> Option<String> {
             Some(decision.reason.clone())
         }
         _ => None,
+    }
+}
+
+const MAX_IDENTICAL_IMPLEMENTATION_FINDING_REWORKS: usize = 2;
+
+/// Guard the coding workflow's implementation loop before the lifecycle
+/// engine consumes a generic `Rework` verdict. Only actionable implementation
+/// findings may enter that loop. Non-code failures are converted to the
+/// existing durable manual-pending state with an explicit retry owner and
+/// workspace-preservation requirement. Repeated identical findings converge
+/// or escalate deterministically instead of consuming the full generic rework
+/// budget after every resume.
+fn enforce_coding_rework_convergence(
+    workflow: &OrchestratorWorkflow,
+    phase_id: &str,
+    outcome: &mut PhaseExecutionOutcome,
+) -> Option<Value> {
+    let PhaseExecutionOutcome::Completed { phase_decision: Some(decision), .. } = outcome else {
+        return None;
+    };
+    if decision.verdict != PhaseDecisionVerdict::Rework {
+        return None;
+    }
+
+    let reason = decision.reason.trim().to_string();
+    let kind = classify_phase_failure(&reason);
+    let mut metadata = failure_metadata(&reason);
+    metadata["phase_id"] = Value::String(phase_id.to_string());
+
+    if let PhaseFailureKind::ImplementationFinding { fingerprint } = kind {
+        let prior_identical = workflow
+            .decision_history
+            .iter()
+            .filter(|record| {
+                record.phase_id.eq_ignore_ascii_case(phase_id)
+                    && record.decision == orchestrator_core::WorkflowDecisionAction::Rework
+                    && finding_fingerprint(&record.reason) == fingerprint
+            })
+            .count();
+        let repeat_count = prior_identical + 1;
+        metadata["finding_fingerprint"] = Value::String(fingerprint.clone());
+        metadata["repeat_count"] = serde_json::json!(repeat_count);
+        metadata["repeat_limit"] = serde_json::json!(MAX_IDENTICAL_IMPLEMENTATION_FINDING_REWORKS);
+        metadata["disposition"] = Value::String(if repeat_count > MAX_IDENTICAL_IMPLEMENTATION_FINDING_REWORKS {
+            "operator_escalation".to_string()
+        } else {
+            "implementation_rework".to_string()
+        });
+
+        if repeat_count > MAX_IDENTICAL_IMPLEMENTATION_FINDING_REWORKS {
+            let latest = crate::phase_git::redact_git_diagnostic(&reason);
+            *outcome = PhaseExecutionOutcome::ManualPending {
+                instructions: format!(
+                    "implementation rework did not converge after {repeat_count} identical findings; \
+                     retry_owner=operator; finding_fingerprint={fingerprint}; \
+                     preservation_state=workspace-retained. Latest unresolved finding snapshot:\n{latest}"
+                ),
+                approval_note_required: true,
+            };
+        } else {
+            decision.reason = format!(
+                "[animus-rework-v1 fingerprint={fingerprint} repeat={repeat_count} \
+                 class=implementation_finding retry_owner=implementation]\n{reason}"
+            );
+        }
+        return Some(metadata);
+    }
+
+    let latest = crate::phase_git::redact_git_diagnostic(&reason);
+    metadata["disposition"] = Value::String("operator_escalation".to_string());
+    metadata["preservation_state"] = Value::String("workspace-retained".to_string());
+    *outcome = PhaseExecutionOutcome::ManualPending {
+        instructions: format!(
+            "non-code failure cannot enter implementation rework; failure_class={}; retry_owner={}; \
+             preservation_state=workspace-retained. Latest diagnostic:\n{}",
+            kind.class_name(),
+            kind.retry_owner(),
+            latest,
+        ),
+        approval_note_required: true,
+    };
+    Some(metadata)
+}
+
+#[cfg(test)]
+mod rework_convergence_tests {
+    use super::*;
+    use orchestrator_core::{
+        PhaseDecision, WorkflowDecisionAction, WorkflowDecisionRecord, WorkflowDecisionRisk, WorkflowDecisionSource,
+    };
+
+    fn workflow(history: Vec<WorkflowDecisionRecord>) -> OrchestratorWorkflow {
+        OrchestratorWorkflow {
+            id: "wf-convergence".to_string(),
+            execution_fence: None,
+            task_id: "TASK-1174".to_string(),
+            workflow_ref: Some("coding".to_string()),
+            subject: None,
+            input: None,
+            vars: HashMap::new(),
+            status: WorkflowStatus::Running,
+            current_phase_index: 0,
+            phases: Vec::new(),
+            machine_state: Default::default(),
+            current_phase: Some("code-check".to_string()),
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            failure_reason: None,
+            checkpoint_metadata: Default::default(),
+            rework_counts: HashMap::new(),
+            total_reworks: history.len() as u32,
+            decision_history: history,
+        }
+    }
+
+    fn rework(reason: &str) -> PhaseExecutionOutcome {
+        PhaseExecutionOutcome::Completed {
+            commit_message: None,
+            phase_decision: Some(PhaseDecision {
+                kind: "phase_decision".to_string(),
+                phase_id: "code-check".to_string(),
+                verdict: PhaseDecisionVerdict::Rework,
+                verdict_key: None,
+                confidence: 1.0,
+                risk: WorkflowDecisionRisk::Medium,
+                reason: reason.to_string(),
+                evidence: Vec::new(),
+                guardrail_violations: Vec::new(),
+                commit_message: None,
+                target_phase: Some("code-implement".to_string()),
+            }),
+            result_payload: None,
+        }
+    }
+
+    fn prior_rework(reason: &str) -> WorkflowDecisionRecord {
+        WorkflowDecisionRecord {
+            timestamp: chrono::Utc::now(),
+            phase_id: "code-check".to_string(),
+            source: WorkflowDecisionSource::Llm,
+            decision: WorkflowDecisionAction::Rework,
+            target_phase: Some("code-implement".to_string()),
+            reason: reason.to_string(),
+            confidence: 1.0,
+            risk: WorkflowDecisionRisk::Medium,
+            guardrail_violations: Vec::new(),
+            machine_version: None,
+            machine_hash: None,
+            machine_source: None,
+        }
+    }
+
+    #[test]
+    fn actionable_finding_enters_implementation_rework_with_fingerprint() {
+        let mut outcome = rework("VERDICT: CHANGES REQUESTED — REQUIRED CHANGE: fix the lease race");
+        let metadata = enforce_coding_rework_convergence(&workflow(Vec::new()), "code-check", &mut outcome)
+            .expect("rework metadata");
+        assert_eq!(metadata["class"], "implementation_finding");
+        assert_eq!(metadata["repeat_count"], 1);
+        let PhaseExecutionOutcome::Completed { phase_decision: Some(decision), .. } = outcome else {
+            panic!("actionable finding should remain a rework");
+        };
+        assert!(decision.reason.contains("[animus-rework-v1"));
+        assert!(decision.reason.contains("retry_owner=implementation"));
+    }
+
+    #[test]
+    fn infrastructure_failure_never_burns_an_implementation_attempt() {
+        let mut outcome = rework(
+            "environment/prepare failed: RailwayApiError: Too many services in project; plan only allows 100 services",
+        );
+        let metadata = enforce_coding_rework_convergence(&workflow(Vec::new()), "code-prepare", &mut outcome)
+            .expect("failure metadata");
+        assert_eq!(metadata["class"], "infrastructure");
+        assert_eq!(metadata["retry_owner"], "infrastructure");
+        let PhaseExecutionOutcome::ManualPending { instructions, .. } = outcome else {
+            panic!("infrastructure failure must escalate without implementation rework");
+        };
+        assert!(instructions.contains("preservation_state=workspace-retained"));
+        assert!(instructions.contains("retry_owner=infrastructure"));
+    }
+
+    #[test]
+    fn publication_conflict_is_owned_by_github_without_implementation_rework() {
+        let mut outcome = rework("git push rejected: non-fast-forward publication conflict");
+        let metadata = enforce_coding_rework_convergence(&workflow(Vec::new()), "code-publish", &mut outcome)
+            .expect("failure metadata");
+        assert_eq!(metadata["class"], "publication_conflict");
+        assert_eq!(metadata["retry_owner"], "github");
+        assert_eq!(metadata["preservation_required"], true);
+        let PhaseExecutionOutcome::ManualPending { instructions, .. } = outcome else {
+            panic!("publication conflicts must not consume implementation attempts");
+        };
+        assert!(instructions.contains("retry_owner=github"));
+        assert!(instructions.contains("preservation_state=workspace-retained"));
+    }
+
+    #[test]
+    fn third_identical_finding_escalates_with_latest_snapshot() {
+        let reason = "VERDICT: CHANGES REQUESTED — REQUIRED CHANGE: fix the lease race";
+        let history = vec![prior_rework(reason), prior_rework(reason)];
+        let mut outcome = rework(reason);
+        let metadata = enforce_coding_rework_convergence(&workflow(history), "code-check", &mut outcome)
+            .expect("convergence metadata");
+        assert_eq!(metadata["repeat_count"], 3);
+        assert_eq!(metadata["disposition"], "operator_escalation");
+        let PhaseExecutionOutcome::ManualPending { instructions, .. } = outcome else {
+            panic!("third identical finding must stop the loop");
+        };
+        assert!(instructions.contains("did not converge"));
+        assert!(instructions.contains("Latest unresolved finding snapshot"));
+        assert!(instructions.contains("workspace-retained"));
     }
 }
 
