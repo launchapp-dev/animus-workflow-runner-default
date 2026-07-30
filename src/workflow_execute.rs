@@ -4,12 +4,17 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use animus_actor::Actor;
+use animus_execution_protocol::ExecutionFence;
+use animus_workflow_runner_protocol::{
+    PublicationPullRequest, PublicationReceipt, PublicationReceiptIssuer, PublicationSubjectGeneration,
+    PUBLICATION_RECEIPT_SCHEMA_ID, PUBLICATION_RECEIPT_VERSION,
+};
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 
 use orchestrator_config::{
     collect_workflow_refs, ensure_pack_execution_requirements, resolve_active_pack_for_workflow_ref,
-    resolve_pack_registry,
+    resolve_pack_registry, WorkflowPublicationCleanupPolicy, WorkflowPublicationConfig, WorkflowPublicationOwner,
 };
 use orchestrator_core::{
     dispatch_workflow_event, ensure_workflow_config_compiled, load_workflow_config,
@@ -58,6 +63,10 @@ pub struct WorkflowExecuteInternalParams {
     /// Stable id for an idempotent fresh bootstrap. Queue dispatch supplies
     /// this before spawn so the queue and journal share one authority.
     pub bootstrap_workflow_id: Option<String>,
+    /// Scheduler-authoritative workflow/subject/lease/repository generation.
+    /// Generation-aware coding refuses to create or resume journal state
+    /// without an exact matching fence.
+    pub execution_fence: Option<ExecutionFence>,
     pub task_id: Option<String>,
     pub requirement_id: Option<String>,
     /// Qualified `<kind>:<id>` for a subject of any (incl. runtime-declared)
@@ -92,6 +101,7 @@ pub(crate) type WorkflowExecuteParams = WorkflowExecuteInternalParams;
 pub struct WorkflowExecuteInternalResult {
     pub success: bool,
     pub workflow_id: String,
+    pub execution_fence: Option<ExecutionFence>,
     pub workflow_ref: String,
     pub workflow_status: WorkflowStatus,
     pub subject_id: String,
@@ -102,6 +112,7 @@ pub struct WorkflowExecuteInternalResult {
     pub total_duration: Duration,
     pub phase_results: Vec<Value>,
     pub post_success: Value,
+    pub publication_receipt: Option<PublicationReceipt>,
 }
 
 // Back-compat alias for the lifted in-tree call sites + tests.
@@ -249,10 +260,29 @@ pub async fn execute_workflow_with_hub(
     // construction sites below.
     let mcp_config = params.mcp_config.take();
 
-    let mut workflow = match params.workflow_id.as_deref() {
-        Some(workflow_id) => load_existing_workflow(hub.clone(), workflow_id, &params).await?,
+    // Publication policy and execution authority are preflighted before a
+    // fresh journal row is created. A required publication can therefore
+    // never start under a missing/stale generation and leave ambiguous work.
+    ensure_workflow_config_compiled(Path::new(&params.project_root))?;
+    let workflow_config = load_workflow_config(Path::new(&params.project_root), params.actor.as_ref())?;
+    let existing_workflow = match params.workflow_id.as_deref() {
+        Some(workflow_id) => Some(load_existing_workflow(hub.clone(), workflow_id, &params).await?),
+        None => None,
+    };
+    let policy_workflow_ref = existing_workflow
+        .as_ref()
+        .and_then(|workflow| workflow.workflow_ref.as_deref())
+        .or(params.workflow_ref.as_deref())
+        .unwrap_or(workflow_config.default_workflow_ref.as_str())
+        .to_string();
+    let publication_contract = workflow_publication_contract(&workflow_config, &policy_workflow_ref)?;
+    validate_execution_authority(&params, existing_workflow.as_ref(), publication_contract.as_ref())?;
+
+    let mut workflow = match existing_workflow {
+        Some(workflow) => workflow,
         None => {
-            let input = resolve_input(&params)?;
+            let input = resolve_input(&params)?.with_execution_fence(params.execution_fence.clone());
+            validate_execution_subject(params.execution_fence.as_ref(), input.subject())?;
             let subject = input.subject().cloned();
             let subject_id = subject.as_ref().map(|s| s.id().to_string()).unwrap_or_default();
             let run_result = match params.bootstrap_workflow_id.clone() {
@@ -346,9 +376,14 @@ pub async fn execute_workflow_with_hub(
     let subject_description = subject_context.subject_description.clone();
     let task_complexity = task.as_ref().map(|t| t.complexity);
 
-    ensure_workflow_config_compiled(Path::new(&params.project_root))?;
-    let workflow_config = load_workflow_config(Path::new(&params.project_root), params.actor.as_ref())?;
     let workflow_ref = workflow.workflow_ref.clone().unwrap_or_else(|| workflow_config.default_workflow_ref.clone());
+    anyhow::ensure!(
+        workflow_ref.eq_ignore_ascii_case(&policy_workflow_ref),
+        "workflow '{}' resolved publication policy for '{}' but journal state uses '{}'",
+        workflow.id,
+        policy_workflow_ref,
+        workflow_ref
+    );
     let pack_registry = resolve_pack_registry(Path::new(&params.project_root))?;
     ensure_workflow_pack_execution_requirements(&pack_registry, &workflow_config, &workflow_ref)?;
     let phase_inputs = workflow_phase_inputs(&workflow);
@@ -392,6 +427,8 @@ pub async fn execute_workflow_with_hub(
                     phase_inputs.dispatch_input.as_deref(),
                     &execution_cwd,
                     phases_requested,
+                    publication_contract.as_ref(),
+                    params.execution_fence.as_ref(),
                     params.actor.as_ref(),
                     event_emitter.as_ref(),
                 )
@@ -422,7 +459,7 @@ pub async fn execute_workflow_with_hub(
     // `metadata.github_repo` so the environment plugin repo-scopes the GitHub App
     // installation token to THAT repo (correct installation, least privilege). A
     // bare non-coding run without `git_repo` leaves the metadata untouched.
-    let publication_required = workflow_requires_publication(&workflow_ref);
+    let publication_required = publication_contract.as_ref().is_some_and(|publication| publication.required);
     let subject_git_repo =
         crate::phase_command::subject_git_repo(&params.project_root, &subject_kind_str, &subject_id_str).await;
     let brokered_environment: Option<std::sync::Arc<crate::phase_environment::BrokeredEnvironment>> =
@@ -629,6 +666,7 @@ pub async fn execute_workflow_with_hub(
                 return Ok(WorkflowExecuteResult {
                     success: phase_status != "failed",
                     workflow_id: workflow.id.clone(),
+                    execution_fence: params.execution_fence.clone(),
                     workflow_ref,
                     workflow_status: workflow.status,
                     subject_id: subject_id_str,
@@ -642,6 +680,7 @@ pub async fn execute_workflow_with_hub(
                         "status": "skipped",
                         "reason": "post-success actions are not run for single-phase execution",
                     }),
+                    publication_receipt: None,
                 });
             }
             Err(err) => {
@@ -678,6 +717,7 @@ pub async fn execute_workflow_with_hub(
                 return Ok(WorkflowExecuteResult {
                     success: false,
                     workflow_id: workflow.id.clone(),
+                    execution_fence: params.execution_fence.clone(),
                     workflow_ref,
                     workflow_status: workflow.status,
                     subject_id: subject_id_str,
@@ -691,6 +731,7 @@ pub async fn execute_workflow_with_hub(
                         "status": "skipped",
                         "reason": "post-success actions are not run for single-phase execution",
                     }),
+                    publication_receipt: None,
                 });
             }
         }
@@ -817,17 +858,25 @@ pub async fn execute_workflow_with_hub(
             Ok(mut result) => {
                 // A publication authorization/policy denial is deterministic
                 // and operator-actionable, not an implementation defect. The
-                // coding workflow historically interpreted code-open-pr's
+                // legacy coding workflows interpreted their publishing phase's
                 // ordinary non-zero/rework result as a reason to run
                 // code-implement and code-check again until max_reworks was
                 // exhausted. Convert only this class of publication failure to
                 // the existing durable human-pause path before the workflow
                 // state machine sees the rework verdict.
-                if non_retryable_publication_diagnostic(&phase_id, &result.outcome).is_some() {
+                let phase_owns_publication = matches!(
+                    publication_contract.as_ref(),
+                    Some(WorkflowPublicationConfig {
+                        required: true,
+                        owner: Some(WorkflowPublicationOwner::Phase { phase_id: owner_phase }),
+                        ..
+                    }) if owner_phase.eq_ignore_ascii_case(&phase_id)
+                );
+                if non_retryable_publication_diagnostic(phase_owns_publication, &result.outcome).is_some() {
                     let (commit, tree) =
                         unpublished_git_identity(&params.project_root, &execution_cwd, held_environment);
                     intercept_non_retryable_publication_denial(
-                        &phase_id,
+                        phase_owns_publication,
                         &mut result.outcome,
                         commit.as_deref(),
                         tree.as_deref(),
@@ -1203,7 +1252,17 @@ pub async fn execute_workflow_with_hub(
                 // ao-cli #299 journal mapping persists them, instead of the bare
                 // error string the generic arm below produces.
                 if let Some(cmd_fail) = err.downcast_ref::<crate::phase_command::CommandPhaseFailedError>() {
-                    if let Some(diagnostic) = non_retryable_command_publication_diagnostic(&phase_id, cmd_fail) {
+                    let phase_owns_publication = matches!(
+                        publication_contract.as_ref(),
+                        Some(WorkflowPublicationConfig {
+                            required: true,
+                            owner: Some(WorkflowPublicationOwner::Phase { phase_id: owner_phase }),
+                            ..
+                        }) if owner_phase.eq_ignore_ascii_case(&phase_id)
+                    );
+                    if let Some(diagnostic) =
+                        non_retryable_command_publication_diagnostic(phase_owns_publication, cmd_fail)
+                    {
                         let (commit, tree) =
                             unpublished_git_identity(&params.project_root, &execution_cwd, held_environment);
                         let instructions = crate::phase_git::publication_denial_escalation(
@@ -1332,36 +1391,164 @@ pub async fn execute_workflow_with_hub(
         "status": "skipped",
         "reason": "workflow did not complete all phases",
     });
+    let mut publication_receipt: Option<PublicationReceipt> = None;
     if workflow.status == WorkflowStatus::Completed {
-        post_success = if publication_required {
-            if let Some(task_title) = publication_task_title(&workflow_subject, task.as_ref(), &subject_context) {
-                execute_post_success_actions(
-                    &params.project_root,
-                    task_title,
-                    &workflow,
-                    &workflow_config,
-                    &execution_cwd,
-                    held_environment,
-                )
-                .await
-            } else {
-                serde_json::json!({
-                    "status": "failed",
-                    "publication_durable": false,
-                    "reason": "coding publication requires a task subject",
-                })
+        let mut phase_receipts = phase_publication_receipts(&results)?;
+        post_success = match publication_contract.as_ref() {
+            None => {
+                if phase_receipts.is_empty() {
+                    serde_json::json!({
+                        "status": "skipped",
+                        "reason": "workflow has no explicit publication contract",
+                    })
+                } else {
+                    serde_json::json!({
+                        "status": "failed",
+                        "publication_durable": false,
+                        "reason": "a phase emitted publication proof without an explicit publication owner",
+                    })
+                }
             }
-        } else {
-            serde_json::json!({
-                "status": "skipped",
-                "reason": "workflow does not require coding publication",
-            })
+            Some(publication) if !publication.required => {
+                if phase_receipts.is_empty() {
+                    serde_json::json!({
+                        "status": "skipped",
+                        "reason": "workflow publication is explicitly disabled",
+                    })
+                } else {
+                    serde_json::json!({
+                        "status": "failed",
+                        "publication_durable": false,
+                        "reason": "a phase emitted publication proof while publication.required is false",
+                    })
+                }
+            }
+            Some(WorkflowPublicationConfig { owner: Some(WorkflowPublicationOwner::Runner), .. }) => {
+                if !phase_receipts.is_empty() {
+                    serde_json::json!({
+                        "status": "failed",
+                        "publication_durable": false,
+                        "reason": "a phase emitted publication proof but the workflow declares the runner as sole owner",
+                    })
+                } else if let Some(task_title) =
+                    publication_task_title(&workflow_subject, task.as_ref(), &subject_context)
+                {
+                    let mut outcome = execute_post_success_actions(
+                        &params.project_root,
+                        task_title,
+                        &workflow,
+                        &workflow_config,
+                        &execution_cwd,
+                        held_environment,
+                        params.execution_fence.as_ref(),
+                    )
+                    .await;
+                    if outcome.get("publication_durable").and_then(Value::as_bool) == Some(true) {
+                        match issue_runner_publication_receipt(
+                            &outcome,
+                            params.execution_fence.as_ref().expect("required publication preflighted fence"),
+                            &params.project_root,
+                            &execution_cwd,
+                            held_environment,
+                        ) {
+                            Ok(receipt) => {
+                                outcome["publication_receipt"] = serde_json::to_value(&receipt).unwrap_or(Value::Null);
+                                publication_receipt = Some(receipt);
+                            }
+                            Err(error) => {
+                                outcome = serde_json::json!({
+                                    "status": "failed",
+                                    "publication_durable": false,
+                                    "reason": format!("runner publication receipt verification failed: {error:#}"),
+                                });
+                            }
+                        }
+                    }
+                    outcome
+                } else {
+                    serde_json::json!({
+                        "status": "failed",
+                        "publication_durable": false,
+                        "reason": "runner-owned git publication requires a task subject",
+                    })
+                }
+            }
+            Some(WorkflowPublicationConfig {
+                owner: Some(WorkflowPublicationOwner::Phase { phase_id: owner_phase }),
+                ..
+            }) => {
+                if phase_receipts.len() != 1 {
+                    serde_json::json!({
+                        "status": "failed",
+                        "publication_durable": false,
+                        "reason": format!(
+                            "publication owner phase '{}' must emit exactly one receipt; observed {}",
+                            owner_phase,
+                            phase_receipts.len()
+                        ),
+                    })
+                } else {
+                    let (result_index, emitted_phase, receipt) = phase_receipts.remove(0);
+                    let issuer_matches = matches!(
+                        &receipt.issuer,
+                        PublicationReceiptIssuer::Phase { phase_id, .. }
+                            if phase_id.eq_ignore_ascii_case(owner_phase)
+                    );
+                    if !emitted_phase.eq_ignore_ascii_case(owner_phase) || !issuer_matches {
+                        serde_json::json!({
+                            "status": "failed",
+                            "publication_durable": false,
+                            "reason": format!(
+                                "publication receipt was emitted by phase '{}' but sole owner is '{}'",
+                                emitted_phase,
+                                owner_phase
+                            ),
+                        })
+                    } else {
+                        match verify_publication_receipt(
+                            &receipt,
+                            params.execution_fence.as_ref().expect("required publication preflighted fence"),
+                            &params.project_root,
+                            &execution_cwd,
+                            held_environment,
+                        ) {
+                            Ok(_) => {
+                                results[result_index]["publication_receipt"] =
+                                    serde_json::to_value(&receipt).unwrap_or(Value::Null);
+                                publication_receipt = Some(receipt.clone());
+                                serde_json::json!({
+                                    "status": "completed",
+                                    "publication_durable": true,
+                                    "publication_receipt": receipt,
+                                })
+                            }
+                            Err(error) => serde_json::json!({
+                                "status": "failed",
+                                "publication_durable": false,
+                                "reason": format!("phase publication receipt verification failed: {error:#}"),
+                            }),
+                        }
+                    }
+                }
+            }
+            Some(_) => serde_json::json!({
+                "status": "failed",
+                "publication_durable": false,
+                "reason": "required publication contract has no owner",
+            }),
         };
 
-        cleanup_allowed
-            .store(cleanup_is_allowed(publication_required, &post_success), std::sync::atomic::Ordering::SeqCst);
+        let publication_satisfied = !publication_required || publication_receipt.is_some();
+        let cleanup_policy = publication_contract
+            .as_ref()
+            .map(|publication| publication.cleanup)
+            .unwrap_or(WorkflowPublicationCleanupPolicy::AfterRemoteVerified);
+        cleanup_allowed.store(
+            cleanup_is_allowed(publication_required, cleanup_policy, publication_receipt.as_ref()),
+            std::sync::atomic::Ordering::SeqCst,
+        );
 
-        if !cleanup_is_allowed(publication_required, &post_success) {
+        if !publication_satisfied {
             let reason = post_success_failure_reason(&post_success)
                 .unwrap_or_else(|| "workflow completed without durable publication evidence".to_string());
             workflow = hub.workflows().mark_completed_failed(&workflow.id, reason).await?;
@@ -1402,7 +1589,8 @@ pub async fn execute_workflow_with_hub(
                 "final_status": "completed",
                 // Delegating parents consume this as the session protocol's
                 // positive cleanup/success gate.
-                "publication_durable": cleanup_is_allowed(publication_required, &post_success),
+                "publication_durable": !publication_required || publication_receipt.is_some(),
+                "publication_receipt": publication_receipt.clone(),
                 "post_success": post_success.clone(),
             }),
         ),
@@ -1418,6 +1606,7 @@ pub async fn execute_workflow_with_hub(
     Ok(WorkflowExecuteResult {
         success: workflow_exit_success(reported_workflow_status),
         workflow_id: workflow.id.clone(),
+        execution_fence: params.execution_fence.clone(),
         workflow_ref,
         workflow_status: reported_workflow_status,
         subject_id: subject_id_str,
@@ -1428,15 +1617,370 @@ pub async fn execute_workflow_with_hub(
         total_duration,
         phase_results: results,
         post_success,
+        publication_receipt,
     })
 }
 
-pub(crate) fn workflow_requires_publication(workflow_ref: &str) -> bool {
-    workflow_ref.rsplit(['/', ':']).next() == Some("coding")
+fn workflow_publication_contract(
+    workflow_config: &orchestrator_core::WorkflowConfig,
+    workflow_ref: &str,
+) -> Result<Option<WorkflowPublicationConfig>> {
+    orchestrator_config::validate_workflow_publication_contracts(workflow_config)?;
+    let workflow = workflow_config
+        .workflows
+        .iter()
+        .find(|workflow| workflow.id.eq_ignore_ascii_case(workflow_ref))
+        .ok_or_else(|| anyhow!("workflow publication policy cannot resolve workflow '{}'", workflow_ref))?;
+    if workflow.publication.is_none() {
+        eprintln!(
+            "warning: workflow '{}' has no explicit publication contract; publication is disabled and no owner is inferred",
+            workflow.id
+        );
+    }
+    Ok(workflow.publication.clone())
 }
 
-fn cleanup_is_allowed(publication_required: bool, post_success: &Value) -> bool {
-    !publication_required || post_success.get("publication_durable").and_then(Value::as_bool) == Some(true)
+fn validate_execution_authority(
+    params: &WorkflowExecuteParams,
+    existing: Option<&OrchestratorWorkflow>,
+    publication: Option<&WorkflowPublicationConfig>,
+) -> Result<()> {
+    let publication_required = publication.is_some_and(|publication| publication.required);
+    let execution = match params.execution_fence.as_ref() {
+        Some(execution) => {
+            if publication_required {
+                execution.validate_coding().map_err(anyhow::Error::msg)?;
+            } else {
+                execution.validate().map_err(anyhow::Error::msg)?;
+            }
+            Some(execution)
+        }
+        None if publication_required => {
+            return Err(anyhow!(
+                "workflow publication is required but no execution fence was supplied; refusing to create or resume journal state"
+            ));
+        }
+        None => None,
+    };
+
+    if let Some(execution) = execution {
+        let expected_workflow_id = existing
+            .map(|workflow| workflow.id.as_str())
+            .or(params.workflow_id.as_deref())
+            .or(params.bootstrap_workflow_id.as_deref())
+            .ok_or_else(|| anyhow!("fenced workflow execution requires a scheduler-selected workflow id"))?;
+        anyhow::ensure!(
+            execution.workflow_id == expected_workflow_id,
+            "execution fence workflow '{}' does not match requested workflow '{}'",
+            execution.workflow_id,
+            expected_workflow_id
+        );
+    }
+
+    if let Some(existing) = existing {
+        match (existing.execution_fence.as_ref(), execution) {
+            (Some(persisted), Some(current)) => {
+                anyhow::ensure!(
+                    persisted.same_execution_generation(current),
+                    "incoming execution fence does not match persisted workflow/subject generation"
+                );
+                anyhow::ensure!(
+                    persisted.repository == current.repository,
+                    "incoming execution fence changes the persisted repository reservation"
+                );
+            }
+            (None, Some(_)) => {
+                return Err(anyhow!(
+                    "existing workflow has no persisted execution fence; refusing to retrofit scheduler authority"
+                ));
+            }
+            (Some(_), None) => {
+                return Err(anyhow!("existing fenced workflow cannot be resumed without its execution fence"));
+            }
+            (None, None) => {}
+        }
+        validate_execution_subject(execution, existing.subject.as_ref())?;
+    }
+    Ok(())
+}
+
+fn validate_execution_subject(execution: Option<&ExecutionFence>, subject: Option<&SubjectRef>) -> Result<()> {
+    let Some(execution_subject) = execution.and_then(|execution| execution.subject.as_ref()) else {
+        return Ok(());
+    };
+    let subject =
+        subject.ok_or_else(|| anyhow!("subject-bearing execution fence cannot target a subjectless workflow"))?;
+    let kind = subject.kind();
+    let short_kind = kind.rsplit('.').next().unwrap_or(kind);
+    let native_id = match subject.id().split_once(':') {
+        Some((prefix, native)) if prefix.eq_ignore_ascii_case(kind) || prefix.eq_ignore_ascii_case(short_kind) => {
+            native
+        }
+        _ => subject.id(),
+    };
+    let expected = format!("{short_kind}:{native_id}");
+    anyhow::ensure!(
+        execution_subject.qualified_id == expected,
+        "execution fence subject '{}' does not match requested subject '{}'",
+        execution_subject.qualified_id,
+        expected
+    );
+    Ok(())
+}
+
+fn cleanup_is_allowed(
+    publication_required: bool,
+    cleanup: WorkflowPublicationCleanupPolicy,
+    receipt: Option<&PublicationReceipt>,
+) -> bool {
+    !publication_required
+        || (receipt.is_some() && matches!(cleanup, WorkflowPublicationCleanupPolicy::AfterRemoteVerified))
+}
+
+pub(crate) fn publication_receipt_from_value(value: &Value) -> Result<Option<PublicationReceipt>> {
+    let candidate = if value.get("schema").and_then(Value::as_str) == Some(PUBLICATION_RECEIPT_SCHEMA_ID) {
+        Some(value)
+    } else {
+        value.get("publication_receipt").or_else(|| value.get("receipt"))
+    };
+    let Some(candidate) = candidate else {
+        return Ok(None);
+    };
+    let receipt: PublicationReceipt =
+        serde_json::from_value(candidate.clone()).context("decoding publication receipt")?;
+    receipt.validate().map_err(anyhow::Error::msg)?;
+    Ok(Some(receipt))
+}
+
+fn phase_publication_receipts(results: &[Value]) -> Result<Vec<(usize, String, PublicationReceipt)>> {
+    let mut receipts = Vec::new();
+    for (index, result) in results.iter().enumerate() {
+        let phase_id = result.get("phase_id").and_then(Value::as_str).unwrap_or_default().to_string();
+        let payload = result
+            .get("publication_receipt")
+            .or_else(|| result.pointer("/outcome/Completed/result_payload"))
+            .or_else(|| result.pointer("/outcome/completed/result_payload"));
+        let Some(candidate) = payload else {
+            continue;
+        };
+        let Some(receipt) = publication_receipt_from_value(candidate)
+            .with_context(|| format!("phase '{}' emitted an invalid publication receipt", phase_id))?
+        else {
+            continue;
+        };
+        receipts.push((index, phase_id, receipt));
+    }
+    Ok(receipts)
+}
+
+fn run_publication_git(
+    project_root: &str,
+    execution_cwd: &str,
+    held_environment: Option<&dyn crate::phase_environment::HeldEnvironment>,
+    args: Vec<String>,
+) -> Result<crate::phase_git::PublicationCommandOutput> {
+    if let Some(environment) = held_environment {
+        let output = environment.exec_command(
+            Path::new(project_root),
+            "git",
+            &args,
+            &std::collections::BTreeMap::new(),
+            Some(execution_cwd),
+            None,
+            Some(std::time::Duration::from_secs(180)),
+        )?;
+        return Ok(crate::phase_git::PublicationCommandOutput {
+            success: output.exit_code == 0 && !output.timed_out,
+            stdout: output.stdout,
+            stderr: output.stderr,
+        });
+    }
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(execution_cwd)
+        .args(&args)
+        .output()
+        .with_context(|| format!("running git {} in {}", args.join(" "), execution_cwd))?;
+    Ok(crate::phase_git::PublicationCommandOutput {
+        success: output.status.success(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    })
+}
+
+pub(crate) fn canonical_remote_url(value: &str) -> Result<String> {
+    let value = value.trim();
+    anyhow::ensure!(!value.is_empty(), "publication remote URL is empty");
+    let sanitized = if let Some((scheme, rest)) = value.split_once("://") {
+        let authority_end = rest.find('/').unwrap_or(rest.len());
+        let (authority, tail) = rest.split_at(authority_end);
+        let host = authority.rsplit('@').next().unwrap_or(authority);
+        format!("{scheme}://{host}{tail}")
+    } else {
+        value.to_string()
+    };
+    Ok(sanitized.trim_end_matches('/').to_string())
+}
+
+pub(crate) fn normalized_repository_identity(value: &str) -> String {
+    let mut value = canonical_remote_url(value).unwrap_or_else(|_| value.trim().to_string());
+    if let Some(rest) = value.strip_prefix("git@") {
+        value = rest.replacen(':', "/", 1);
+    } else if let Some((_, rest)) = value.split_once("://") {
+        value = rest.trim_start_matches("git@").to_string();
+    }
+    value.trim_end_matches('/').trim_end_matches(".git").to_ascii_lowercase()
+}
+
+pub(crate) fn exact_remote_sha(output: &str, remote_ref: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let sha = fields.next()?;
+        let observed_ref = fields.next()?;
+        (observed_ref == remote_ref).then(|| sha.to_string())
+    })
+}
+
+fn verify_publication_receipt(
+    receipt: &PublicationReceipt,
+    execution: &ExecutionFence,
+    project_root: &str,
+    execution_cwd: &str,
+    held_environment: Option<&dyn crate::phase_environment::HeldEnvironment>,
+) -> Result<String> {
+    receipt.validate_against_execution(execution).map_err(anyhow::Error::msg)?;
+    let repository = execution
+        .repository
+        .as_ref()
+        .ok_or_else(|| anyhow!("publication receipt requires a repository reservation"))?;
+    let remote_output = run_publication_git(
+        project_root,
+        execution_cwd,
+        held_environment,
+        vec!["config".into(), "--get".into(), "remote.origin.url".into()],
+    )?;
+    anyhow::ensure!(remote_output.success, "failed to resolve canonical origin URL");
+    let canonical_remote = canonical_remote_url(remote_output.stdout.trim())?;
+    let expected_identity = normalized_repository_identity(&repository.repository);
+    anyhow::ensure!(
+        normalized_repository_identity(&canonical_remote) == expected_identity,
+        "checkout origin does not match the fenced repository reservation"
+    );
+    anyhow::ensure!(
+        normalized_repository_identity(&receipt.remote) == expected_identity,
+        "publication receipt remote does not match the fenced repository reservation"
+    );
+
+    let observed = run_publication_git(
+        project_root,
+        execution_cwd,
+        held_environment,
+        vec!["ls-remote".into(), "--refs".into(), "origin".into(), receipt.remote_ref.clone()],
+    )?;
+    anyhow::ensure!(observed.success, "failed to observe publication remote ref");
+    let observed_sha = exact_remote_sha(&observed.stdout, &receipt.remote_ref)
+        .ok_or_else(|| anyhow!("publication remote ref '{}' was not found", receipt.remote_ref))?;
+    anyhow::ensure!(
+        observed_sha == receipt.commit_sha && observed_sha == receipt.observed_remote_sha,
+        "publication remote ref is not exactly at the receipt commit"
+    );
+
+    let proof = crate::phase_git::PublicationProof {
+        commit: receipt.commit_sha.clone(),
+        tree: receipt.tree_sha.clone(),
+        remote: "origin".to_string(),
+        remote_ref: Some(receipt.remote_ref.clone()),
+        recovery_ref: Some(receipt.recovery_ref.clone()),
+        bundle_path: None,
+        diagnostic: None,
+    };
+    anyhow::ensure!(
+        crate::phase_git::verify_publication_proof_with(&proof, |args| {
+            run_publication_git(project_root, execution_cwd, held_environment, args)
+        })?,
+        "publication receipt commit/tree proof failed independent remote verification"
+    );
+    Ok(canonical_remote)
+}
+
+fn issue_runner_publication_receipt(
+    post_success: &Value,
+    execution: &ExecutionFence,
+    project_root: &str,
+    execution_cwd: &str,
+    held_environment: Option<&dyn crate::phase_environment::HeldEnvironment>,
+) -> Result<PublicationReceipt> {
+    let proof: crate::phase_git::PublicationProof = serde_json::from_value(
+        post_success
+            .get("proof")
+            .cloned()
+            .ok_or_else(|| anyhow!("runner publication completed without a typed git proof"))?,
+    )
+    .context("decoding runner publication proof")?;
+    anyhow::ensure!(proof.is_durable(), "runner publication proof is not durable");
+    let remote_ref = proof.remote_ref.clone().ok_or_else(|| anyhow!("publication proof has no remote ref"))?;
+    let subject = execution
+        .subject
+        .as_ref()
+        .ok_or_else(|| anyhow!("runner publication receipt requires a subject generation"))?;
+    let remote_output = run_publication_git(
+        project_root,
+        execution_cwd,
+        held_environment,
+        vec!["config".into(), "--get".into(), "remote.origin.url".into()],
+    )?;
+    anyhow::ensure!(remote_output.success, "failed to resolve canonical origin URL");
+    let remote = canonical_remote_url(remote_output.stdout.trim())?;
+    let pull_request_url = post_success
+        .get("pull_request")
+        .or_else(|| post_success.get("recovery_pull_request"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("runner publication completed without an exact-head pull request"))?;
+    let pull_request_number = pull_request_url
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| anyhow!("pull request URL has no numeric PR id"))?;
+    let pull_request = Some(PublicationPullRequest {
+        number: pull_request_number,
+        url: pull_request_url.to_string(),
+        head_sha: proof.commit.clone(),
+    });
+    let receipt = PublicationReceipt {
+        schema: PUBLICATION_RECEIPT_SCHEMA_ID.to_string(),
+        version: PUBLICATION_RECEIPT_VERSION,
+        workflow_id: execution.workflow_id.clone(),
+        workflow_generation: execution.workflow_generation,
+        subject: PublicationSubjectGeneration {
+            qualified_id: subject.qualified_id.clone(),
+            generation: subject.generation,
+        },
+        commit_sha: proof.commit,
+        tree_sha: proof.tree,
+        remote,
+        remote_ref: remote_ref.clone(),
+        observed_remote_sha: String::new(),
+        recovery_ref: proof.recovery_ref.unwrap_or_else(|| remote_ref.clone()),
+        pull_request,
+        issuer: PublicationReceiptIssuer::Runner {
+            component: env!("CARGO_PKG_NAME").to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        },
+        issued_at: chrono::Utc::now(),
+    };
+    let mut receipt = receipt;
+    let observed = run_publication_git(
+        project_root,
+        execution_cwd,
+        held_environment,
+        vec!["ls-remote".into(), "--refs".into(), "origin".into(), receipt.remote_ref.clone()],
+    )?;
+    anyhow::ensure!(observed.success, "failed to observe publication remote ref");
+    receipt.observed_remote_sha = exact_remote_sha(&observed.stdout, &receipt.remote_ref)
+        .ok_or_else(|| anyhow!("publication remote ref '{}' was not found", receipt.remote_ref))?;
+    verify_publication_receipt(&receipt, execution, project_root, execution_cwd, held_environment)?;
+    Ok(receipt)
 }
 
 #[cfg(test)]
@@ -1546,41 +2090,171 @@ mod publication_cleanup_tests {
         }
     }
 
+    fn publication_receipt() -> PublicationReceipt {
+        let commit = "1".repeat(40);
+        PublicationReceipt {
+            schema: PUBLICATION_RECEIPT_SCHEMA_ID.to_string(),
+            version: PUBLICATION_RECEIPT_VERSION,
+            workflow_id: "wf-publication".to_string(),
+            workflow_generation: 1,
+            subject: PublicationSubjectGeneration { qualified_id: "task:TASK-PUBLICATION".to_string(), generation: 1 },
+            commit_sha: commit.clone(),
+            tree_sha: "2".repeat(40),
+            remote: "https://github.com/launchapp-dev/example.git".to_string(),
+            remote_ref: "refs/heads/animus/TASK-PUBLICATION".to_string(),
+            observed_remote_sha: commit,
+            recovery_ref: "refs/animus/recovery/wf-publication".to_string(),
+            pull_request: None,
+            issuer: PublicationReceiptIssuer::Runner {
+                component: env!("CARGO_PKG_NAME").to_string(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+            },
+            issued_at: chrono::Utc::now(),
+        }
+    }
+
+    fn required_runner_publication() -> WorkflowPublicationConfig {
+        WorkflowPublicationConfig {
+            schema: orchestrator_config::WORKFLOW_PUBLICATION_SCHEMA_ID.to_string(),
+            version: orchestrator_config::WORKFLOW_PUBLICATION_VERSION,
+            required: true,
+            owner: Some(WorkflowPublicationOwner::Runner),
+            cleanup: WorkflowPublicationCleanupPolicy::AfterRemoteVerified,
+        }
+    }
+
+    fn publication_params(execution_fence: Option<ExecutionFence>) -> WorkflowExecuteInternalParams {
+        WorkflowExecuteInternalParams {
+            project_root: "/tmp/publication-authority".to_string(),
+            workflow_id: None,
+            bootstrap_workflow_id: Some("wf-publication".to_string()),
+            execution_fence,
+            task_id: Some("TASK-PUBLICATION".to_string()),
+            requirement_id: None,
+            subject_id: None,
+            title: None,
+            description: None,
+            workflow_ref: Some("coding".to_string()),
+            input: None,
+            vars: HashMap::new(),
+            model: None,
+            tool: None,
+            phase_timeout_secs: None,
+            phase_filter: None,
+            phase_routing: None,
+            mcp_config: None,
+            actor: None,
+        }
+    }
+
+    fn coding_execution_fence() -> ExecutionFence {
+        let mut execution = ExecutionFence::direct(
+            "wf-publication",
+            1,
+            Some(animus_execution_protocol::SubjectGeneration {
+                qualified_id: "task:TASK-PUBLICATION".to_string(),
+                generation: 1,
+            }),
+        );
+        execution.queue_lease = Some(animus_execution_protocol::QueueLeaseFence {
+            entry_id: "queue-entry".to_string(),
+            owner_id: "daemon-generation".to_string(),
+            generation: 1,
+            expires_at: chrono::Utc::now() + chrono::Duration::minutes(5),
+        });
+        execution.repository = Some(animus_execution_protocol::RepositoryReservation {
+            repository: "https://github.com/launchapp-dev/example.git".to_string(),
+            base_ref: "refs/heads/main".to_string(),
+            head_ref: "refs/heads/animus/TASK-PUBLICATION".to_string(),
+        });
+        execution
+    }
+
     #[test]
     fn unpublished_commit_blocks_environment_cleanup() {
-        assert!(!cleanup_is_allowed(
-            true,
-            &serde_json::json!({
-                "status": "failed",
-                "publication_durable": false,
-            })
-        ));
+        assert!(!cleanup_is_allowed(true, WorkflowPublicationCleanupPolicy::AfterRemoteVerified, None,));
     }
 
     #[test]
     fn durable_recovery_ref_allows_cleanup() {
         assert!(cleanup_is_allowed(
             true,
-            &serde_json::json!({
-                "status": "conflict",
-                "publication_durable": true,
-            })
+            WorkflowPublicationCleanupPolicy::AfterRemoteVerified,
+            Some(&publication_receipt()),
         ));
     }
 
     #[test]
     fn missing_publication_evidence_blocks_cleanup() {
-        assert!(!cleanup_is_allowed(true, &serde_json::json!({ "status": "skipped" })));
-        assert!(!cleanup_is_allowed(true, &Value::Null));
-        assert!(cleanup_is_allowed(false, &Value::Null));
+        assert!(!cleanup_is_allowed(true, WorkflowPublicationCleanupPolicy::AfterRemoteVerified, None));
+        assert!(!cleanup_is_allowed(true, WorkflowPublicationCleanupPolicy::Retain, Some(&publication_receipt()),));
+        assert!(cleanup_is_allowed(false, WorkflowPublicationCleanupPolicy::Retain, None));
     }
 
     #[test]
-    fn publication_semantics_are_scoped_to_coding() {
-        assert!(workflow_requires_publication("coding"));
-        assert!(workflow_requires_publication("launchapp/coding"));
-        assert!(workflow_requires_publication("pack:coding"));
-        assert!(!workflow_requires_publication("planning"));
+    fn publication_semantics_are_explicit_and_never_inferred_from_workflow_names() {
+        let mut config: orchestrator_core::WorkflowConfig = serde_json::from_value(serde_json::json!({
+            "schema": "animus.workflow-config",
+            "version": 1,
+            "default_workflow_ref": "coding",
+            "workflows": [{
+                "id": "coding",
+                "name": "Coding",
+                "phases": []
+            }]
+        }))
+        .expect("minimal workflow config");
+
+        assert!(workflow_publication_contract(&config, "coding").unwrap().is_none());
+
+        config.workflows[0].id = "planning".to_string();
+        config.workflows[0].publication = Some(required_runner_publication());
+        assert!(workflow_publication_contract(&config, "planning").unwrap().is_some());
+    }
+
+    #[test]
+    fn required_publication_refuses_missing_incomplete_or_mismatched_scheduler_authority() {
+        let publication = required_runner_publication();
+        let missing = validate_execution_authority(&publication_params(None), None, Some(&publication))
+            .expect_err("required publication must be fenced");
+        assert!(missing.to_string().contains("no execution fence"));
+
+        let mut incomplete = coding_execution_fence();
+        incomplete.queue_lease = None;
+        let incomplete_error =
+            validate_execution_authority(&publication_params(Some(incomplete)), None, Some(&publication))
+                .expect_err("coding publication must be queue-backed");
+        assert!(incomplete_error.to_string().contains("requires queue_lease"));
+
+        let valid = coding_execution_fence();
+        validate_execution_authority(&publication_params(Some(valid.clone())), None, Some(&publication))
+            .expect("exact scheduler authority");
+
+        let mut mismatched = valid;
+        mismatched.workflow_id = "wf-stale".to_string();
+        let mismatch_error =
+            validate_execution_authority(&publication_params(Some(mismatched)), None, Some(&publication))
+                .expect_err("fence must name the scheduler-selected workflow");
+        assert!(mismatch_error.to_string().contains("does not match requested workflow"));
+    }
+
+    #[test]
+    fn pull_request_proof_requires_exact_head_base_and_canonical_url() {
+        let commit = "1".repeat(40);
+        let output = format!("{commit}\thttps://github.com/launchapp-dev/example/pull/42\tmain\n");
+        assert_eq!(
+            parse_verified_pull_request(&output, &commit, "main").unwrap(),
+            "https://github.com/launchapp-dev/example/pull/42"
+        );
+        assert!(parse_verified_pull_request(&output, &"2".repeat(40), "main").is_err());
+        assert!(parse_verified_pull_request(&output, &commit, "release").is_err());
+        assert!(parse_verified_pull_request(&format!("{commit}\t\tmain\n"), &commit, "main").is_err());
+    }
+
+    #[test]
+    fn normal_and_recovery_pull_requests_have_distinct_audit_bodies() {
+        assert!(publication_pull_request_body(false).contains("all workflow gates completed"));
+        assert!(publication_pull_request_body(true).contains("non-fast-forward publication collision"));
     }
 
     #[test]
@@ -1601,7 +2275,7 @@ mod publication_cleanup_tests {
 
         // Exercise the same interception point as the real runner, before it
         // hands a Rework verdict to complete_current_phase_with_decision.
-        assert!(intercept_non_retryable_publication_denial("code-open-pr", &mut outcome, Some(commit), Some(tree),));
+        assert!(intercept_non_retryable_publication_denial(true, &mut outcome, Some(commit), Some(tree),));
         if matches!(
             &outcome,
             PhaseExecutionOutcome::Completed {
@@ -1611,7 +2285,7 @@ mod publication_cleanup_tests {
         ) {
             code_reworks += 1;
         }
-        if cleanup_is_allowed(true, &serde_json::json!({"publication_durable": false})) {
+        if cleanup_is_allowed(true, WorkflowPublicationCleanupPolicy::AfterRemoteVerified, None) {
             teardowns += 1;
         }
 
@@ -1632,11 +2306,11 @@ mod publication_cleanup_tests {
     #[test]
     fn successful_runner_publication_performs_exactly_one_teardown() {
         let mut teardowns = 0;
-        let post_success = serde_json::json!({"publication_durable": true});
+        let receipt = publication_receipt();
 
         // The runner owns one guard for its one prepared environment. Dropping
         // that guard consults this gate once after successful publication.
-        if cleanup_is_allowed(true, &post_success) {
+        if cleanup_is_allowed(true, WorkflowPublicationCleanupPolicy::AfterRemoteVerified, Some(&receipt)) {
             teardowns += 1;
         }
 
@@ -1650,7 +2324,7 @@ mod publication_cleanup_tests {
             "fatal: unable to access github.com: connection timed out",
         ] {
             let outcome = publication_outcome(PhaseDecisionVerdict::Rework, reason);
-            assert!(non_retryable_publication_diagnostic("code-open-pr", &outcome).is_none());
+            assert!(non_retryable_publication_diagnostic(true, &outcome).is_none());
         }
     }
 
@@ -1667,10 +2341,10 @@ mod publication_cleanup_tests {
             ),
         };
 
-        let diagnostic = non_retryable_command_publication_diagnostic("code-open-pr", &failure)
+        let diagnostic = non_retryable_command_publication_diagnostic(true, &failure)
             .expect("the terminal command stderr must reach publication-denial classification");
         assert!(diagnostic.contains("workflows` permission"));
-        assert!(non_retryable_command_publication_diagnostic("code-check", &failure).is_none());
+        assert!(non_retryable_command_publication_diagnostic(false, &failure).is_none());
     }
 
     #[test]
@@ -1964,6 +2638,7 @@ mod existing_workflow_subject_tests {
     fn running_workflow(subject: SubjectRef) -> OrchestratorWorkflow {
         OrchestratorWorkflow {
             id: "workflow-one-id".to_string(),
+            execution_fence: None,
             task_id: subject.id().to_string(),
             workflow_ref: Some("coding".to_string()),
             subject: Some(subject),
@@ -1989,6 +2664,7 @@ mod existing_workflow_subject_tests {
             project_root: "/node".to_string(),
             workflow_id: Some("workflow-one-id".to_string()),
             bootstrap_workflow_id: None,
+            execution_fence: None,
             task_id: task_id.map(str::to_string),
             requirement_id: requirement_id.map(str::to_string),
             subject_id: None,
@@ -2509,6 +3185,7 @@ async fn execute_post_success_actions(
     workflow_config: &orchestrator_core::WorkflowConfig,
     execution_cwd: &str,
     held_environment: Option<&dyn crate::phase_environment::HeldEnvironment>,
+    execution_fence: Option<&ExecutionFence>,
 ) -> Value {
     let workflow_ref = workflow.workflow_ref.as_deref().unwrap_or(workflow_config.default_workflow_ref.as_str());
     let workflow_def = workflow_config
@@ -2588,6 +3265,48 @@ async fn execute_post_success_actions(
             }
         }
     };
+    let Some(reserved_head_ref) = execution_fence
+        .and_then(|execution| execution.repository.as_ref())
+        .map(|repository| repository.head_ref.as_str())
+    else {
+        return serde_json::json!({
+            "status": "failed",
+            "publication_durable": false,
+            "reason": "runner publication requires a fenced repository head",
+            "workflow_ref": workflow_ref_id,
+        });
+    };
+    let Some(reserved_branch) = reserved_head_ref.strip_prefix("refs/heads/") else {
+        return serde_json::json!({
+            "status": "failed",
+            "publication_durable": false,
+            "reason": "runner publication repository head is not a fully qualified branch ref",
+            "workflow_ref": workflow_ref_id,
+        });
+    };
+    if branch != reserved_branch {
+        return serde_json::json!({
+            "status": "failed",
+            "publication_durable": false,
+            "reason": format!(
+                "checkout branch '{}' does not match fenced publication head '{}'",
+                branch,
+                reserved_head_ref
+            ),
+            "workflow_ref": workflow_ref_id,
+        });
+    }
+    let Some(reserved_base_branch) = execution_fence
+        .and_then(|execution| execution.repository.as_ref())
+        .and_then(|repository| repository.base_ref.strip_prefix("refs/heads/"))
+    else {
+        return serde_json::json!({
+            "status": "failed",
+            "publication_durable": false,
+            "reason": "runner publication repository base is not a fully qualified branch ref",
+            "workflow_ref": workflow_ref_id,
+        });
+    };
 
     let durable_root = Path::new(project_root).join(".animus").join("publication-recovery").join(&workflow.id);
     let publication = if let Some(environment) = held_environment {
@@ -2612,32 +3331,41 @@ async fn execute_post_success_actions(
     };
 
     match publication {
-        Ok(proof) if proof.is_durable() && proof.recovery_ref.is_none() => serde_json::json!({
-            "status": "completed",
-            "publication_durable": true,
-            "workflow_ref": workflow_ref_id,
-            "proof": proof,
-        }),
         Ok(proof) if proof.is_durable() => {
-            let recovery_ref = proof.recovery_ref.as_deref().expect("recovery proof has a recovery ref");
-            let recovery_pr = if let Some(environment) = held_environment {
-                ensure_recovery_pull_request_in_environment(
+            let published_ref = proof
+                .recovery_ref
+                .as_deref()
+                .or(proof.remote_ref.as_deref())
+                .expect("a durable publication proof must carry either the reserved remote ref or a recovery ref");
+            let recovery = proof.recovery_ref.is_some();
+            let pull_request = if let Some(environment) = held_environment {
+                ensure_publication_pull_request_in_environment(
                     project_root,
                     execution_cwd,
                     environment,
-                    recovery_ref,
+                    published_ref,
+                    reserved_base_branch,
                     &proof.commit,
                     task_title,
+                    recovery,
                 )
             } else {
-                ensure_recovery_pull_request(execution_cwd, recovery_ref, &proof.commit, task_title).await
+                ensure_publication_pull_request(
+                    execution_cwd,
+                    published_ref,
+                    reserved_base_branch,
+                    &proof.commit,
+                    task_title,
+                    recovery,
+                )
+                .await
             };
-            match recovery_pr {
+            match pull_request {
                 Ok(url) => serde_json::json!({
                     "status": "completed",
                     "publication_durable": true,
                     "reason": proof.diagnostic,
-                    "recovery_pull_request": url,
+                    "pull_request": url,
                     "workflow_ref": workflow_ref_id,
                     "proof": proof,
                 }),
@@ -2666,8 +3394,11 @@ async fn execute_post_success_actions(
     }
 }
 
-fn non_retryable_publication_diagnostic(phase_id: &str, outcome: &PhaseExecutionOutcome) -> Option<String> {
-    if !phase_id.eq_ignore_ascii_case("code-open-pr") {
+fn non_retryable_publication_diagnostic(
+    phase_owns_publication: bool,
+    outcome: &PhaseExecutionOutcome,
+) -> Option<String> {
+    if !phase_owns_publication {
         return None;
     }
     let PhaseExecutionOutcome::Completed { phase_decision: Some(decision), result_payload, .. } = outcome else {
@@ -2685,10 +3416,10 @@ fn non_retryable_publication_diagnostic(phase_id: &str, outcome: &PhaseExecution
 }
 
 fn non_retryable_command_publication_diagnostic(
-    phase_id: &str,
+    phase_owns_publication: bool,
     error: &crate::phase_command::CommandPhaseFailedError,
 ) -> Option<String> {
-    if !phase_id.eq_ignore_ascii_case("code-open-pr") {
+    if !phase_owns_publication {
         return None;
     }
     let mut diagnostic = error.message.clone();
@@ -2700,12 +3431,12 @@ fn non_retryable_command_publication_diagnostic(
 }
 
 fn intercept_non_retryable_publication_denial(
-    phase_id: &str,
+    phase_owns_publication: bool,
     outcome: &mut PhaseExecutionOutcome,
     commit: Option<&str>,
     tree: Option<&str>,
 ) -> bool {
-    let Some(diagnostic) = non_retryable_publication_diagnostic(phase_id, outcome) else {
+    let Some(diagnostic) = non_retryable_publication_diagnostic(phase_owns_publication, outcome) else {
         return false;
     };
     *outcome = PhaseExecutionOutcome::ManualPending {
@@ -2808,25 +3539,47 @@ fn unpublished_git_identity(
     (resolve("HEAD^{commit}"), resolve("HEAD^{tree}"))
 }
 
-fn ensure_recovery_pull_request_in_environment(
+fn publication_pull_request_body(recovery: bool) -> &'static str {
+    if recovery {
+        "Animus recovered this exact reviewed commit after a concurrent non-fast-forward publication collision."
+    } else {
+        "Animus published this exact reviewed commit after all workflow gates completed."
+    }
+}
+
+fn parse_verified_pull_request(output: &str, expected_commit: &str, expected_base: &str) -> Result<String> {
+    let mut fields = output.trim().splitn(3, '\t');
+    let actual_commit = fields.next().unwrap_or_default();
+    let url = fields.next().unwrap_or_default();
+    let actual_base = fields.next().unwrap_or_default();
+    anyhow::ensure!(actual_commit == expected_commit, "pull-request head does not match the reviewed commit");
+    anyhow::ensure!(actual_base == expected_base, "pull-request base does not match the fenced base branch");
+    anyhow::ensure!(!url.trim().is_empty(), "pull-request verification returned no canonical URL");
+    Ok(url.to_string())
+}
+
+fn ensure_publication_pull_request_in_environment(
     project_root: &str,
     execution_cwd: &str,
     environment: &dyn crate::phase_environment::HeldEnvironment,
-    recovery_ref: &str,
+    published_ref: &str,
+    base_branch: &str,
     expected_commit: &str,
     title: &str,
+    recovery: bool,
 ) -> Result<String> {
-    let head = recovery_ref.strip_prefix("refs/heads/").unwrap_or(recovery_ref);
+    let head = published_ref.strip_prefix("refs/heads/").unwrap_or(published_ref);
     let create_args = vec![
         "pr".to_string(),
         "create".to_string(),
         "--head".to_string(),
         head.to_string(),
+        "--base".to_string(),
+        base_branch.to_string(),
         "--title".to_string(),
         title.to_string(),
         "--body".to_string(),
-        "Animus recovered this exact reviewed commit after a concurrent non-fast-forward publication collision."
-            .to_string(),
+        publication_pull_request_body(recovery).to_string(),
     ];
     let create = environment.exec_command(
         Path::new(project_root),
@@ -2838,10 +3591,7 @@ fn ensure_recovery_pull_request_in_environment(
         Some(std::time::Duration::from_secs(120)),
     )?;
     if create.exit_code != 0 && !create.stderr.to_ascii_lowercase().contains("already exists") {
-        anyhow::bail!(
-            "recovery pull-request creation failed: {}",
-            crate::phase_git::redact_git_diagnostic(&create.stderr)
-        );
+        anyhow::bail!("pull-request creation failed: {}", crate::phase_git::redact_git_diagnostic(&create.stderr));
     }
 
     let view_args = vec![
@@ -2849,9 +3599,9 @@ fn ensure_recovery_pull_request_in_environment(
         "view".to_string(),
         head.to_string(),
         "--json".to_string(),
-        "headRefOid,url".to_string(),
+        "headRefOid,url,baseRefName".to_string(),
         "--jq".to_string(),
-        "[.headRefOid,.url]|@tsv".to_string(),
+        "[.headRefOid,.url,.baseRefName]|@tsv".to_string(),
     ];
     let view = environment.exec_command(
         Path::new(project_root),
@@ -2863,72 +3613,65 @@ fn ensure_recovery_pull_request_in_environment(
         Some(std::time::Duration::from_secs(120)),
     )?;
     if view.exit_code != 0 || view.timed_out {
-        anyhow::bail!(
-            "recovery pull-request verification failed: {}",
-            crate::phase_git::redact_git_diagnostic(&view.stderr)
-        );
+        anyhow::bail!("pull-request verification failed: {}", crate::phase_git::redact_git_diagnostic(&view.stderr));
     }
-    let mut fields = view.stdout.trim().splitn(2, '\t');
-    let actual_commit = fields.next().unwrap_or_default();
-    let url = fields.next().unwrap_or_default();
-    if actual_commit != expected_commit {
-        anyhow::bail!("recovery pull-request head does not match the reviewed commit");
-    }
-    Ok(url.to_string())
+    parse_verified_pull_request(&view.stdout, expected_commit, base_branch)
 }
 
-async fn ensure_recovery_pull_request(
+async fn ensure_publication_pull_request(
     cwd: &str,
-    recovery_ref: &str,
+    published_ref: &str,
+    base_branch: &str,
     expected_commit: &str,
     title: &str,
+    recovery: bool,
 ) -> Result<String> {
-    let head = recovery_ref.strip_prefix("refs/heads/").unwrap_or(recovery_ref);
+    let head = published_ref.strip_prefix("refs/heads/").unwrap_or(published_ref);
     let create = tokio::process::Command::new("gh")
         .args([
             "pr",
             "create",
             "--head",
             head,
+            "--base",
+            base_branch,
             "--title",
             title,
             "--body",
-            "Animus recovered this exact reviewed commit after a concurrent non-fast-forward publication collision.",
+            publication_pull_request_body(recovery),
         ])
         .current_dir(cwd)
         .output()
         .await
-        .context("starting recovery pull-request publication")?;
+        .context("starting pull-request publication")?;
     let create_stderr = String::from_utf8_lossy(&create.stderr);
     // `gh pr create` is not idempotent, so an existing-PR result proceeds to
     // the authoritative `pr view` exact-head check.
     if !create.status.success() && !create_stderr.to_ascii_lowercase().contains("already exists") {
-        anyhow::bail!(
-            "recovery pull-request creation failed: {}",
-            crate::phase_git::redact_git_diagnostic(&create_stderr)
-        );
+        anyhow::bail!("pull-request creation failed: {}", crate::phase_git::redact_git_diagnostic(&create_stderr));
     }
 
     let view = tokio::process::Command::new("gh")
-        .args(["pr", "view", head, "--json", "headRefOid,url", "--jq", "[.headRefOid,.url]|@tsv"])
+        .args([
+            "pr",
+            "view",
+            head,
+            "--json",
+            "headRefOid,url,baseRefName",
+            "--jq",
+            "[.headRefOid,.url,.baseRefName]|@tsv",
+        ])
         .current_dir(cwd)
         .output()
         .await
-        .context("verifying recovery pull-request head")?;
+        .context("verifying pull-request head")?;
     if !view.status.success() {
         anyhow::bail!(
-            "recovery pull-request verification failed: {}",
+            "pull-request verification failed: {}",
             crate::phase_git::redact_git_diagnostic(&String::from_utf8_lossy(&view.stderr))
         );
     }
-    let stdout = String::from_utf8_lossy(&view.stdout);
-    let mut fields = stdout.trim().splitn(2, '\t');
-    let actual_commit = fields.next().unwrap_or_default();
-    let url = fields.next().unwrap_or_default();
-    if actual_commit != expected_commit {
-        anyhow::bail!("recovery pull-request head does not match the reviewed commit");
-    }
-    Ok(url.to_string())
+    parse_verified_pull_request(&String::from_utf8_lossy(&view.stdout), expected_commit, base_branch)
 }
 
 #[cfg(test)]

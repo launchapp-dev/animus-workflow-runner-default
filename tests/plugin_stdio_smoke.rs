@@ -110,9 +110,6 @@ fn initialize_then_workflow_execute_round_trip() {
     assert!(init_response.get("error").is_none(), "initialize should succeed; got {init_response:?}",);
     let result = init_response.get("result").expect("initialize result");
     assert_eq!(result["plugin_info"]["plugin_kind"], "workflow_runner");
-    // `kind_capabilities` was removed from `InitializeResult` in the current
-    // animus-cli plugin protocol; the surviving capability surface is
-    // `capabilities.methods`.
     let methods = result["capabilities"]["methods"].as_array().expect("capabilities.methods");
     assert!(
         methods.iter().any(|m| m == "workflow/execute"),
@@ -122,6 +119,10 @@ fn initialize_then_workflow_execute_round_trip() {
         methods.iter().any(|m| m == "workflow/run_phase"),
         "initialize must advertise workflow/run_phase; got {methods:?}"
     );
+    let runner_capabilities = &result["kind_capabilities"]["workflow_runner"];
+    assert_eq!(runner_capabilities["crate_version"], "0.4.0");
+    assert_eq!(runner_capabilities["extra"]["publication_receipt_v1"], true);
+    assert_eq!(runner_capabilities["extra"]["execution_fence_v1"], true);
 
     // 2. health/check
     let health_request = json!({

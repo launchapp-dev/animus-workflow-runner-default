@@ -1810,6 +1810,7 @@ mod tests {
 
         let request = WorkflowExecuteRequest {
             workflow_id: Some("wf-1".to_string()),
+            execution_fence: None,
             task_id: Some("TASK-1".to_string()),
             requirement_id: None,
             title: None,
