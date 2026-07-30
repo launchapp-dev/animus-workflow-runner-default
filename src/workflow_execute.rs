@@ -195,6 +195,46 @@ impl Drop for PreparedEnvironmentGuard {
     }
 }
 
+fn execution_preservation_state(
+    prepared_environment_present: bool,
+    brokered_environment_present: bool,
+    cleanup_allowed: &std::sync::atomic::AtomicBool,
+) -> Value {
+    Value::String(
+        if prepared_environment_present {
+            if cleanup_allowed.load(std::sync::atomic::Ordering::SeqCst) {
+                "workspace-release-authorized"
+            } else {
+                "workspace-retained"
+            }
+        } else if brokered_environment_present {
+            "broker-managed"
+        } else {
+            "local-worktree-retained"
+        }
+        .to_string(),
+    )
+}
+
+fn execution_failure_metadata(
+    message: &str,
+    phase_id: &str,
+    prepared_environment_present: bool,
+    brokered_environment_present: bool,
+    cleanup_allowed: &std::sync::atomic::AtomicBool,
+) -> Value {
+    let mut metadata = failure_metadata(message);
+    metadata["phase_id"] = Value::String(phase_id.to_string());
+    metadata["preservation_state"] =
+        execution_preservation_state(prepared_environment_present, brokered_environment_present, cleanup_allowed);
+    metadata
+}
+
+fn workflow_has_coding_rework_contract(workflow: &OrchestratorWorkflow) -> bool {
+    workflow.workflow_ref.as_deref().is_some_and(|reference| reference.eq_ignore_ascii_case("coding"))
+        || workflow.phases.iter().any(|phase| phase.phase_id.eq_ignore_ascii_case("code-implement"))
+}
+
 fn ensure_workflow_pack_execution_requirements(
     pack_registry: &orchestrator_config::ResolvedPackRegistry,
     workflow_config: &orchestrator_config::WorkflowConfig,
@@ -363,7 +403,7 @@ pub async fn execute_workflow_with_hub(
     if phases_to_run.is_empty() {
         return Err(anyhow!("workflow has no phases to execute"));
     }
-    let coding_rework_contract = phases_to_run.iter().any(|phase| phase.eq_ignore_ascii_case("code-implement"));
+    let coding_rework_contract = workflow_has_coding_rework_contract(&workflow);
 
     if let Err(err) = hub.daemon().start(Default::default()).await {
         eprintln!("warning: failed to auto-start runner for workflow execute: {err}");
@@ -624,7 +664,22 @@ pub async fn execute_workflow_with_hub(
         let phase_elapsed = phase_start.elapsed();
 
         match run_result {
-            Ok(result) => {
+            Ok(mut result) => {
+                let mut rework_failure = if coding_rework_contract {
+                    enforce_coding_rework_convergence(&workflow, &phase_filter, &mut result.outcome)
+                } else {
+                    None
+                };
+                if matches!(result.outcome, PhaseExecutionOutcome::ManualPending { .. }) {
+                    cleanup_allowed.store(false, std::sync::atomic::Ordering::SeqCst);
+                    if let Some(failure) = rework_failure.as_mut() {
+                        failure["preservation_state"] = execution_preservation_state(
+                            prepared_environment.is_some(),
+                            brokered_environment.is_some(),
+                            cleanup_allowed.as_ref(),
+                        );
+                    }
+                }
                 if let PhaseExecutionOutcome::Completed { phase_decision: Some(ref decision), .. } = &result.outcome {
                     emit(PhaseEvent::Decision { phase_id: &phase_filter, decision });
                 }
@@ -649,20 +704,25 @@ pub async fn execute_workflow_with_hub(
                     model: result.model.clone(),
                     tool: result.tool.clone(),
                 });
-                emit_runtime(
-                    RuntimeWorkflowEventKind::PhaseCompleted,
-                    serde_json::json!({
-                        "phase_id": phase_filter,
-                        "phase_status": phase_status,
-                    }),
-                );
-                results.push(serde_json::json!({
+                let mut completed_payload = serde_json::json!({
+                    "phase_id": phase_filter,
+                    "phase_status": phase_status,
+                });
+                if let Some(failure) = rework_failure.as_ref() {
+                    completed_payload["failure"] = failure.clone();
+                }
+                emit_runtime(RuntimeWorkflowEventKind::PhaseCompleted, completed_payload);
+                let mut phase_result = serde_json::json!({
                     "phase_id": phase_filter,
                     "status": phase_status,
                     "duration_secs": phase_elapsed.as_secs(),
                     "outcome": result.outcome,
                     "metadata": result.metadata,
-                }));
+                });
+                if let Some(failure) = rework_failure.as_ref() {
+                    phase_result["failure"] = failure.clone();
+                }
+                results.push(phase_result);
 
                 let total_duration = workflow_start.elapsed();
                 return Ok(WorkflowExecuteResult {
@@ -692,7 +752,15 @@ pub async fn execute_workflow_with_hub(
                 // arm so both paths feed the journal mapping the same shape.
                 let cmd_fail = err.downcast_ref::<crate::phase_command::CommandPhaseFailedError>();
                 let error_message = cmd_fail.map(|c| c.message.clone()).unwrap_or_else(|| err.to_string());
-                let failed_payload = match cmd_fail {
+                cleanup_allowed.store(false, std::sync::atomic::Ordering::SeqCst);
+                let failure = execution_failure_metadata(
+                    &error_message,
+                    &phase_filter,
+                    prepared_environment.is_some(),
+                    brokered_environment.is_some(),
+                    cleanup_allowed.as_ref(),
+                );
+                let mut failed_payload = match cmd_fail {
                     Some(cmd_fail) => crate::phase_command::command_phase_failed_event_payload(&phase_filter, cmd_fail),
                     None => serde_json::json!({
                         "phase_id": phase_filter,
@@ -700,6 +768,7 @@ pub async fn execute_workflow_with_hub(
                         "error": error_message,
                     }),
                 };
+                failed_payload["failure"] = failure.clone();
                 emit(PhaseEvent::Completed {
                     phase_id: &phase_filter,
                     duration: phase_elapsed,
@@ -714,6 +783,7 @@ pub async fn execute_workflow_with_hub(
                     "status": "failed",
                     "duration_secs": phase_elapsed.as_secs(),
                     "error": error_message,
+                    "failure": failure,
                 }));
                 let total_duration = workflow_start.elapsed();
                 return Ok(WorkflowExecuteResult {
@@ -973,11 +1043,21 @@ pub async fn execute_workflow_with_hub(
                     }
                 }
 
-                let rework_failure = if coding_rework_contract {
+                let mut rework_failure = if coding_rework_contract {
                     enforce_coding_rework_convergence(&workflow, &phase_id, &mut result.outcome)
                 } else {
                     None
                 };
+                if matches!(result.outcome, PhaseExecutionOutcome::ManualPending { .. }) {
+                    cleanup_allowed.store(false, std::sync::atomic::Ordering::SeqCst);
+                    if let Some(failure) = rework_failure.as_mut() {
+                        failure["preservation_state"] = execution_preservation_state(
+                            prepared_environment.is_some(),
+                            brokered_environment.is_some(),
+                            cleanup_allowed.as_ref(),
+                        );
+                    }
+                }
 
                 if let PhaseExecutionOutcome::Completed { phase_decision: Some(ref decision), .. } = &result.outcome {
                     emit(PhaseEvent::Decision { phase_id: &phase_id, decision });
@@ -1236,7 +1316,14 @@ pub async fn execute_workflow_with_hub(
                 // retry would require scheduler changes outside this PR.)
                 if err.downcast_ref::<crate::phase_executor::DispatchRetryableError>().is_some() {
                     let error_message = err.to_string();
-                    let failure = failure_metadata(&error_message);
+                    cleanup_allowed.store(false, std::sync::atomic::Ordering::SeqCst);
+                    let failure = execution_failure_metadata(
+                        &error_message,
+                        &phase_id,
+                        prepared_environment.is_some(),
+                        brokered_environment.is_some(),
+                        cleanup_allowed.as_ref(),
+                    );
                     workflow = hub.workflows().fail_current_phase(&workflow.id, error_message.clone()).await?;
                     reported_workflow_status = workflow.status;
                     emit(PhaseEvent::Completed {
@@ -1358,7 +1445,14 @@ pub async fn execute_workflow_with_hub(
                         diagnostic.push('\n');
                         diagnostic.push_str(stderr);
                     }
-                    let failure = failure_metadata(&diagnostic);
+                    cleanup_allowed.store(false, std::sync::atomic::Ordering::SeqCst);
+                    let failure = execution_failure_metadata(
+                        &diagnostic,
+                        &phase_id,
+                        prepared_environment.is_some(),
+                        brokered_environment.is_some(),
+                        cleanup_allowed.as_ref(),
+                    );
                     workflow = hub.workflows().fail_current_phase(&workflow.id, cmd_fail.message.clone()).await?;
                     reported_workflow_status = workflow.status;
                     emit(PhaseEvent::Completed {
@@ -1385,7 +1479,14 @@ pub async fn execute_workflow_with_hub(
                     break;
                 }
                 let error_message = err.to_string();
-                let failure = failure_metadata(&error_message);
+                cleanup_allowed.store(false, std::sync::atomic::Ordering::SeqCst);
+                let failure = execution_failure_metadata(
+                    &error_message,
+                    &phase_id,
+                    prepared_environment.is_some(),
+                    brokered_environment.is_some(),
+                    cleanup_allowed.as_ref(),
+                );
                 workflow = hub.workflows().fail_current_phase(&workflow.id, error_message.clone()).await?;
                 reported_workflow_status = workflow.status;
                 emit(PhaseEvent::Completed {
@@ -1610,7 +1711,18 @@ pub async fn execute_workflow_with_hub(
     // Cancellation is the sole operator-controlled escape hatch from the
     // publication hold. A paused authorization denial keeps this false;
     // durable publication sets it above; explicit cancellation releases it.
-    if reported_workflow_status == WorkflowStatus::Cancelled {
+    if matches!(reported_workflow_status, WorkflowStatus::Failed | WorkflowStatus::Escalated) {
+        cleanup_allowed.store(false, std::sync::atomic::Ordering::SeqCst);
+        let reason = workflow.failure_reason.as_deref().unwrap_or("workflow failed without a recorded reason");
+        let failure = execution_failure_metadata(
+            reason,
+            "post-success",
+            prepared_environment.is_some(),
+            brokered_environment.is_some(),
+            cleanup_allowed.as_ref(),
+        );
+        post_success["failure"] = failure;
+    } else if reported_workflow_status == WorkflowStatus::Cancelled {
         cleanup_allowed.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
@@ -1630,6 +1742,7 @@ pub async fn execute_workflow_with_hub(
             RuntimeWorkflowEventKind::WorkflowFailed,
             serde_json::json!({
                 "final_status": format!("{:?}", reported_workflow_status).to_ascii_lowercase(),
+                "failure": post_success.get("failure").cloned().unwrap_or(Value::Null),
             }),
         ),
         _ => {}
@@ -3134,9 +3247,66 @@ fn enforce_coding_rework_convergence(
 #[cfg(test)]
 mod rework_convergence_tests {
     use super::*;
-    use orchestrator_core::{
-        PhaseDecision, WorkflowDecisionAction, WorkflowDecisionRecord, WorkflowDecisionRisk, WorkflowDecisionSource,
+    use orchestrator_config::{
+        builtin_agent_runtime_config, builtin_workflow_config, write_agent_runtime_config, write_workflow_config,
+        AgentProfile, CommandCwdMode, Idempotency, PhaseCommandDefinition, PhaseExecutionDefinition,
+        PhaseExecutionMode, PhaseUiDefinition, WorkflowDefinition,
     };
+    use orchestrator_core::{
+        services::InMemoryServiceHub, PhaseDecision, Priority, TaskCreateInput, TaskType, WorkflowDecisionAction,
+        WorkflowDecisionRecord, WorkflowDecisionRisk, WorkflowDecisionSource,
+    };
+    use std::collections::BTreeMap;
+    use std::sync::{atomic::AtomicBool, Mutex};
+
+    #[derive(Default)]
+    struct CapturedEvents(Mutex<Vec<RuntimeWorkflowEvent>>);
+
+    impl crate::workflow_event_emitter::WorkflowEventEmitter for CapturedEvents {
+        fn emit(&self, event: RuntimeWorkflowEvent) {
+            self.0.lock().expect("event lock").push(event);
+        }
+    }
+
+    fn command_phase(program: &str, args: Vec<String>) -> PhaseExecutionDefinition {
+        PhaseExecutionDefinition {
+            mode: PhaseExecutionMode::Command,
+            agent_id: None,
+            directive: None,
+            system_prompt: None,
+            runtime: None,
+            capabilities: None,
+            output_contract: None,
+            output_json_schema: None,
+            decision_contract: None,
+            retry: None,
+            skills: Vec::new(),
+            command: Some(PhaseCommandDefinition {
+                program: program.to_string(),
+                args,
+                env: BTreeMap::new(),
+                cwd_mode: CommandCwdMode::ProjectRoot,
+                cwd_path: None,
+                timeout_secs: Some(10),
+                success_exit_codes: vec![0],
+                parse_json_output: false,
+                expected_result_kind: None,
+                expected_schema: None,
+                category: None,
+                failure_pattern: None,
+                excerpt_max_chars: None,
+                on_success_verdict: None,
+                on_failure_verdict: Some("rework".to_string()),
+                confidence: Some(1.0),
+                failure_risk: None,
+            }),
+            manual: None,
+            default_tool: None,
+            idempotency: Idempotency::Unknown,
+            worktree: None,
+            evals: None,
+        }
+    }
 
     fn workflow(history: Vec<WorkflowDecisionRecord>) -> OrchestratorWorkflow {
         OrchestratorWorkflow {
@@ -3211,6 +3381,153 @@ mod rework_convergence_tests {
         };
         assert!(decision.reason.contains("[animus-rework-v1"));
         assert!(decision.reason.contains("retry_owner=implementation"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn phase_filtered_coding_resume_keeps_the_non_code_rework_guard() {
+        let _state_guard = crate::test_env::scoped_state_serializer();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut workflow_config = builtin_workflow_config();
+        workflow_config.default_workflow_ref = "coding".to_string();
+        for phase_id in ["code-implement", "code-check"] {
+            workflow_config.phase_catalog.insert(
+                phase_id.to_string(),
+                PhaseUiDefinition {
+                    label: phase_id.to_string(),
+                    description: "Filtered resume fixture phase".to_string(),
+                    category: "verification".to_string(),
+                    icon: None,
+                    docs_url: None,
+                    tags: Vec::new(),
+                    visible: true,
+                },
+            );
+        }
+        workflow_config.workflows = vec![WorkflowDefinition {
+            id: "coding".to_string(),
+            name: "Coding".to_string(),
+            description: "Filtered resume fixture".to_string(),
+            phases: vec!["code-implement".to_string().into(), "code-check".to_string().into()],
+            variables: Vec::new(),
+            worktree: None,
+            budget: None,
+            environment: None,
+            workspace: None,
+            publication: None,
+        }];
+        write_workflow_config(temp.path(), &workflow_config).expect("workflow config");
+
+        let mut runtime = builtin_agent_runtime_config();
+        runtime.agents.insert(
+            "fixture".to_string(),
+            AgentProfile {
+                description: "Filtered resume fixture".to_string(),
+                system_prompt: "Not executed by this command-only fixture".to_string(),
+                ..Default::default()
+            },
+        );
+        runtime.tools_allowlist = vec!["sh".to_string()];
+        runtime
+            .phases
+            .insert("code-implement".to_string(), command_phase("sh", vec!["-c".to_string(), "exit 0".to_string()]));
+        runtime.phases.insert(
+            "code-check".to_string(),
+            command_phase(
+                "sh",
+                vec!["-c".to_string(), "echo 'RailwayApiError: too many services in project' >&2; exit 1".to_string()],
+            ),
+        );
+        write_agent_runtime_config(temp.path(), &runtime).expect("agent runtime config");
+        let _config_source =
+            orchestrator_config::workflow_config::config_source_client::install_yaml_config_source_base(temp.path());
+
+        let hub = Arc::new(InMemoryServiceHub::new().with_project_root(temp.path()));
+        let task = hub
+            .tasks()
+            .create(TaskCreateInput {
+                title: "Filtered resume".to_string(),
+                description: "Exercise the real phase-filter execution path".to_string(),
+                task_type: Some(TaskType::Feature),
+                priority: Some(Priority::High),
+                created_by: Some("test".to_string()),
+                tags: Vec::new(),
+                linked_requirements: Vec::new(),
+                linked_architecture_entities: Vec::new(),
+            })
+            .await
+            .expect("task");
+        let events = Arc::new(CapturedEvents::default());
+        let result = execute_workflow_with_hub(
+            WorkflowExecuteParams {
+                project_root: temp.path().to_string_lossy().to_string(),
+                workflow_id: None,
+                bootstrap_workflow_id: None,
+                execution_fence: None,
+                task_id: Some(task.id.clone()),
+                requirement_id: None,
+                subject_id: None,
+                title: None,
+                description: None,
+                workflow_ref: Some("coding".to_string()),
+                input: None,
+                vars: HashMap::new(),
+                model: None,
+                tool: None,
+                phase_timeout_secs: None,
+                phase_filter: Some("code-check".to_string()),
+                phase_routing: None,
+                mcp_config: None,
+                actor: None,
+            },
+            hub.clone(),
+            Some(events.clone()),
+            None,
+        )
+        .await
+        .expect("filtered execution");
+
+        let phase_result = result.phase_results.first().expect("phase result");
+        assert_eq!(phase_result["status"], "manual_pending");
+        assert_eq!(phase_result["failure"]["class"], "infrastructure");
+        assert_eq!(phase_result["failure"]["retry_owner"], "infrastructure");
+        let event = events
+            .0
+            .lock()
+            .expect("event lock")
+            .iter()
+            .find(|event| event.kind == RuntimeWorkflowEventKind::PhaseCompleted)
+            .cloned()
+            .expect("journal event");
+        assert_eq!(event.payload["phase_status"], "manual_pending");
+        assert_eq!(event.payload["failure"]["class"], "infrastructure");
+        assert_eq!(event.payload["failure"]["retry_owner"], "infrastructure");
+
+        let persisted = hub.workflows().get(&result.workflow_id).await.expect("workflow");
+        assert_eq!(persisted.total_reworks, 0);
+        assert_eq!(persisted.rework_counts.get("code-implement"), None);
+    }
+
+    #[test]
+    fn failure_metadata_reports_concrete_workspace_disposition() {
+        let retained = AtomicBool::new(false);
+        let metadata =
+            execution_failure_metadata("Not logged in · Please run /login", "code-implement", true, false, &retained);
+        assert_eq!(metadata["class"], "provider_authentication");
+        assert_eq!(metadata["phase_id"], "code-implement");
+        assert_eq!(metadata["retry_owner"], "provider");
+        assert_eq!(metadata["preservation_state"], "workspace-retained");
+
+        let metadata = execution_failure_metadata(
+            "invalid publication receipt: missing commit",
+            "post-success",
+            false,
+            true,
+            &retained,
+        );
+        assert_eq!(metadata["class"], "invalid_metadata");
+        assert_eq!(metadata["phase_id"], "post-success");
+        assert_eq!(metadata["preservation_state"], "broker-managed");
     }
 
     #[test]
