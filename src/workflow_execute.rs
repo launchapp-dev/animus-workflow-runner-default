@@ -3247,10 +3247,66 @@ fn enforce_coding_rework_convergence(
 #[cfg(test)]
 mod rework_convergence_tests {
     use super::*;
-    use orchestrator_core::{
-        PhaseDecision, WorkflowDecisionAction, WorkflowDecisionRecord, WorkflowDecisionRisk, WorkflowDecisionSource,
+    use orchestrator_config::{
+        builtin_agent_runtime_config, builtin_workflow_config, write_agent_runtime_config, write_workflow_config,
+        AgentProfile, CommandCwdMode, Idempotency, PhaseCommandDefinition, PhaseExecutionDefinition,
+        PhaseExecutionMode, PhaseUiDefinition, WorkflowDefinition,
     };
-    use std::sync::atomic::AtomicBool;
+    use orchestrator_core::{
+        services::InMemoryServiceHub, PhaseDecision, Priority, TaskCreateInput, TaskType, WorkflowDecisionAction,
+        WorkflowDecisionRecord, WorkflowDecisionRisk, WorkflowDecisionSource,
+    };
+    use std::collections::BTreeMap;
+    use std::sync::{atomic::AtomicBool, Mutex};
+
+    #[derive(Default)]
+    struct CapturedEvents(Mutex<Vec<RuntimeWorkflowEvent>>);
+
+    impl crate::workflow_event_emitter::WorkflowEventEmitter for CapturedEvents {
+        fn emit(&self, event: RuntimeWorkflowEvent) {
+            self.0.lock().expect("event lock").push(event);
+        }
+    }
+
+    fn command_phase(program: &str, args: Vec<String>) -> PhaseExecutionDefinition {
+        PhaseExecutionDefinition {
+            mode: PhaseExecutionMode::Command,
+            agent_id: None,
+            directive: None,
+            system_prompt: None,
+            runtime: None,
+            capabilities: None,
+            output_contract: None,
+            output_json_schema: None,
+            decision_contract: None,
+            retry: None,
+            skills: Vec::new(),
+            command: Some(PhaseCommandDefinition {
+                program: program.to_string(),
+                args,
+                env: BTreeMap::new(),
+                cwd_mode: CommandCwdMode::ProjectRoot,
+                cwd_path: None,
+                timeout_secs: Some(10),
+                success_exit_codes: vec![0],
+                parse_json_output: false,
+                expected_result_kind: None,
+                expected_schema: None,
+                category: None,
+                failure_pattern: None,
+                excerpt_max_chars: None,
+                on_success_verdict: None,
+                on_failure_verdict: Some("rework".to_string()),
+                confidence: Some(1.0),
+                failure_risk: None,
+            }),
+            manual: None,
+            default_tool: None,
+            idempotency: Idempotency::Unknown,
+            worktree: None,
+            evals: None,
+        }
+    }
 
     fn workflow(history: Vec<WorkflowDecisionRecord>) -> OrchestratorWorkflow {
         OrchestratorWorkflow {
@@ -3327,20 +3383,129 @@ mod rework_convergence_tests {
         assert!(decision.reason.contains("retry_owner=implementation"));
     }
 
-    #[test]
-    fn phase_filtered_coding_resume_keeps_the_non_code_rework_guard() {
-        let workflow = workflow(Vec::new());
-        let phases_requested = ["code-check"];
-        assert_eq!(phases_requested, ["code-check"]);
-        assert!(workflow_has_coding_rework_contract(&workflow));
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn phase_filtered_coding_resume_keeps_the_non_code_rework_guard() {
+        let _state_guard = crate::test_env::scoped_state_serializer();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut workflow_config = builtin_workflow_config();
+        workflow_config.default_workflow_ref = "coding".to_string();
+        for phase_id in ["code-implement", "code-check"] {
+            workflow_config.phase_catalog.insert(
+                phase_id.to_string(),
+                PhaseUiDefinition {
+                    label: phase_id.to_string(),
+                    description: "Filtered resume fixture phase".to_string(),
+                    category: "verification".to_string(),
+                    icon: None,
+                    docs_url: None,
+                    tags: Vec::new(),
+                    visible: true,
+                },
+            );
+        }
+        workflow_config.workflows = vec![WorkflowDefinition {
+            id: "coding".to_string(),
+            name: "Coding".to_string(),
+            description: "Filtered resume fixture".to_string(),
+            phases: vec!["code-implement".to_string().into(), "code-check".to_string().into()],
+            variables: Vec::new(),
+            worktree: None,
+            budget: None,
+            environment: None,
+            workspace: None,
+            publication: None,
+        }];
+        write_workflow_config(temp.path(), &workflow_config).expect("workflow config");
 
-        let mut outcome = rework("RailwayApiError: too many services in project");
-        let metadata = enforce_coding_rework_convergence(&workflow, phases_requested[0], &mut outcome)
-            .expect("filtered coding rework must remain classified");
-        assert_eq!(metadata["class"], "infrastructure");
-        assert_eq!(metadata["retry_owner"], "infrastructure");
-        assert_eq!(workflow.total_reworks, 0);
-        assert!(matches!(outcome, PhaseExecutionOutcome::ManualPending { .. }));
+        let mut runtime = builtin_agent_runtime_config();
+        runtime.agents.insert(
+            "fixture".to_string(),
+            AgentProfile {
+                description: "Filtered resume fixture".to_string(),
+                system_prompt: "Not executed by this command-only fixture".to_string(),
+                ..Default::default()
+            },
+        );
+        runtime.tools_allowlist = vec!["sh".to_string()];
+        runtime
+            .phases
+            .insert("code-implement".to_string(), command_phase("sh", vec!["-c".to_string(), "exit 0".to_string()]));
+        runtime.phases.insert(
+            "code-check".to_string(),
+            command_phase(
+                "sh",
+                vec!["-c".to_string(), "echo 'RailwayApiError: too many services in project' >&2; exit 1".to_string()],
+            ),
+        );
+        write_agent_runtime_config(temp.path(), &runtime).expect("agent runtime config");
+        let _config_source =
+            orchestrator_config::workflow_config::config_source_client::install_yaml_config_source_base(temp.path());
+
+        let hub = Arc::new(InMemoryServiceHub::new().with_project_root(temp.path()));
+        let task = hub
+            .tasks()
+            .create(TaskCreateInput {
+                title: "Filtered resume".to_string(),
+                description: "Exercise the real phase-filter execution path".to_string(),
+                task_type: Some(TaskType::Feature),
+                priority: Some(Priority::High),
+                created_by: Some("test".to_string()),
+                tags: Vec::new(),
+                linked_requirements: Vec::new(),
+                linked_architecture_entities: Vec::new(),
+            })
+            .await
+            .expect("task");
+        let events = Arc::new(CapturedEvents::default());
+        let result = execute_workflow_with_hub(
+            WorkflowExecuteParams {
+                project_root: temp.path().to_string_lossy().to_string(),
+                workflow_id: None,
+                bootstrap_workflow_id: None,
+                execution_fence: None,
+                task_id: Some(task.id.clone()),
+                requirement_id: None,
+                subject_id: None,
+                title: None,
+                description: None,
+                workflow_ref: Some("coding".to_string()),
+                input: None,
+                vars: HashMap::new(),
+                model: None,
+                tool: None,
+                phase_timeout_secs: None,
+                phase_filter: Some("code-check".to_string()),
+                phase_routing: None,
+                mcp_config: None,
+                actor: None,
+            },
+            hub.clone(),
+            Some(events.clone()),
+            None,
+        )
+        .await
+        .expect("filtered execution");
+
+        let phase_result = result.phase_results.first().expect("phase result");
+        assert_eq!(phase_result["status"], "manual_pending");
+        assert_eq!(phase_result["failure"]["class"], "infrastructure");
+        assert_eq!(phase_result["failure"]["retry_owner"], "infrastructure");
+        let event = events
+            .0
+            .lock()
+            .expect("event lock")
+            .iter()
+            .find(|event| event.kind == RuntimeWorkflowEventKind::PhaseCompleted)
+            .cloned()
+            .expect("journal event");
+        assert_eq!(event.payload["phase_status"], "manual_pending");
+        assert_eq!(event.payload["failure"]["class"], "infrastructure");
+        assert_eq!(event.payload["failure"]["retry_owner"], "infrastructure");
+
+        let persisted = hub.workflows().get(&result.workflow_id).await.expect("workflow");
+        assert_eq!(persisted.total_reworks, 0);
+        assert_eq!(persisted.rework_counts.get("code-implement"), None);
     }
 
     #[test]
