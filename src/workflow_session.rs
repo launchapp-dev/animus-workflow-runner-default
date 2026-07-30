@@ -615,6 +615,7 @@ fn finalize_session_publication(
     node_status: WorkflowStatus,
     publication_required: bool,
     publication_durable: bool,
+    publication_verified: bool,
     candidate_receipt: Option<PublicationReceipt>,
 ) -> (WorkflowStatus, Option<PublicationReceipt>) {
     // A structurally valid journal receipt is still untrusted until the parent
@@ -625,7 +626,7 @@ fn finalize_session_publication(
     } else {
         node_status
     };
-    let verified_receipt = publication_durable.then_some(candidate_receipt).flatten();
+    let verified_receipt = publication_verified.then_some(candidate_receipt).flatten();
     (workflow_status, verified_receipt)
 }
 
@@ -842,6 +843,7 @@ pub(crate) async fn delegate_workflow_via_session(
         .map(|publication| publication.cleanup)
         .unwrap_or(WorkflowPublicationCleanupPolicy::AfterRemoteVerified);
     let publication_durable = Arc::new(AtomicBool::new(!publication_required));
+    let publication_verified = Arc::new(AtomicBool::new(false));
     let publication_receipt: Arc<Mutex<Option<PublicationReceipt>>> = Arc::new(Mutex::new(None));
 
     // Clones captured by the (Fn + Send + Sync) journal callback.
@@ -914,6 +916,7 @@ pub(crate) async fn delegate_workflow_via_session(
     let actor_owned = actor.cloned();
     let execution_fence_owned = execution_fence.cloned();
     let publication_durable_for_thread = publication_durable.clone();
+    let publication_verified_for_thread = publication_verified.clone();
     let publication_receipt_for_thread = publication_receipt.clone();
 
     // TASK-933 (companion to animus-cli rc.28): this delegated node is otherwise
@@ -1028,6 +1031,7 @@ pub(crate) async fn delegate_workflow_via_session(
                     } else {
                         false
                     };
+                    publication_verified_for_thread.store(verified, std::sync::atomic::Ordering::SeqCst);
                     publication_durable_for_thread.store(verified, std::sync::atomic::Ordering::SeqCst);
                 }
                 // A paused node session remains resumable: keep its prepared
@@ -1081,11 +1085,13 @@ pub(crate) async fn delegate_workflow_via_session(
 
     let response = rx.await.map_err(|_| anyhow!("remote-animus session thread terminated unexpectedly"))??;
     let publication_durable = publication_durable.load(Ordering::SeqCst);
+    let publication_verified = publication_verified.load(Ordering::SeqCst);
     let candidate_publication_receipt = publication_receipt.lock().ok().and_then(|guard| guard.clone());
     let (workflow_status, verified_publication_receipt) = finalize_session_publication(
         session_status_to_workflow_status(&response.status),
         publication_required,
         publication_durable,
+        publication_verified,
         candidate_publication_receipt,
     );
 
@@ -1758,7 +1764,7 @@ mod tests {
 
         let verified = verify_session_publication(&executor, &receipt, &execution).await.unwrap();
         let (verified_status, verified_receipt) =
-            finalize_session_publication(WorkflowStatus::Completed, true, verified, Some(receipt.clone()));
+            finalize_session_publication(WorkflowStatus::Completed, true, verified, verified, Some(receipt.clone()));
         let teardowns = AtomicUsize::new(0);
         if session_should_teardown(
             WorkflowStatus::Completed,
@@ -1776,8 +1782,13 @@ mod tests {
         let mut forged = receipt;
         forged.tree_sha = "0".repeat(40);
         let forged_verified = verify_session_publication(&executor, &forged, &execution).await.unwrap();
-        let (forged_status, forged_receipt) =
-            finalize_session_publication(WorkflowStatus::Completed, true, forged_verified, Some(forged));
+        let (forged_status, forged_receipt) = finalize_session_publication(
+            WorkflowStatus::Completed,
+            true,
+            forged_verified,
+            forged_verified,
+            Some(forged),
+        );
         let forged_teardowns = AtomicUsize::new(0);
         if session_should_teardown(
             WorkflowStatus::Completed,
@@ -1791,6 +1802,24 @@ mod tests {
         assert_eq!(forged_status, WorkflowStatus::Failed);
         assert!(forged_receipt.is_none(), "unverified candidate must not escape as a verified receipt");
         assert_eq!(forged_teardowns.load(Ordering::SeqCst), 0);
+
+        let non_publication_candidate = test_publication_receipt(
+            "https://github.com/launchapp-dev/unrelated.git",
+            &"3".repeat(40),
+            &"4".repeat(40),
+        );
+        let (non_publication_status, non_publication_receipt) = finalize_session_publication(
+            WorkflowStatus::Completed,
+            false,
+            true,
+            false,
+            Some(non_publication_candidate),
+        );
+        assert_eq!(non_publication_status, WorkflowStatus::Completed);
+        assert!(
+            non_publication_receipt.is_none(),
+            "publication-not-required completion must not promote an unverified journal receipt"
+        );
     }
 
     #[cfg(feature = "remote-animus-session")]
