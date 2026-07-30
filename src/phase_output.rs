@@ -645,6 +645,7 @@ mod tests {
         rework_counts.insert("code-review".to_string(), 2u32);
         let workflow = orchestrator_core::OrchestratorWorkflow {
             id: workflow_id.to_string(),
+            execution_fence: None,
             task_id: "TASK-1".to_string(),
             workflow_ref: None,
             subject: Some(SubjectRef::task("TASK-1".to_string())),

@@ -206,6 +206,7 @@ pub async fn run_execute(args: ExecuteArgs) -> u8 {
 
 async fn run_execute_inner(args: ExecuteArgs) -> anyhow::Result<u8> {
     let actor = inherited_workflow_actor()?;
+    let execution_fence = inherited_execution_fence()?;
     let subject_id = args
         .workflow_id
         .as_deref()
@@ -238,6 +239,7 @@ async fn run_execute_inner(args: ExecuteArgs) -> anyhow::Result<u8> {
         project_root: args.project_root.clone(),
         workflow_id: args.workflow_id,
         bootstrap_workflow_id: args.new_workflow_id,
+        execution_fence,
         task_id: args.task_id,
         requirement_id: args.requirement_id,
         subject_id: args.subject_id,
@@ -345,6 +347,23 @@ async fn run_execute_inner(args: ExecuteArgs) -> anyhow::Result<u8> {
     }
 
     Ok(clamp_exit_code(exit_code))
+}
+
+fn inherited_execution_fence() -> anyhow::Result<Option<animus_execution_protocol::ExecutionFence>> {
+    let Some(raw) = std::env::var_os(orchestrator_daemon_runtime::ANIMUS_EXECUTION_FENCE_JSON_ENV) else {
+        return Ok(None);
+    };
+    let raw = raw.into_string().map_err(|_| {
+        anyhow!("{} is present but is not valid UTF-8", orchestrator_daemon_runtime::ANIMUS_EXECUTION_FENCE_JSON_ENV)
+    })?;
+    let execution: animus_execution_protocol::ExecutionFence = serde_json::from_str(&raw).with_context(|| {
+        format!(
+            "{} is malformed; refusing unfenced workflow execution",
+            orchestrator_daemon_runtime::ANIMUS_EXECUTION_FENCE_JSON_ENV
+        )
+    })?;
+    execution.validate().map_err(anyhow::Error::msg)?;
+    Ok(Some(execution))
 }
 
 /// Normalize a single argv token into one-or-two output tokens so a
@@ -607,6 +626,42 @@ mod tests {
         let _actor_env = EnvVarGuard::set(ANIMUS_ACTOR_JSON_ENV, None);
 
         assert_eq!(inherited_workflow_actor().expect("absent actor is valid"), None);
+    }
+
+    #[test]
+    fn inherited_execution_fence_parses_the_exact_scheduler_authority() {
+        use protocol::test_utils::EnvVarGuard;
+
+        let _lock = actor_env_lock().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let fence = animus_execution_protocol::ExecutionFence::direct("wf-fenced", 7, None);
+        let encoded = serde_json::to_string(&fence).expect("serialize execution fence");
+        let _fence_env = EnvVarGuard::set(orchestrator_daemon_runtime::ANIMUS_EXECUTION_FENCE_JSON_ENV, Some(&encoded));
+
+        assert_eq!(inherited_execution_fence().expect("valid inherited fence"), Some(fence));
+    }
+
+    #[test]
+    fn malformed_inherited_execution_fence_fails_closed() {
+        use protocol::test_utils::EnvVarGuard;
+
+        let _lock = actor_env_lock().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _fence_env =
+            EnvVarGuard::set(orchestrator_daemon_runtime::ANIMUS_EXECUTION_FENCE_JSON_ENV, Some("{not-json"));
+
+        let error = inherited_execution_fence().expect_err("malformed scheduler authority must fail");
+        let message = format!("{error:#}");
+        assert!(message.contains(orchestrator_daemon_runtime::ANIMUS_EXECUTION_FENCE_JSON_ENV));
+        assert!(message.contains("refusing unfenced workflow execution"));
+    }
+
+    #[test]
+    fn absent_inherited_execution_fence_preserves_legacy_nonpublication_execution() {
+        use protocol::test_utils::EnvVarGuard;
+
+        let _lock = actor_env_lock().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _fence_env = EnvVarGuard::set(orchestrator_daemon_runtime::ANIMUS_EXECUTION_FENCE_JSON_ENV, None);
+
+        assert_eq!(inherited_execution_fence().expect("absent fence is valid"), None);
     }
 
     #[cfg(unix)]

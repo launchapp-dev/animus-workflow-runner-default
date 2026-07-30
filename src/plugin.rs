@@ -17,11 +17,13 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use animus_plugin_protocol::{
-    InitializeResult, PluginCapabilities, PluginInfo, PluginManifest, PROTOCOL_VERSION as PLUGIN_PROTOCOL_VERSION,
+    InitializeResult, KindCapability, PluginCapabilities, PluginInfo, PluginManifest,
+    PROTOCOL_VERSION as PLUGIN_PROTOCOL_VERSION,
 };
 use animus_workflow_runner_protocol::{
     error_codes, phase_status, workflow_status, PhaseResultSnapshot, WorkflowExecuteRequest, WorkflowExecuteResult,
-    WorkflowPhaseRunRequest, WorkflowPhaseRunResult, KIND as WORKFLOW_RUNNER_KIND,
+    WorkflowPhaseRunRequest, WorkflowPhaseRunResult, WorkflowRunnerCapabilities, KIND as WORKFLOW_RUNNER_KIND,
+    PROTOCOL_VERSION as WORKFLOW_RUNNER_PROTOCOL_VERSION,
 };
 use anyhow::{anyhow, Context, Result};
 use orchestrator_core::{services::ServiceHub, FileServiceHub, WorkflowStatus};
@@ -225,10 +227,22 @@ pub fn plugin_initialize_result(params: &Value) -> Result<InitializeResult> {
             subject_kinds: Vec::new(),
             mcp_tools: Vec::new(),
         },
-        // Typed per-kind capability map (protocol v1.1.0+). Empty here keeps
-        // the v1.0.0 back-compat posture; the legacy `capabilities.methods`
-        // allowlist above remains authoritative for this runner.
-        kind_capabilities: std::collections::HashMap::new(),
+        kind_capabilities: std::collections::HashMap::from([(
+            WORKFLOW_RUNNER_KIND.to_string(),
+            KindCapability {
+                crate_version: WORKFLOW_RUNNER_PROTOCOL_VERSION.to_string(),
+                extra: serde_json::to_value(WorkflowRunnerCapabilities {
+                    phase_decision_parsing: true,
+                    rework_context_support: true,
+                    post_success_actions: true,
+                    publication_receipt_v1: true,
+                    execution_fence_v1: true,
+                    crash_recovery: true,
+                    manual_pause_support: true,
+                })
+                .expect("workflow runner capabilities are serializable"),
+            },
+        )]),
     })
 }
 
@@ -250,7 +264,8 @@ pub async fn handle_workflow_execute(request: WorkflowExecuteRequest) -> Result<
     let params = WorkflowExecuteInternalParams {
         project_root: project_root_str.clone(),
         workflow_id: request.workflow_id.clone(),
-        bootstrap_workflow_id: None,
+        bootstrap_workflow_id: request.execution_fence.as_ref().map(|execution| execution.workflow_id.clone()),
+        execution_fence: request.execution_fence.clone(),
         task_id,
         requirement_id,
         // The stdio plugin path resolves its subject envelope via
@@ -294,6 +309,7 @@ pub async fn handle_workflow_execute(request: WorkflowExecuteRequest) -> Result<
 
     Ok(WorkflowExecuteResult {
         workflow_id: internal.workflow_id,
+        execution_fence: internal.execution_fence,
         workflow_ref: internal.workflow_ref,
         workflow_status: wire_workflow_status,
         subject_id: internal.subject_id,
@@ -304,6 +320,7 @@ pub async fn handle_workflow_execute(request: WorkflowExecuteRequest) -> Result<
         total_duration_secs: internal.total_duration.as_secs(),
         phase_results,
         post_success: internal.post_success,
+        publication_receipt: internal.publication_receipt,
         success,
         phase_events: recorder.take_events(),
     })
@@ -327,7 +344,18 @@ fn snapshot_from_value(value: Value) -> PhaseResultSnapshot {
     let metadata = value.get("metadata").cloned().unwrap_or(Value::Null);
     let next_phase_id = value.get("next_phase_id").and_then(Value::as_str).map(ToOwned::to_owned);
     let close_reason = value.get("close_reason").and_then(Value::as_str).map(ToOwned::to_owned);
-    PhaseResultSnapshot { phase_id, status, duration_secs, outcome, metadata, next_phase_id, close_reason }
+    let publication_receipt =
+        value.get("publication_receipt").cloned().and_then(|receipt| serde_json::from_value(receipt).ok());
+    PhaseResultSnapshot {
+        phase_id,
+        status,
+        duration_secs,
+        outcome,
+        metadata,
+        publication_receipt,
+        next_phase_id,
+        close_reason,
+    }
 }
 
 /// Project the protocol's three-way subject envelope onto the lifted
@@ -414,6 +442,7 @@ fn workflow_status_to_wire(status: WorkflowStatus) -> &'static str {
 /// the lifted `run_workflow_phase` function and returns the result snapshot.
 pub async fn handle_workflow_run_phase(request: WorkflowPhaseRunRequest) -> Result<WorkflowPhaseRunResult> {
     let state = current_state()?;
+    request.validate_execution_fence(request.execution_fence.is_some()).map_err(anyhow::Error::msg)?;
     // Strict project-binding enforcement (codex P1 round 1 — initial draft
     // logged + continued, which broke the v0.5 isolation contract). If the
     // requested execution_cwd is not the bound project root or a subdirectory
@@ -515,11 +544,21 @@ pub async fn handle_workflow_run_phase(request: WorkflowPhaseRunRequest) -> Resu
                     phase_status::MANUAL_PENDING.to_string()
                 }
             };
+            let publication_receipt = match &result.outcome {
+                crate::phase_executor::PhaseExecutionOutcome::Completed { result_payload: Some(payload), .. } => {
+                    crate::workflow_execute::publication_receipt_from_value(payload).with_context(|| {
+                        format!("phase '{}' emitted an invalid publication receipt", request.phase_id)
+                    })?
+                }
+                _ => None,
+            };
             Ok(WorkflowPhaseRunResult {
                 phase_status: status,
+                execution_fence: request.execution_fence.clone(),
                 duration_secs: elapsed.as_secs(),
                 outcome: serde_json::to_value(&result.outcome).unwrap_or(Value::Null),
                 metadata: serde_json::to_value(&result.metadata).unwrap_or(Value::Null),
+                publication_receipt,
                 signals: result.signals.into_iter().filter_map(|sig| serde_json::to_value(sig).ok()).collect(),
                 model: result.model,
                 tool: result.tool,
@@ -527,9 +566,11 @@ pub async fn handle_workflow_run_phase(request: WorkflowPhaseRunRequest) -> Resu
         }
         Err(error) => Ok(WorkflowPhaseRunResult {
             phase_status: phase_status::FAILED.to_string(),
+            execution_fence: request.execution_fence,
             duration_secs: elapsed.as_secs(),
             outcome: serde_json::json!({ "error": error.to_string() }),
             metadata: Value::Null,
+            publication_receipt: None,
             signals: Vec::new(),
             model: None,
             tool: None,
@@ -642,6 +683,7 @@ mod tests {
         WorkflowPhaseRunRequest {
             execution_cwd: "/tmp/proj".to_string(),
             workflow_id: "wf-1".to_string(),
+            execution_fence: None,
             workflow_ref: "default".to_string(),
             subject_id: "task:TASK-1".to_string(),
             subject_title: "title".to_string(),

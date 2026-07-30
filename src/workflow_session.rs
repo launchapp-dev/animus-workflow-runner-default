@@ -42,7 +42,11 @@
 use std::path::Path;
 
 use animus_actor::Actor;
+use animus_execution_protocol::ExecutionFence;
+#[cfg(feature = "remote-animus-session")]
+use animus_workflow_runner_protocol::PublicationReceipt;
 use anyhow::Result;
+use orchestrator_config::{WorkflowPublicationCleanupPolicy, WorkflowPublicationConfig};
 use orchestrator_core::WorkflowStatus;
 
 use crate::workflow_event_emitter::{RuntimeWorkflowEventKind, SharedWorkflowEventEmitter};
@@ -370,6 +374,7 @@ impl SessionEnvironmentClient {
         workflow_ref: Option<String>,
         dispatch_input: Option<String>,
         workflow_id: Option<String>,
+        execution_fence: Option<ExecutionFence>,
         actor: Option<&Actor>,
         on_journal: F,
     ) -> Result<animus_environment_protocol::ExecSessionResponse>
@@ -380,8 +385,14 @@ impl SessionEnvironmentClient {
         use anyhow::Context;
         use tokio::sync::broadcast::error::RecvError;
 
-        let request =
-            ExecSessionRequest { handle: handle.clone(), subject_id, workflow_ref, dispatch_input, workflow_id };
+        let request = ExecSessionRequest {
+            handle: handle.clone(),
+            subject_id,
+            workflow_ref,
+            dispatch_input,
+            workflow_id,
+            execution_fence,
+        };
         let params = request_params_with_actor(request, actor, "serializing environment exec_session request")?;
         let (host, generation) = self.pinned_host().await?;
         let mut notifications = host.subscribe_notifications();
@@ -458,35 +469,60 @@ impl SessionPublicationCommands for BoundSessionPublication<'_> {
 }
 
 #[cfg(feature = "remote-animus-session")]
-async fn verify_session_publication<E>(executor: &E, proof: &crate::phase_git::PublicationProof) -> Result<bool>
+async fn verify_session_publication<E>(
+    executor: &E,
+    proof: &PublicationReceipt,
+    execution: &ExecutionFence,
+) -> Result<bool>
 where
     E: SessionPublicationCommands,
 {
-    if !crate::phase_git::proof_shape_is_valid(proof) {
+    if proof.validate_against_execution(execution).is_err() {
         return Ok(false);
     }
-    let remote_ref = proof.remote_ref.as_deref().expect("shape checked remote ref");
-    let verify_ref = format!("refs/animus/session-proof/{}", &proof.commit[..12]);
+    let Some(repository) = execution.repository.as_ref() else {
+        return Ok(false);
+    };
+    let configured_remote = executor.run_git(vec!["config".into(), "--get".into(), "remote.origin.url".into()]).await?;
+    if !configured_remote.success {
+        return Ok(false);
+    }
+    let configured_remote = crate::workflow_execute::canonical_remote_url(configured_remote.stdout.trim())?;
+    let expected_identity = crate::workflow_execute::normalized_repository_identity(&repository.repository);
+    if crate::workflow_execute::normalized_repository_identity(&configured_remote) != expected_identity
+        || crate::workflow_execute::normalized_repository_identity(&proof.remote) != expected_identity
+    {
+        return Ok(false);
+    }
+    let observed =
+        executor.run_git(vec!["ls-remote".into(), "--refs".into(), "origin".into(), proof.remote_ref.clone()]).await?;
+    if !observed.success
+        || crate::workflow_execute::exact_remote_sha(&observed.stdout, &proof.remote_ref).as_deref()
+            != Some(proof.commit_sha.as_str())
+    {
+        return Ok(false);
+    }
+    let verify_ref = format!("refs/animus/session-proof/{}", &proof.commit_sha[..12]);
     let fetched = executor
-        .run_git(vec!["fetch".into(), "--no-tags".into(), proof.remote.clone(), format!("+{remote_ref}:{verify_ref}")])
+        .run_git(vec![
+            "fetch".into(),
+            "--no-tags".into(),
+            "origin".into(),
+            format!("+{}:{verify_ref}", proof.remote_ref),
+        ])
         .await?;
     if !fetched.success {
         return Ok(false);
     }
 
-    let ancestor = executor
-        .run_git(vec!["merge-base".into(), "--is-ancestor".into(), proof.commit.clone(), verify_ref.clone()])
-        .await?
-        .success;
-    let actual_commit = executor.run_git(vec!["rev-parse".into(), format!("{}^{{commit}}", proof.commit)]).await?;
-    let actual_tree = executor.run_git(vec!["rev-parse".into(), format!("{}^{{tree}}", proof.commit)]).await?;
+    let actual_commit = executor.run_git(vec!["rev-parse".into(), format!("{verify_ref}^{{commit}}")]).await?;
+    let actual_tree = executor.run_git(vec!["rev-parse".into(), format!("{verify_ref}^{{tree}}")]).await?;
     let _ = executor.run_git(vec!["update-ref".into(), "-d".into(), verify_ref]).await;
 
-    Ok(ancestor
-        && actual_commit.success
+    Ok(actual_commit.success
         && actual_tree.success
-        && actual_commit.stdout.trim() == proof.commit
-        && actual_tree.stdout.trim() == proof.tree)
+        && actual_commit.stdout.trim() == proof.commit_sha
+        && actual_tree.stdout.trim() == proof.tree_sha)
 }
 
 /// Attach the SDK's well-known top-level actor field after serializing the
@@ -562,21 +598,44 @@ fn session_succeeded(status: WorkflowStatus) -> bool {
 }
 
 #[cfg_attr(not(feature = "remote-animus-session"), allow(dead_code))]
-fn session_should_teardown(status: WorkflowStatus, publication_durable: bool) -> bool {
-    matches!(status, WorkflowStatus::Cancelled) || (matches!(status, WorkflowStatus::Completed) && publication_durable)
+fn session_should_teardown(
+    status: WorkflowStatus,
+    publication_required: bool,
+    cleanup: WorkflowPublicationCleanupPolicy,
+    publication_durable: bool,
+) -> bool {
+    matches!(status, WorkflowStatus::Cancelled)
+        || (matches!(status, WorkflowStatus::Completed)
+            && (!publication_required
+                || (publication_durable && matches!(cleanup, WorkflowPublicationCleanupPolicy::AfterRemoteVerified))))
 }
 
 #[cfg(feature = "remote-animus-session")]
-fn terminal_publication_proof(
-    event: &SessionJournalEvent,
-    workflow_id: &str,
-) -> Option<crate::phase_git::PublicationProof> {
+fn terminal_publication_receipt(event: &SessionJournalEvent, workflow_id: &str) -> Option<PublicationReceipt> {
     if !event.terminal || event.event_kind != "workflow_completed" || event.workflow_id.as_deref() != Some(workflow_id)
     {
         return None;
     }
-    let proof = event.payload.pointer("/post_success/proof")?;
-    serde_json::from_value(proof.clone()).ok()
+    let receipt = event
+        .payload
+        .get("publication_receipt")
+        .or_else(|| event.payload.pointer("/post_success/publication_receipt"))?;
+    serde_json::from_value(receipt.clone()).ok()
+}
+
+#[cfg(feature = "remote-animus-session")]
+fn validate_session_response_fence(
+    response: &animus_environment_protocol::ExecSessionResponse,
+    expected: Option<&ExecutionFence>,
+    required: bool,
+) -> Result<()> {
+    match (expected, response.execution_fence.as_ref()) {
+        (Some(expected), Some(actual)) if expected == actual => Ok(()),
+        (Some(_), Some(_)) => anyhow::bail!("remote session returned a different execution fence"),
+        (Some(_), None) => anyhow::bail!("remote session omitted the required execution fence"),
+        (None, Some(_)) if required => anyhow::bail!("remote session returned unexpected scheduler authority"),
+        (None, _) => Ok(()),
+    }
 }
 
 /// Agent-run transcript event kinds -- the fine-grained session stream that
@@ -699,6 +758,8 @@ pub(crate) async fn delegate_workflow_via_session(
     _dispatch_input: Option<&str>,
     _execution_cwd: &str,
     _phases_requested: Vec<String>,
+    _publication: Option<&WorkflowPublicationConfig>,
+    _execution_fence: Option<&ExecutionFence>,
     _actor: Option<&Actor>,
     _event_emitter: Option<&SharedWorkflowEventEmitter>,
 ) -> Result<WorkflowExecuteInternalResult> {
@@ -737,6 +798,8 @@ pub(crate) async fn delegate_workflow_via_session(
     dispatch_input: Option<&str>,
     execution_cwd: &str,
     phases_requested: Vec<String>,
+    publication: Option<&WorkflowPublicationConfig>,
+    execution_fence: Option<&ExecutionFence>,
     actor: Option<&Actor>,
     event_emitter: Option<&SharedWorkflowEventEmitter>,
 ) -> Result<WorkflowExecuteInternalResult> {
@@ -755,9 +818,12 @@ pub(crate) async fn delegate_workflow_via_session(
     // the driver reads back after the session ends.
     let phase_results: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
     let phases_completed = Arc::new(AtomicUsize::new(0));
-    let publication_durable =
-        Arc::new(AtomicBool::new(!crate::workflow_execute::workflow_requires_publication(workflow_ref)));
-    let publication_proof: Arc<Mutex<Option<crate::phase_git::PublicationProof>>> = Arc::new(Mutex::new(None));
+    let publication_required = publication.is_some_and(|publication| publication.required);
+    let cleanup_policy = publication
+        .map(|publication| publication.cleanup)
+        .unwrap_or(WorkflowPublicationCleanupPolicy::AfterRemoteVerified);
+    let publication_durable = Arc::new(AtomicBool::new(!publication_required));
+    let publication_receipt: Arc<Mutex<Option<PublicationReceipt>>> = Arc::new(Mutex::new(None));
 
     // Clones captured by the (Fn + Send + Sync) journal callback.
     let emitter = event_emitter.cloned();
@@ -765,12 +831,12 @@ pub(crate) async fn delegate_workflow_via_session(
     let project_root_for_journal = project_root.to_string();
     let phase_results_sink = phase_results.clone();
     let phases_completed_sink = phases_completed.clone();
-    let publication_proof_sink = publication_proof.clone();
+    let publication_receipt_sink = publication_receipt.clone();
 
     let on_journal = move |event: &SessionJournalEvent| {
-        if let Some(proof) = terminal_publication_proof(event, &workflow_id_for_events) {
-            if let Ok(mut sink) = publication_proof_sink.lock() {
-                *sink = Some(proof);
+        if let Some(receipt) = terminal_publication_receipt(event, &workflow_id_for_events) {
+            if let Ok(mut sink) = publication_receipt_sink.lock() {
+                *sink = Some(receipt);
             }
         }
         // Mirror the node's agent-run transcript (output chunks, tool calls, ...)
@@ -827,8 +893,9 @@ pub(crate) async fn delegate_workflow_via_session(
     // re-keys to a no-op. `None`-tolerant on the wire (old env plugins ignore it).
     let workflow_id_owned = workflow_id.to_string();
     let actor_owned = actor.cloned();
+    let execution_fence_owned = execution_fence.cloned();
     let publication_durable_for_thread = publication_durable.clone();
-    let publication_proof_for_thread = publication_proof.clone();
+    let publication_receipt_for_thread = publication_receipt.clone();
 
     // TASK-933 (companion to animus-cli rc.28): this delegated node is otherwise
     // invisible to the daemon after a restart -- the home runner holds the handle
@@ -917,18 +984,28 @@ pub(crate) async fn delegate_workflow_via_session(
                     Some(workflow_ref_owned),
                     dispatch_input_owned,
                     Some(workflow_id_owned.clone()),
+                    execution_fence_owned.clone(),
                     actor_owned.as_ref(),
                     on_journal,
                 ).await;
+                if let Ok(response) = response.as_ref() {
+                    validate_session_response_fence(response, execution_fence_owned.as_ref(), publication_required)?;
+                }
                 if response.is_ok() && !publication_durable_for_thread.load(std::sync::atomic::Ordering::SeqCst) {
-                    let proof = publication_proof_for_thread
+                    let receipt = publication_receipt_for_thread
                         .lock()
                         .ok()
                         .and_then(|guard| guard.clone());
-                    let verified = if let Some(proof) = proof.as_ref() {
-                        verify_session_publication(&BoundSessionPublication { client: &client, handle: &handle }, proof)
-                            .await
-                            .unwrap_or(false)
+                    let verified = if let (Some(receipt), Some(execution)) =
+                        (receipt.as_ref(), execution_fence_owned.as_ref())
+                    {
+                        verify_session_publication(
+                            &BoundSessionPublication { client: &client, handle: &handle },
+                            receipt,
+                            execution,
+                        )
+                        .await
+                        .unwrap_or(false)
                     } else {
                         false
                     };
@@ -941,7 +1018,12 @@ pub(crate) async fn delegate_workflow_via_session(
                 let should_teardown = response
                     .as_ref()
                     .map(|response| {
-                        session_should_teardown(session_status_to_workflow_status(&response.status), durable)
+                        session_should_teardown(
+                            session_status_to_workflow_status(&response.status),
+                            publication_required,
+                            cleanup_policy,
+                            durable,
+                        )
                     })
                     .unwrap_or(false);
                 if should_teardown {
@@ -980,6 +1062,7 @@ pub(crate) async fn delegate_workflow_via_session(
 
     let response = rx.await.map_err(|_| anyhow!("remote-animus session thread terminated unexpectedly"))??;
     let publication_durable = publication_durable.load(Ordering::SeqCst);
+    let verified_publication_receipt = publication_receipt.lock().ok().and_then(|guard| guard.clone());
 
     let node_workflow_status = session_status_to_workflow_status(&response.status);
     // A node saying "completed" is insufficient. The parent reports success
@@ -1075,6 +1158,7 @@ pub(crate) async fn delegate_workflow_via_session(
                     "final_status": "completed",
                     "source": "environment_session",
                     "publication_durable": publication_durable,
+                    "publication_receipt": verified_publication_receipt,
                 }),
                 occurred_at: chrono::Utc::now(),
             }),
@@ -1099,6 +1183,7 @@ pub(crate) async fn delegate_workflow_via_session(
     Ok(WorkflowExecuteInternalResult {
         success: session_succeeded(workflow_status),
         workflow_id: workflow_id.to_string(),
+        execution_fence: execution_fence.cloned(),
         workflow_ref: workflow_ref.to_string(),
         workflow_status,
         subject_id: subject_id.to_string(),
@@ -1113,8 +1198,10 @@ pub(crate) async fn delegate_workflow_via_session(
         post_success: serde_json::json!({
             "status": if publication_durable { "completed" } else { "failed" },
             "publication_durable": publication_durable,
+            "publication_receipt": verified_publication_receipt,
             "reason": "remote-animus session owns the full workflow (incl. post-success) on the node",
         }),
+        publication_receipt: verified_publication_receipt,
     })
 }
 
@@ -1210,6 +1297,51 @@ fn build_session_spec(environment_id: &str, github_repo: Option<&str>) -> animus
 mod tests {
     use super::*;
 
+    #[cfg(feature = "remote-animus-session")]
+    fn test_execution(repository: &str) -> ExecutionFence {
+        let mut execution = ExecutionFence::direct(
+            "run",
+            1,
+            Some(animus_execution_protocol::SubjectGeneration {
+                qualified_id: "task:TASK-SESSION".to_string(),
+                generation: 1,
+            }),
+        );
+        execution.repository = Some(animus_execution_protocol::RepositoryReservation {
+            repository: repository.to_string(),
+            base_ref: "refs/heads/main".to_string(),
+            head_ref: "refs/heads/reviewed".to_string(),
+        });
+        execution
+    }
+
+    #[cfg(feature = "remote-animus-session")]
+    fn test_publication_receipt(repository: &str, commit: &str, tree: &str) -> PublicationReceipt {
+        PublicationReceipt {
+            schema: animus_workflow_runner_protocol::PUBLICATION_RECEIPT_SCHEMA_ID.to_string(),
+            version: animus_workflow_runner_protocol::PUBLICATION_RECEIPT_VERSION,
+            workflow_id: "run".to_string(),
+            workflow_generation: 1,
+            subject: animus_workflow_runner_protocol::PublicationSubjectGeneration {
+                qualified_id: "task:TASK-SESSION".to_string(),
+                generation: 1,
+            },
+            commit_sha: commit.to_string(),
+            tree_sha: tree.to_string(),
+            remote: repository.to_string(),
+            remote_ref: "refs/heads/reviewed".to_string(),
+            observed_remote_sha: commit.to_string(),
+            recovery_ref: "refs/heads/reviewed".to_string(),
+            pull_request: None,
+            issuer: animus_workflow_runner_protocol::PublicationReceiptIssuer::Phase {
+                phase_id: "publish".to_string(),
+                component: "session-test-publisher".to_string(),
+                version: "1.0.0".to_string(),
+            },
+            issued_at: chrono::Utc::now(),
+        }
+    }
+
     #[test]
     fn capabilities_detects_exec_session() {
         assert!(capabilities_advertise_exec_session(&[
@@ -1295,6 +1427,7 @@ mod tests {
                 workflow_ref: Some("coding".to_string()),
                 dispatch_input: None,
                 workflow_id: Some("wf-1".to_string()),
+                execution_fence: None,
             },
             Some(&actor),
             "serialize exec_session",
@@ -1464,24 +1597,47 @@ mod tests {
         {
             assert!(!session_succeeded(status), "{status:?} must not be reported as success");
         }
-        assert!(!session_should_teardown(WorkflowStatus::Paused, true));
-        assert!(session_should_teardown(WorkflowStatus::Completed, true));
-        assert!(!session_should_teardown(WorkflowStatus::Completed, false));
-        assert!(!session_should_teardown(WorkflowStatus::Failed, false));
+        assert!(!session_should_teardown(
+            WorkflowStatus::Paused,
+            true,
+            WorkflowPublicationCleanupPolicy::AfterRemoteVerified,
+            true,
+        ));
+        assert!(session_should_teardown(
+            WorkflowStatus::Completed,
+            true,
+            WorkflowPublicationCleanupPolicy::AfterRemoteVerified,
+            true,
+        ));
+        assert!(!session_should_teardown(
+            WorkflowStatus::Completed,
+            true,
+            WorkflowPublicationCleanupPolicy::Retain,
+            true,
+        ));
+        assert!(session_should_teardown(
+            WorkflowStatus::Completed,
+            false,
+            WorkflowPublicationCleanupPolicy::Retain,
+            false,
+        ));
+        assert!(!session_should_teardown(
+            WorkflowStatus::Failed,
+            false,
+            WorkflowPublicationCleanupPolicy::AfterRemoteVerified,
+            false,
+        ));
         assert!(
-            session_should_teardown(WorkflowStatus::Cancelled, false),
+            session_should_teardown(WorkflowStatus::Cancelled, true, WorkflowPublicationCleanupPolicy::Retain, false,),
             "explicit cancellation is the operator escape hatch for a held unpublished environment"
         );
     }
 
     #[test]
     #[cfg(feature = "remote-animus-session")]
-    fn publication_proof_only_comes_from_matching_terminal_completion() {
-        let proof = serde_json::json!({
-            "commit": "1".repeat(40), "tree": "2".repeat(40), "remote": "origin",
-            "remote_ref": "refs/heads/coding", "recovery_ref": null,
-            "bundle_path": null, "diagnostic": null
-        });
+    fn publication_receipt_only_comes_from_matching_terminal_completion() {
+        let receipt =
+            test_publication_receipt("https://github.com/launchapp-dev/example.git", &"1".repeat(40), &"2".repeat(40));
         let event = |event_kind: &str, terminal: bool, workflow_id: &str| SessionJournalEvent {
             handle_id: "node".into(),
             workflow_id: Some(workflow_id.into()),
@@ -1489,13 +1645,33 @@ mod tests {
             phase_id: None,
             status: None,
             ts: String::new(),
-            payload: serde_json::json!({"post_success": {"publication_durable": true, "proof": proof.clone()}}),
+            payload: serde_json::json!({"publication_receipt": receipt.clone()}),
             terminal,
         };
-        assert!(terminal_publication_proof(&event("phase_completed", true, "run"), "run").is_none());
-        assert!(terminal_publication_proof(&event("workflow_completed", false, "run"), "run").is_none());
-        assert!(terminal_publication_proof(&event("workflow_completed", true, "other"), "run").is_none());
-        assert!(terminal_publication_proof(&event("workflow_completed", true, "run"), "run").is_some());
+        assert!(terminal_publication_receipt(&event("phase_completed", true, "run"), "run").is_none());
+        assert!(terminal_publication_receipt(&event("workflow_completed", false, "run"), "run").is_none());
+        assert!(terminal_publication_receipt(&event("workflow_completed", true, "other"), "run").is_none());
+        assert!(terminal_publication_receipt(&event("workflow_completed", true, "run"), "run").is_some());
+    }
+
+    #[cfg(feature = "remote-animus-session")]
+    #[test]
+    fn session_response_must_echo_the_exact_execution_generation() {
+        let expected = test_execution("https://github.com/launchapp-dev/example.git");
+        let response = |execution_fence| animus_environment_protocol::ExecSessionResponse {
+            workflow_id: Some("run".to_string()),
+            execution_fence,
+            status: "completed".to_string(),
+        };
+
+        assert!(validate_session_response_fence(&response(Some(expected.clone())), Some(&expected), true).is_ok());
+        assert!(validate_session_response_fence(&response(None), Some(&expected), true).is_err());
+
+        let mut stale = expected.clone();
+        stale.workflow_generation += 1;
+        assert!(validate_session_response_fence(&response(Some(stale)), Some(&expected), true).is_err());
+        assert!(validate_session_response_fence(&response(Some(expected)), None, true).is_err());
+        assert!(validate_session_response_fence(&response(None), None, false).is_ok());
     }
 
     #[cfg(feature = "remote-animus-session")]
@@ -1560,30 +1736,33 @@ mod tests {
         .unwrap()
         .trim()
         .to_string();
-        let proof = crate::phase_git::PublicationProof {
-            commit,
-            tree,
-            remote: "origin".to_string(),
-            remote_ref: Some("refs/heads/reviewed".to_string()),
-            recovery_ref: None,
-            bundle_path: None,
-            diagnostic: None,
-        };
+        let execution = test_execution(remote.to_str().unwrap());
+        let receipt = test_publication_receipt(remote.to_str().unwrap(), &commit, &tree);
         let executor = NodeGit { cwd: node };
 
-        let verified = verify_session_publication(&executor, &proof).await.unwrap();
+        let verified = verify_session_publication(&executor, &receipt, &execution).await.unwrap();
         let teardowns = AtomicUsize::new(0);
-        if session_should_teardown(WorkflowStatus::Completed, verified) {
+        if session_should_teardown(
+            WorkflowStatus::Completed,
+            true,
+            WorkflowPublicationCleanupPolicy::AfterRemoteVerified,
+            verified,
+        ) {
             teardowns.fetch_add(1, Ordering::SeqCst);
         }
         assert!(verified);
         assert_eq!(teardowns.load(Ordering::SeqCst), 1);
 
-        let mut forged = proof;
-        forged.tree = "0".repeat(40);
-        let forged_verified = verify_session_publication(&executor, &forged).await.unwrap();
+        let mut forged = receipt;
+        forged.tree_sha = "0".repeat(40);
+        let forged_verified = verify_session_publication(&executor, &forged, &execution).await.unwrap();
         let forged_teardowns = AtomicUsize::new(0);
-        if session_should_teardown(WorkflowStatus::Completed, forged_verified) {
+        if session_should_teardown(
+            WorkflowStatus::Completed,
+            true,
+            WorkflowPublicationCleanupPolicy::AfterRemoteVerified,
+            forged_verified,
+        ) {
             forged_teardowns.fetch_add(1, Ordering::SeqCst);
         }
         assert!(!forged_verified);

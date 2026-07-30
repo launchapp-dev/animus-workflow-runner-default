@@ -217,8 +217,8 @@ mod tests {
 
     use orchestrator_config::workflow_config::McpServerDefinition;
     use orchestrator_core::{
-        builtin_agent_runtime_config, builtin_workflow_config, workflow_config_hash, write_agent_runtime_config,
-        write_workflow_config, LoadedWorkflowConfig, WorkflowConfigMetadata, WorkflowConfigSource,
+        builtin_agent_runtime_config, builtin_workflow_config, workflow_config_hash, write_workflow_config,
+        LoadedWorkflowConfig, WorkflowConfigMetadata, WorkflowConfigSource,
     };
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -272,14 +272,12 @@ mod tests {
             .expect("registry state");
     }
 
-    // TODO: skill_dispatch test intermittently sees scoped_state_root resolve to a
-    // different path between writing the skills-registry.v1.json fixture and the
-    // resolver reading it. Same root cause as test_persist_and_load_phase_output.
-    // Passes reliably in isolation. Reproduce and fix scoped_state_root resolution
-    // race separately.
-    #[ignore = "intermittent scoped_state_root race on skills-registry fixture; passes in isolation"]
     #[test]
     fn runtime_resolves_installed_registry_skills_into_prompt_and_contract() {
+        use orchestrator_config::agent_runtime_config::{
+            AgentProfile, Idempotency, PhaseExecutionDefinition, PhaseExecutionMode,
+        };
+
         let _guard = crate::test_env::scoped_state_serializer();
         let temp = tempfile::tempdir().expect("tempdir");
         let mut workflow = builtin_workflow_config();
@@ -299,12 +297,52 @@ mod tests {
         write_workflow_config(temp.path(), &workflow).expect("workflow config");
         write_installed_skill(&temp);
         let mut runtime = builtin_agent_runtime_config();
-        runtime.phases.get_mut("implementation").expect("implementation phase").skills =
-            vec!["registry-review".to_string()];
-        write_agent_runtime_config(temp.path(), &runtime).expect("runtime config");
-
+        runtime.tools_allowlist = vec!["git".to_string()];
+        let default_agent = AgentProfile {
+            description: "test agent".to_string(),
+            system_prompt: "Run the fixture phase.".to_string(),
+            ..Default::default()
+        };
+        runtime.agents.insert("default".to_string(), default_agent);
+        // v0.6 intentionally ships no built-in phase definitions. Define the
+        // fixture phase explicitly instead of relying on the removed legacy
+        // `implementation` default.
+        runtime.phases.insert(
+            "implementation".to_string(),
+            PhaseExecutionDefinition {
+                mode: PhaseExecutionMode::Agent,
+                agent_id: Some("default".to_string()),
+                directive: None,
+                system_prompt: None,
+                runtime: None,
+                capabilities: None,
+                output_contract: None,
+                output_json_schema: None,
+                decision_contract: None,
+                retry: None,
+                skills: vec!["registry-review".to_string()],
+                command: None,
+                manual: None,
+                default_tool: None,
+                idempotency: Idempotency::Unknown,
+                evals: None,
+                worktree: None,
+            },
+        );
         let project_root = temp.path().to_string_lossy().to_string();
-        let ctx = RuntimeConfigContext::load(&project_root);
+        let ctx = RuntimeConfigContext {
+            agent_runtime_config: runtime,
+            workflow_config: LoadedWorkflowConfig {
+                metadata: WorkflowConfigMetadata {
+                    schema: workflow.schema.clone(),
+                    version: workflow.version,
+                    hash: workflow_config_hash(&workflow),
+                    source: WorkflowConfigSource::Builtin,
+                },
+                config: workflow,
+                path: PathBuf::from("fixture"),
+            },
+        };
         let resolved = resolve_phase_skills(&ctx, temp.path(), "implementation").expect("resolve skills");
         assert_eq!(resolved.requested_skills, vec!["registry-review"]);
         assert!(matches!(

@@ -3019,6 +3019,7 @@ mod tests {
                 ],
                 variables: Vec::new(),
                 worktree: None,
+                publication: None,
                 budget: None,
                 environment: Some("workflow-env".to_string()),
                 workspace: Some("workflow-ws".to_string()),
