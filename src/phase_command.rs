@@ -53,17 +53,19 @@ pub(crate) struct CommandExecutionResult {
     pub failure_summary: Option<String>,
 }
 
-/// Template variables that a command phase MUST have bound to a non-empty
-/// value before it is safe to execute. Today this is the subject identity:
+/// Template variables that a command phase MUST have bound to a concrete,
+/// non-empty value before it is safe to execute. This includes subject
+/// identity and the Git metadata used by coding checkout commands:
 /// a command like `animus subject status --id {{subject_id}}` dispatched on a
 /// run with no bound subject expands `{{subject_id}}` to the empty string and
 /// invokes `animus subject status --id ""`, which the CLI rejects with
 /// "--id must not be empty" (exit 2). The pre-fix runner then treated that as
 /// a normal non-zero exit -> rework -> 4 retries -> escalated. Detecting the
 /// unresolved binding up front lets the phase fail-fast on attempt 1 with a
-/// clear message instead of burning the whole rework budget. Extend this list
-/// as other required-non-empty bindings are identified.
-pub(crate) const COMMAND_REQUIRED_NONEMPTY_VARS: &[&str] = &["subject_id"];
+/// clear message instead of burning the whole rework budget. A value that still
+/// contains a `{{...}}` marker is unresolved too; executing it would reproduce
+/// TASK-881's `git clone '{{git_repo}}'` failure.
+pub(crate) const COMMAND_REQUIRED_NONEMPTY_VARS: &[&str] = &["subject_id", "git_repo", "git_ref"];
 
 /// Upper bound on the best-effort subject/get enrichment run before every
 /// command phase. On timeout the phase degrades to scalar context rather than
@@ -130,13 +132,103 @@ pub(crate) fn unresolved_required_command_vars(
     for field in fields {
         for name in referenced_template_vars(field) {
             let required = COMMAND_REQUIRED_NONEMPTY_VARS.contains(&name);
-            let empty = template_vars.get(name).map(|value| value.trim().is_empty()).unwrap_or(true);
-            if required && empty && !unresolved.iter().any(|existing| existing == name) {
+            let invalid = template_vars.get(name).map(|value| template_binding_is_unresolved(value)).unwrap_or(true);
+            if required && invalid && !unresolved.iter().any(|existing| existing == name) {
                 unresolved.push(name.to_string());
             }
         }
     }
     unresolved
+}
+
+fn template_binding_is_unresolved(value: &str) -> bool {
+    let value = value.trim();
+    value.is_empty() || value.contains("{{") || value.contains("}}")
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SubjectGitMetadata {
+    pub repo: Option<String>,
+    pub git_ref: Option<String>,
+}
+
+#[cfg(test)]
+type TestSubjectGitMetadataMap = HashMap<(String, String, String), SubjectGitMetadata>;
+
+#[cfg(test)]
+static TEST_SUBJECT_GIT_METADATA: std::sync::OnceLock<std::sync::Mutex<TestSubjectGitMetadataMap>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn install_test_subject_git_metadata(
+    project_root: &str,
+    kind: &str,
+    subject_id: &str,
+    metadata: SubjectGitMetadata,
+) {
+    TEST_SUBJECT_GIT_METADATA
+        .get_or_init(Default::default)
+        .lock()
+        .expect("test Git metadata lock")
+        .insert((project_root.to_string(), kind.to_string(), subject_id.to_string()), metadata);
+}
+
+impl SubjectGitMetadata {
+    pub(crate) fn validated_repo(&self) -> Option<String> {
+        self.repo.as_deref().filter(|value| !template_binding_is_unresolved(value)).map(str::to_owned)
+    }
+}
+
+/// Coding workflows always require a concrete repository and ref before any
+/// execution environment is acquired. Matching the canonical workflow name
+/// and its phase namespace keeps the guard effective for renamed/derived
+/// coding workflows without imposing Git metadata on unrelated workflows.
+pub(crate) fn workflow_requires_git_metadata<'a>(
+    workflow_ref: &str,
+    phase_ids: impl IntoIterator<Item = &'a str>,
+) -> bool {
+    let workflow_ref = workflow_ref.trim().to_ascii_lowercase();
+    workflow_ref == "coding"
+        || workflow_ref.starts_with("coding-")
+        || phase_ids.into_iter().any(|phase_id| phase_id.trim().to_ascii_lowercase().starts_with("code-"))
+}
+
+/// Validate the coding subject before node acquisition. This is intentionally
+/// separate from command templating: command validation happens after the
+/// daemon broker has already prepared/acquired a node, which is too late for
+/// TASK-881's no-node-spawn invariant.
+pub(crate) fn validate_coding_git_metadata(
+    workflow_ref: &str,
+    subject_id: &str,
+    metadata: &SubjectGitMetadata,
+) -> Result<()> {
+    let mut missing = Vec::new();
+    let mut invalid = Vec::new();
+    for (name, value) in [("git_repo", metadata.repo.as_deref()), ("git_ref", metadata.git_ref.as_deref())] {
+        match value {
+            None => missing.push(name),
+            Some(value) if value.trim().is_empty() => missing.push(name),
+            Some(value) if template_binding_is_unresolved(value) => invalid.push(name),
+            Some(_) => {}
+        }
+    }
+    if missing.is_empty() && invalid.is_empty() {
+        return Ok(());
+    }
+
+    let mut problems = Vec::new();
+    if !missing.is_empty() {
+        problems.push(format!("missing {}", missing.join(", ")));
+    }
+    if !invalid.is_empty() {
+        problems.push(format!("unrendered/invalid {}", invalid.join(", ")));
+    }
+    anyhow::bail!(
+        "coding workflow '{}' cannot start for subject '{}': {}; set concrete git_repo and git_ref subject fields before retrying (execution environment was not acquired)",
+        workflow_ref,
+        subject_id,
+        problems.join("; ")
+    )
 }
 
 /// True when a command phase has opted into producing structured verdicts:
@@ -473,19 +565,26 @@ async fn fetch_subject_record(project_root: &str, kind: &str, native_id: &str) -
     None
 }
 
-/// Best-effort fetch of the bound subject's `git_repo` custom field — the SAME
-/// value a command phase renders as `{{git_repo}}` (case-insensitive, mirroring
-/// [`build_command_template_vars`]'s lowercased custom-field keys). Used to
-/// repo-scope the per-run environment node's GitHub App installation token (see
-/// [`crate::phase_environment`]). Reuses the same bounded `subject/get` fetch the
-/// command path uses; a fetch failure / missing field degrades to `None` (a bare
-/// node, no repo scoping).
-pub(crate) async fn subject_git_repo(project_root: &str, kind: &str, subject_id: &str) -> Option<String> {
+/// Best-effort fetch of the bound subject's Git metadata — the SAME values a
+/// command phase renders as `{{git_repo}}` and `{{git_ref}}`. The caller decides
+/// whether absence is allowed; coding entrypoints fail closed before acquiring
+/// an environment, while unrelated workflows may continue without Git data.
+pub(crate) async fn subject_git_metadata(project_root: &str, kind: &str, subject_id: &str) -> SubjectGitMetadata {
     // The brokered per-phase entry supplies no explicit kind and a possibly
     // kind-QUALIFIED id (`task:TASK-1`); the owned path supplies the real kind
     // and a BARE native id. Derive `(kind, native_id)` for the `subject/get`
     // fetch from whichever form arrived.
     let (kind, native_id) = resolve_kind_and_native(kind, subject_id);
+    #[cfg(test)]
+    if let Some(metadata) = TEST_SUBJECT_GIT_METADATA
+        .get_or_init(Default::default)
+        .lock()
+        .expect("test Git metadata lock")
+        .get(&(project_root.to_string(), kind.to_string(), native_id.to_string()))
+        .cloned()
+    {
+        return metadata;
+    }
     let record = tokio::time::timeout(
         std::time::Duration::from_secs(SUBJECT_FETCH_TIMEOUT_SECS),
         fetch_subject_record(project_root, kind, native_id),
@@ -493,10 +592,10 @@ pub(crate) async fn subject_git_repo(project_root: &str, kind: &str, subject_id:
     .await
     .ok()
     .flatten();
-    subject_custom_fields(record.as_ref())
-        .into_iter()
-        .find(|(key, value)| key.eq_ignore_ascii_case("git_repo") && !value.trim().is_empty())
-        .map(|(_, value)| value)
+    let fields = subject_custom_fields(record.as_ref());
+    let find =
+        |name: &str| fields.iter().find(|(key, _)| key.eq_ignore_ascii_case(name)).map(|(_, value)| value.clone());
+    SubjectGitMetadata { repo: find("git_repo"), git_ref: find("git_ref") }
 }
 
 /// Derive the `(kind, native_id)` pair the `subject/get` fetch needs from a
@@ -909,11 +1008,10 @@ pub(crate) async fn run_workflow_phase_with_command(
 
     let template_vars = build_command_template_vars(context);
 
-    // Fail-fast (TASK-205): a required binding like `{{subject_id}}` that
-    // expands to empty (no subject bound) would run e.g. `animus subject
-    // status --id ""` and get rejected by the CLI, then be retried until the
-    // rework budget escalates. Refuse to execute the command and surface a
-    // clear, attempt-1 terminal failure instead.
+    // Fail-fast (TASK-205/TASK-881): a required binding that is empty or still
+    // contains an unrendered marker would otherwise execute a malformed command
+    // and be retried until the rework budget escalates. Refuse to execute it and
+    // surface a clear, attempt-1 terminal failure instead.
     let unresolved = unresolved_required_command_vars(command, &template_vars);
     if !unresolved.is_empty() {
         let placeholders = unresolved
@@ -928,7 +1026,7 @@ pub(crate) async fn run_workflow_phase_with_command(
             .collect::<Vec<_>>()
             .join(", ");
         let message = format!(
-            "phase '{}' command '{}' references unresolved template {} — no subject bound; failing before execution to avoid burning the rework budget",
+            "phase '{}' command '{}' references unresolved required subject metadata {} — failing before execution to avoid burning the rework budget",
             context.phase_id, command.program, placeholders
         );
         return Err(anyhow::Error::new(CommandPhaseFailedError {
@@ -1299,6 +1397,67 @@ mod tests {
     }
 
     #[test]
+    fn unresolved_required_command_vars_flags_missing_and_unrendered_git_metadata() {
+        let command = command_def("git", &["clone", "{{git_repo}}", "--branch", "{{git_ref}}"]);
+        let mut vars = HashMap::new();
+        vars.insert("git_repo".to_string(), "{{git_repo}}".to_string());
+        vars.insert("git_ref".to_string(), "  ".to_string());
+
+        assert_eq!(
+            unresolved_required_command_vars(&command, &vars),
+            vec!["git_repo".to_string(), "git_ref".to_string()]
+        );
+
+        vars.insert("git_repo".to_string(), "https://github.com/acme/app.git".to_string());
+        vars.insert("git_ref".to_string(), "main".to_string());
+        assert!(unresolved_required_command_vars(&command, &vars).is_empty());
+    }
+
+    #[test]
+    fn coding_git_metadata_requirement_covers_workflow_and_phase_namespaces() {
+        assert!(workflow_requires_git_metadata("coding", std::iter::empty()));
+        assert!(workflow_requires_git_metadata("CODING", std::iter::empty()));
+        assert!(workflow_requires_git_metadata("coding-hotfix", std::iter::empty()));
+        assert!(workflow_requires_git_metadata("custom", ["CODE-PREPARE"].into_iter()));
+        assert!(!workflow_requires_git_metadata("directory-reconcile", ["scan", "apply"].into_iter()));
+    }
+
+    #[test]
+    fn coding_git_metadata_validation_accepts_concrete_values() {
+        let metadata = SubjectGitMetadata {
+            repo: Some("https://github.com/acme/app.git".to_string()),
+            git_ref: Some("feature/rock-solid".to_string()),
+        };
+        validate_coding_git_metadata("coding", "TASK-881", &metadata).expect("concrete metadata is valid");
+        assert_eq!(metadata.validated_repo().as_deref(), Some("https://github.com/acme/app.git"));
+    }
+
+    #[test]
+    fn coding_git_metadata_validation_reports_missing_fields_before_environment_acquire() {
+        let err = validate_coding_git_metadata("coding", "TASK-881", &SubjectGitMetadata::default())
+            .expect_err("missing metadata must fail closed");
+        let message = err.to_string();
+        assert!(message.contains("TASK-881"));
+        assert!(message.contains("missing git_repo, git_ref"));
+        assert!(message.contains("execution environment was not acquired"));
+    }
+
+    #[test]
+    fn coding_git_metadata_validation_reports_unrendered_fields_before_environment_acquire() {
+        let metadata = SubjectGitMetadata {
+            repo: Some("{{git_repo}}".to_string()),
+            git_ref: Some("refs/heads/{{git_ref}}".to_string()),
+        };
+        let err = validate_coding_git_metadata("coding-rework", "TASK-881", &metadata)
+            .expect_err("unrendered metadata must fail closed");
+        let message = err.to_string();
+        assert!(message.contains("coding-rework"));
+        assert!(message.contains("unrendered/invalid git_repo, git_ref"));
+        assert!(message.contains("set concrete git_repo and git_ref"));
+        assert!(metadata.validated_repo().is_none());
+    }
+
+    #[test]
     fn unresolved_required_command_vars_ignores_unreferenced_and_optional() {
         // subject_id is empty but not referenced by the command -> not flagged.
         let command = command_def("echo", &["hello"]);
@@ -1444,7 +1603,7 @@ mod tests {
         // would surface exit_code Some(1) via failure_summary, not fail-fast.
         assert!(cmd_fail.exit_code.is_none(), "fail-fast must not execute the command");
         assert!(cmd_fail.message.contains("{{subject_id}}"), "message names the unresolved placeholder");
-        assert!(cmd_fail.message.contains("no subject bound"));
+        assert!(cmd_fail.message.contains("unresolved required subject metadata"));
     }
 
     #[tokio::test]

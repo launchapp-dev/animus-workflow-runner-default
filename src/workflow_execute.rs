@@ -376,6 +376,59 @@ pub async fn execute_workflow_with_hub(
     .await?;
     let mut task = subject_context.task.take();
 
+    let subject_id_str = workflow_subject.id().to_string();
+    // Subject kind for rendering `{{subject_id}}` kind-qualified in command
+    // phases (e.g. `mark-running`), so a dynamic-kind subject's status call
+    // targets its own backend instead of the `task` default.
+    let subject_kind_str = workflow_subject.kind().to_string();
+    let workflow_ref = workflow.workflow_ref.clone().unwrap_or_else(|| workflow_config.default_workflow_ref.clone());
+    anyhow::ensure!(
+        workflow_ref.eq_ignore_ascii_case(&policy_workflow_ref),
+        "workflow '{}' resolved publication policy for '{}' but journal state uses '{}'",
+        workflow.id,
+        policy_workflow_ref,
+        workflow_ref
+    );
+    let phases_to_run: Vec<String> = if let Some(ref phase_filter) = params.phase_filter {
+        vec![phase_filter.clone()]
+    } else {
+        workflow.phases.iter().map(|p| p.phase_id.clone()).collect()
+    };
+    if phases_to_run.is_empty() {
+        return Err(anyhow!("workflow has no phases to execute"));
+    }
+
+    // TASK-881: a coding run without concrete Git metadata can never prepare
+    // its checkout. Validate the subject before execution-CWD preparation,
+    // full-session delegation, broker acquisition, or owned node preparation.
+    // Command-template validation is intentionally not relied on here because
+    // it runs only after scarce execution infrastructure has been allocated.
+    let subject_git_metadata =
+        crate::phase_command::subject_git_metadata(&params.project_root, &subject_kind_str, &subject_id_str).await;
+    if crate::phase_command::workflow_requires_git_metadata(&workflow_ref, phases_to_run.iter().map(String::as_str)) {
+        if let Err(error) =
+            crate::phase_command::validate_coding_git_metadata(&workflow_ref, &subject_id_str, &subject_git_metadata)
+        {
+            let message = error.to_string();
+            // The workflow row is minted before subject enrichment so the
+            // daemon can durably correlate every attempted dispatch. Do not
+            // leave that row Running when preflight rejects its input: mark
+            // this exact run terminal Failed before returning the actionable
+            // error. No phase, execution CWD, session, broker, or node has run.
+            hub.workflows()
+                .fail_current_phase(&workflow.id, message.clone())
+                .await
+                .with_context(|| {
+                    format!(
+                        "coding Git metadata preflight rejected workflow {} but its durable row could not be marked failed: {}",
+                        workflow.id, message
+                    )
+                })?;
+            return Err(anyhow!(message));
+        }
+    }
+    let subject_git_repo = subject_git_metadata.validated_repo();
+
     let execution_cwd = ensure_execution_cwd(hub.clone(), &params.project_root, &workflow_subject, &subject_context)
         .await
         .context("failed to resolve execution cwd")?;
@@ -394,38 +447,16 @@ pub async fn execute_workflow_with_hub(
         subject_context.subject_description = task.description.clone();
     }
 
-    let phases_to_run: Vec<String> = if let Some(ref phase_filter) = params.phase_filter {
-        vec![phase_filter.clone()]
-    } else {
-        workflow.phases.iter().map(|p| p.phase_id.clone()).collect()
-    };
-
-    if phases_to_run.is_empty() {
-        return Err(anyhow!("workflow has no phases to execute"));
-    }
     let coding_rework_contract = workflow_has_coding_rework_contract(&workflow);
 
     if let Err(err) = hub.daemon().start(Default::default()).await {
         eprintln!("warning: failed to auto-start runner for workflow execute: {err}");
     }
 
-    let subject_id_str = workflow_subject.id().to_string();
-    // Subject kind for rendering `{{subject_id}}` kind-qualified in command
-    // phases (e.g. `mark-running`), so a dynamic-kind subject's status call
-    // targets its own backend instead of the `task` default.
-    let subject_kind_str = workflow_subject.kind().to_string();
     let subject_title = subject_context.subject_title.clone();
     let subject_description = subject_context.subject_description.clone();
     let task_complexity = task.as_ref().map(|t| t.complexity);
 
-    let workflow_ref = workflow.workflow_ref.clone().unwrap_or_else(|| workflow_config.default_workflow_ref.clone());
-    anyhow::ensure!(
-        workflow_ref.eq_ignore_ascii_case(&policy_workflow_ref),
-        "workflow '{}' resolved publication policy for '{}' but journal state uses '{}'",
-        workflow.id,
-        policy_workflow_ref,
-        workflow_ref
-    );
     let pack_registry = resolve_pack_registry(Path::new(&params.project_root))?;
     ensure_workflow_pack_execution_requirements(&pack_registry, &workflow_config, &workflow_ref)?;
     let phase_inputs = workflow_phase_inputs(&workflow);
@@ -453,9 +484,6 @@ pub async fn execute_workflow_with_hub(
         ) {
             if crate::workflow_session::environment_is_session_capable(Path::new(&params.project_root), &environment.id)
             {
-                let subject_git_repo =
-                    crate::phase_command::subject_git_repo(&params.project_root, &subject_kind_str, &subject_id_str)
-                        .await;
                 let phases_requested: Vec<String> =
                     workflow.phases.iter().map(|phase| phase.phase_id.clone()).collect();
                 return crate::workflow_session::delegate_workflow_via_session(
@@ -502,8 +530,6 @@ pub async fn execute_workflow_with_hub(
     // installation token to THAT repo (correct installation, least privilege). A
     // bare non-coding run without `git_repo` leaves the metadata untouched.
     let publication_required = publication_contract.as_ref().is_some_and(|publication| publication.required);
-    let subject_git_repo =
-        crate::phase_command::subject_git_repo(&params.project_root, &subject_kind_str, &subject_id_str).await;
     let brokered_environment: Option<std::sync::Arc<crate::phase_environment::BrokeredEnvironment>> =
         match crate::phase_environment::BrokeredEnvironment::acquire_from_env(subject_git_repo.clone()).await {
             Some(result) => Some(std::sync::Arc::new(
@@ -3385,6 +3411,101 @@ mod rework_convergence_tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
+    async fn missing_coding_git_metadata_fails_durable_run_before_checkout_preparation() {
+        let _state_guard = crate::test_env::scoped_state_serializer();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut workflow_config = builtin_workflow_config();
+        workflow_config.default_workflow_ref = "coding".to_string();
+        workflow_config.phase_catalog.insert(
+            "code-prepare".to_string(),
+            PhaseUiDefinition {
+                label: "Prepare".to_string(),
+                description: "Checkout preparation".to_string(),
+                category: "implementation".to_string(),
+                icon: None,
+                docs_url: None,
+                tags: Vec::new(),
+                visible: true,
+            },
+        );
+        workflow_config.workflows = vec![WorkflowDefinition {
+            id: "coding".to_string(),
+            name: "Coding".to_string(),
+            description: "TASK-881 preflight fixture".to_string(),
+            phases: vec!["code-prepare".to_string().into()],
+            variables: Vec::new(),
+            worktree: None,
+            budget: None,
+            environment: None,
+            workspace: None,
+            publication: None,
+        }];
+        write_workflow_config(temp.path(), &workflow_config).expect("workflow config");
+        let _config_source =
+            orchestrator_config::workflow_config::config_source_client::install_yaml_config_source_base(temp.path());
+
+        let hub = Arc::new(InMemoryServiceHub::new().with_project_root(temp.path()));
+        let task = hub
+            .tasks()
+            .create(TaskCreateInput {
+                title: "Missing Git metadata".to_string(),
+                description: "Must fail before checkout preparation".to_string(),
+                task_type: Some(TaskType::Feature),
+                priority: Some(Priority::High),
+                created_by: Some("test".to_string()),
+                tags: Vec::new(),
+                linked_requirements: Vec::new(),
+                linked_architecture_entities: Vec::new(),
+            })
+            .await
+            .expect("task");
+
+        let error = match execute_workflow_with_hub(
+            WorkflowExecuteParams {
+                project_root: temp.path().to_string_lossy().to_string(),
+                workflow_id: None,
+                bootstrap_workflow_id: None,
+                execution_fence: None,
+                task_id: Some(task.id.clone()),
+                requirement_id: None,
+                subject_id: None,
+                title: None,
+                description: None,
+                workflow_ref: Some("coding".to_string()),
+                input: None,
+                vars: HashMap::new(),
+                model: None,
+                tool: None,
+                phase_timeout_secs: None,
+                phase_filter: None,
+                phase_routing: None,
+                mcp_config: None,
+                actor: None,
+            },
+            hub.clone(),
+            None,
+            None,
+        )
+        .await
+        {
+            Ok(_) => panic!("missing coding metadata must fail before execution setup"),
+            Err(error) => error,
+        };
+
+        let message = error.to_string();
+        assert!(message.contains(&task.id));
+        assert!(message.contains("missing git_repo, git_ref"));
+        assert!(message.contains("execution environment was not acquired"));
+
+        let runs = hub.workflows().list().await.expect("workflow rows");
+        assert_eq!(runs.len(), 1, "the attempted dispatch keeps one correlated durable row");
+        assert_eq!(runs[0].status, WorkflowStatus::Failed, "preflight rejection is terminal, not a ghost run");
+        let task_after = hub.tasks().get(&task.id).await.expect("task after rejection");
+        assert!(task_after.worktree_path.is_none(), "checkout/worktree preparation must not run");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn phase_filtered_coding_resume_keeps_the_non_code_rework_guard() {
         let _state_guard = crate::test_env::scoped_state_serializer();
         let temp = tempfile::tempdir().expect("tempdir");
@@ -3457,6 +3578,15 @@ mod rework_convergence_tests {
             })
             .await
             .expect("task");
+        crate::phase_command::install_test_subject_git_metadata(
+            &temp.path().to_string_lossy(),
+            orchestrator_core::SUBJECT_KIND_TASK,
+            &task.id,
+            crate::phase_command::SubjectGitMetadata {
+                repo: Some("https://github.com/acme/fixture.git".to_string()),
+                git_ref: Some("test/filtered-resume".to_string()),
+            },
+        );
         let events = Arc::new(CapturedEvents::default());
         let result = execute_workflow_with_hub(
             WorkflowExecuteParams {

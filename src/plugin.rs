@@ -490,7 +490,27 @@ pub async fn handle_workflow_run_phase(request: WorkflowPhaseRunRequest) -> Resu
     // GitHub App installation token to THAT repo. The broker single-flights the
     // node per run, so this matters on the run's FIRST phase acquire; a bare run
     // without `git_repo` leaves the metadata untouched.
-    let subject_git_repo = crate::phase_command::subject_git_repo(&project_root, "", &request.subject_id).await;
+    // TASK-881: per-phase broker calls are a second public execution entrypoint.
+    // Reject malformed coding subjects before touching the broker so a missing
+    // or literal `{{git_repo}}` cannot allocate a shared Railway node.
+    let subject_git_metadata = crate::phase_command::subject_git_metadata(&project_root, "", &request.subject_id).await;
+    if crate::phase_command::workflow_requires_git_metadata(
+        &request.workflow_ref,
+        std::iter::once(request.phase_id.as_str()),
+    ) {
+        if let Err(error) = crate::phase_command::validate_coding_git_metadata(
+            &request.workflow_ref,
+            &request.subject_id,
+            &subject_git_metadata,
+        ) {
+            // Return a terminal phase result, not an RPC error. The latter is
+            // indistinguishable from a transient plugin/infrastructure fault
+            // to the daemon and can be retried. Missing subject metadata is an
+            // operator-correctable input invariant and must consume no retry.
+            return Ok(terminal_git_metadata_failure(&request, &error));
+        }
+    }
+    let subject_git_repo = subject_git_metadata.validated_repo();
     let brokered_environment: Option<std::sync::Arc<crate::phase_environment::BrokeredEnvironment>> =
         match crate::phase_environment::BrokeredEnvironment::acquire_from_env(subject_git_repo).await {
             Some(result) => Some(std::sync::Arc::new(result.with_context(|| {
@@ -575,6 +595,27 @@ pub async fn handle_workflow_run_phase(request: WorkflowPhaseRunRequest) -> Resu
             model: None,
             tool: None,
         }),
+    }
+}
+
+fn terminal_git_metadata_failure(request: &WorkflowPhaseRunRequest, error: &anyhow::Error) -> WorkflowPhaseRunResult {
+    WorkflowPhaseRunResult {
+        phase_status: phase_status::FAILED.to_string(),
+        execution_fence: request.execution_fence.clone(),
+        duration_secs: 0,
+        outcome: serde_json::json!({
+            "error": error.to_string(),
+            "terminal": true,
+        }),
+        metadata: serde_json::json!({
+            "failure_class": "subject_configuration",
+            "retryable": false,
+            "environment_acquired": false,
+        }),
+        publication_receipt: None,
+        signals: Vec::new(),
+        model: None,
+        tool: None,
     }
 }
 
@@ -737,5 +778,26 @@ mod tests {
         assert!(serialized.get("mcp_config").is_some(), "mcp_config must round-trip on the wire");
         let back: WorkflowPhaseRunRequest = serde_json::from_value(serialized).expect("deserialize");
         assert_eq!(back.mcp_config, original.mcp_config);
+    }
+
+    #[test]
+    fn invalid_git_metadata_becomes_terminal_non_retryable_phase_failure() {
+        let mut request = make_phase_run_request(None);
+        request.workflow_ref = "coding".to_string();
+        request.phase_id = "code-prepare".to_string();
+        let error =
+            anyhow!("coding workflow 'coding' cannot start for subject 'task:TASK-1': missing git_repo, git_ref");
+
+        let result = terminal_git_metadata_failure(&request, &error);
+
+        assert_eq!(result.phase_status, phase_status::FAILED);
+        assert_eq!(result.duration_secs, 0);
+        assert_eq!(result.outcome["terminal"], true);
+        assert!(result.outcome["error"].as_str().unwrap_or_default().contains("git_repo, git_ref"));
+        assert_eq!(result.metadata["failure_class"], "subject_configuration");
+        assert_eq!(result.metadata["retryable"], false);
+        assert_eq!(result.metadata["environment_acquired"], false);
+        assert!(result.model.is_none());
+        assert!(result.tool.is_none());
     }
 }
