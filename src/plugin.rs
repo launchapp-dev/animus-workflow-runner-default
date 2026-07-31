@@ -493,11 +493,17 @@ pub async fn handle_workflow_run_phase(request: WorkflowPhaseRunRequest) -> Resu
     // TASK-881: per-phase broker calls are a second public execution entrypoint.
     // Reject malformed coding subjects before touching the broker so a missing
     // or literal `{{git_repo}}` cannot allocate a shared Railway node.
-    let subject_git_metadata = crate::phase_command::subject_git_metadata(&project_root, "", &request.subject_id).await;
-    if crate::phase_command::workflow_requires_git_metadata(
+    let requires_git_metadata = crate::phase_command::workflow_requires_git_metadata(
         &request.workflow_ref,
         std::iter::once(request.phase_id.as_str()),
-    ) {
+    );
+    let subject_git_metadata =
+        match crate::phase_command::subject_git_metadata(&project_root, "", &request.subject_id).await {
+            Ok(metadata) => metadata,
+            Err(error) if requires_git_metadata => return Ok(retryable_git_metadata_lookup_failure(&request, &error)),
+            Err(_) => crate::phase_command::SubjectGitMetadata::default(),
+        };
+    if requires_git_metadata {
         if let Err(error) = crate::phase_command::validate_coding_git_metadata(
             &request.workflow_ref,
             &request.subject_id,
@@ -610,6 +616,30 @@ fn terminal_git_metadata_failure(request: &WorkflowPhaseRunRequest, error: &anyh
         metadata: serde_json::json!({
             "failure_class": "subject_configuration",
             "retryable": false,
+            "environment_acquired": false,
+        }),
+        publication_receipt: None,
+        signals: Vec::new(),
+        model: None,
+        tool: None,
+    }
+}
+
+fn retryable_git_metadata_lookup_failure(
+    request: &WorkflowPhaseRunRequest,
+    error: &anyhow::Error,
+) -> WorkflowPhaseRunResult {
+    WorkflowPhaseRunResult {
+        phase_status: phase_status::FAILED.to_string(),
+        execution_fence: request.execution_fence.clone(),
+        duration_secs: 0,
+        outcome: serde_json::json!({
+            "error": format!("coding Git metadata lookup is temporarily unavailable: {error}"),
+            "terminal": false,
+        }),
+        metadata: serde_json::json!({
+            "failure_class": "subject_backend",
+            "retryable": true,
             "environment_acquired": false,
         }),
         publication_receipt: None,
@@ -799,5 +829,22 @@ mod tests {
         assert_eq!(result.metadata["environment_acquired"], false);
         assert!(result.model.is_none());
         assert!(result.tool.is_none());
+    }
+
+    #[test]
+    fn subject_backend_lookup_failure_is_retryable_without_environment_acquisition() {
+        let mut request = make_phase_run_request(None);
+        request.workflow_ref = "coding".to_string();
+        request.phase_id = "code-prepare".to_string();
+        let error = anyhow!("subject backend timed out");
+
+        let result = retryable_git_metadata_lookup_failure(&request, &error);
+
+        assert_eq!(result.phase_status, phase_status::FAILED);
+        assert_eq!(result.outcome["terminal"], false);
+        assert!(result.outcome["error"].as_str().unwrap_or_default().contains("temporarily unavailable"));
+        assert_eq!(result.metadata["failure_class"], "subject_backend");
+        assert_eq!(result.metadata["retryable"], true);
+        assert_eq!(result.metadata["environment_acquired"], false);
     }
 }

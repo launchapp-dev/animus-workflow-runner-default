@@ -403,9 +403,26 @@ pub async fn execute_workflow_with_hub(
     // full-session delegation, broker acquisition, or owned node preparation.
     // Command-template validation is intentionally not relied on here because
     // it runs only after scarce execution infrastructure has been allocated.
-    let subject_git_metadata =
-        crate::phase_command::subject_git_metadata(&params.project_root, &subject_kind_str, &subject_id_str).await;
-    if crate::phase_command::workflow_requires_git_metadata(&workflow_ref, phases_to_run.iter().map(String::as_str)) {
+    let requires_git_metadata =
+        crate::phase_command::workflow_requires_git_metadata(&workflow_ref, phases_to_run.iter().map(String::as_str));
+    let subject_git_metadata = match crate::phase_command::subject_git_metadata(
+        &params.project_root,
+        &subject_kind_str,
+        &subject_id_str,
+    )
+    .await
+    {
+        Ok(metadata) => metadata,
+        Err(error) if requires_git_metadata => {
+            return Err(anyhow!(
+                    "coding Git metadata lookup is temporarily unavailable for subject '{}': {}; execution environment was not acquired",
+                    subject_id_str,
+                    error
+                ));
+        }
+        Err(_) => crate::phase_command::SubjectGitMetadata::default(),
+    };
+    if requires_git_metadata {
         if let Err(error) =
             crate::phase_command::validate_coding_git_metadata(&workflow_ref, &subject_id_str, &subject_git_metadata)
         {
@@ -3459,6 +3476,12 @@ mod rework_convergence_tests {
             })
             .await
             .expect("task");
+        crate::phase_command::install_test_subject_git_metadata(
+            &temp.path().to_string_lossy(),
+            orchestrator_core::SUBJECT_KIND_TASK,
+            &task.id,
+            crate::phase_command::SubjectGitMetadata::default(),
+        );
 
         let error = match execute_workflow_with_hub(
             WorkflowExecuteParams {
@@ -3501,6 +3524,105 @@ mod rework_convergence_tests {
         assert_eq!(runs.len(), 1, "the attempted dispatch keeps one correlated durable row");
         assert_eq!(runs[0].status, WorkflowStatus::Failed, "preflight rejection is terminal, not a ghost run");
         let task_after = hub.tasks().get(&task.id).await.expect("task after rejection");
+        assert!(task_after.worktree_path.is_none(), "checkout/worktree preparation must not run");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn unavailable_subject_backend_does_not_terminalize_coding_run_or_prepare_checkout() {
+        let _state_guard = crate::test_env::scoped_state_serializer();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut workflow_config = builtin_workflow_config();
+        workflow_config.default_workflow_ref = "coding".to_string();
+        workflow_config.phase_catalog.insert(
+            "code-prepare".to_string(),
+            PhaseUiDefinition {
+                label: "Prepare".to_string(),
+                description: "Checkout preparation".to_string(),
+                category: "implementation".to_string(),
+                icon: None,
+                docs_url: None,
+                tags: Vec::new(),
+                visible: true,
+            },
+        );
+        workflow_config.workflows = vec![WorkflowDefinition {
+            id: "coding".to_string(),
+            name: "Coding".to_string(),
+            description: "TASK-881 transient subject-backend fixture".to_string(),
+            phases: vec!["code-prepare".to_string().into()],
+            variables: Vec::new(),
+            worktree: None,
+            budget: None,
+            environment: None,
+            workspace: None,
+            publication: None,
+        }];
+        write_workflow_config(temp.path(), &workflow_config).expect("workflow config");
+        let _config_source =
+            orchestrator_config::workflow_config::config_source_client::install_yaml_config_source_base(temp.path());
+
+        let hub = Arc::new(InMemoryServiceHub::new().with_project_root(temp.path()));
+        let task = hub
+            .tasks()
+            .create(TaskCreateInput {
+                title: "Temporarily unavailable Git metadata".to_string(),
+                description: "Must remain retryable before checkout preparation".to_string(),
+                task_type: Some(TaskType::Feature),
+                priority: Some(Priority::High),
+                created_by: Some("test".to_string()),
+                tags: Vec::new(),
+                linked_requirements: Vec::new(),
+                linked_architecture_entities: Vec::new(),
+            })
+            .await
+            .expect("task");
+        crate::phase_command::install_test_subject_git_metadata_error(
+            &temp.path().to_string_lossy(),
+            orchestrator_core::SUBJECT_KIND_TASK,
+            &task.id,
+            "postgres connection temporarily unavailable",
+        );
+
+        let error = match execute_workflow_with_hub(
+            WorkflowExecuteParams {
+                project_root: temp.path().to_string_lossy().to_string(),
+                workflow_id: None,
+                bootstrap_workflow_id: None,
+                execution_fence: None,
+                task_id: Some(task.id.clone()),
+                requirement_id: None,
+                subject_id: None,
+                title: None,
+                description: None,
+                workflow_ref: Some("coding".to_string()),
+                input: None,
+                vars: HashMap::new(),
+                model: None,
+                tool: None,
+                phase_timeout_secs: None,
+                phase_filter: None,
+                phase_routing: None,
+                mcp_config: None,
+                actor: None,
+            },
+            hub.clone(),
+            None,
+            None,
+        )
+        .await
+        {
+            Ok(_) => panic!("unavailable subject backend must stop before execution setup"),
+            Err(error) => error,
+        };
+
+        let message = error.to_string();
+        assert!(message.contains("temporarily unavailable"));
+        assert!(message.contains("execution environment was not acquired"));
+        let runs = hub.workflows().list().await.expect("workflow rows");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, WorkflowStatus::Running, "transient lookup failure must remain retryable");
+        let task_after = hub.tasks().get(&task.id).await.expect("task after transient lookup failure");
         assert!(task_after.worktree_path.is_none(), "checkout/worktree preparation must not run");
     }
 
