@@ -153,7 +153,7 @@ pub(crate) struct SubjectGitMetadata {
 }
 
 #[cfg(test)]
-type TestSubjectGitMetadataMap = HashMap<(String, String, String), SubjectGitMetadata>;
+type TestSubjectGitMetadataMap = HashMap<(String, String, String), std::result::Result<SubjectGitMetadata, String>>;
 
 #[cfg(test)]
 static TEST_SUBJECT_GIT_METADATA: std::sync::OnceLock<std::sync::Mutex<TestSubjectGitMetadataMap>> =
@@ -170,7 +170,16 @@ pub(crate) fn install_test_subject_git_metadata(
         .get_or_init(Default::default)
         .lock()
         .expect("test Git metadata lock")
-        .insert((project_root.to_string(), kind.to_string(), subject_id.to_string()), metadata);
+        .insert((project_root.to_string(), kind.to_string(), subject_id.to_string()), Ok(metadata));
+}
+
+#[cfg(test)]
+pub(crate) fn install_test_subject_git_metadata_error(project_root: &str, kind: &str, subject_id: &str, message: &str) {
+    TEST_SUBJECT_GIT_METADATA
+        .get_or_init(Default::default)
+        .lock()
+        .expect("test Git metadata lock")
+        .insert((project_root.to_string(), kind.to_string(), subject_id.to_string()), Err(message.to_string()));
 }
 
 impl SubjectGitMetadata {
@@ -569,7 +578,11 @@ async fn fetch_subject_record(project_root: &str, kind: &str, native_id: &str) -
 /// command phase renders as `{{git_repo}}` and `{{git_ref}}`. The caller decides
 /// whether absence is allowed; coding entrypoints fail closed before acquiring
 /// an environment, while unrelated workflows may continue without Git data.
-pub(crate) async fn subject_git_metadata(project_root: &str, kind: &str, subject_id: &str) -> SubjectGitMetadata {
+pub(crate) async fn subject_git_metadata(
+    project_root: &str,
+    kind: &str,
+    subject_id: &str,
+) -> Result<SubjectGitMetadata> {
     // The brokered per-phase entry supplies no explicit kind and a possibly
     // kind-QUALIFIED id (`task:TASK-1`); the owned path supplies the real kind
     // and a BARE native id. Derive `(kind, native_id)` for the `subject/get`
@@ -583,19 +596,73 @@ pub(crate) async fn subject_git_metadata(project_root: &str, kind: &str, subject
         .get(&(project_root.to_string(), kind.to_string(), native_id.to_string()))
         .cloned()
     {
-        return metadata;
+        return metadata.map_err(|message| anyhow!(message));
     }
     let record = tokio::time::timeout(
         std::time::Duration::from_secs(SUBJECT_FETCH_TIMEOUT_SECS),
-        fetch_subject_record(project_root, kind, native_id),
+        fetch_subject_record_required(project_root, kind, native_id),
     )
     .await
-    .ok()
-    .flatten();
-    let fields = subject_custom_fields(record.as_ref());
+    .map_err(|_| anyhow!("subject backend timed out while resolving Git metadata for '{}:{}'", kind, native_id))??;
+    let fields = subject_custom_fields(Some(&record));
     let find =
         |name: &str| fields.iter().find(|(key, _)| key.eq_ignore_ascii_case(name)).map(|(_, value)| value.clone());
-    SubjectGitMetadata { repo: find("git_repo"), git_ref: find("git_ref") }
+    Ok(SubjectGitMetadata { repo: find("git_repo"), git_ref: find("git_ref") })
+}
+
+/// Strict subject lookup used by coding admission. Unlike command-context
+/// enrichment, this path must distinguish a successfully fetched record with
+/// missing fields from an unavailable backend. Collapsing both to `None` would
+/// permanently fail a valid task during a transient plugin/Postgres outage.
+async fn fetch_subject_record_required(project_root: &str, kind: &str, native_id: &str) -> Result<Value> {
+    let kind = kind.trim();
+    let native_id = native_id.trim();
+    if kind.is_empty() || native_id.is_empty() {
+        return Err(anyhow!("subject kind/id is unavailable while resolving coding Git metadata for '{}'", native_id));
+    }
+
+    let mut registry = PluginRegistry::discover(project_root).map_err(|error| {
+        anyhow!("subject backend discovery failed while resolving Git metadata for '{}:{}': {}", kind, native_id, error)
+    })?;
+    let kind_method = format!("{kind}/get");
+    let candidates: Vec<(String, String, Value)> = registry
+        .list_plugins()
+        .filter(|plugin| crate::workflow_execute::is_subject_backend(plugin))
+        .filter_map(|plugin| {
+            let capabilities = &plugin.manifest.capabilities;
+            if capabilities.iter().any(|cap| cap.as_str() == "subject/get") {
+                Some((plugin.name.clone(), "subject/get".to_string(), json!({ "kind": kind, "id": native_id })))
+            } else if capabilities.iter().any(|cap| cap.as_str() == kind_method.as_str()) {
+                Some((plugin.name.clone(), kind_method.clone(), json!({ "id": native_id })))
+            } else {
+                None
+            }
+        })
+        .collect();
+    if candidates.is_empty() {
+        return Err(anyhow!(
+            "no subject backend advertises a get method for '{}:{}' while resolving coding Git metadata",
+            kind,
+            native_id
+        ));
+    }
+
+    let mut failures = Vec::new();
+    for (name, method, params) in candidates {
+        match registry.get_plugin(&name).await {
+            Ok(host) => match host.request(method.clone(), Some(params)).await {
+                Ok(value) => return Ok(value),
+                Err(error) => failures.push(format!("{name}.{method}: {error:?}")),
+            },
+            Err(error) => failures.push(format!("{name} start: {error}")),
+        }
+    }
+    Err(anyhow!(
+        "subject backend lookup failed while resolving Git metadata for '{}:{}': {}",
+        kind,
+        native_id,
+        failures.join("; ")
+    ))
 }
 
 /// Derive the `(kind, native_id)` pair the `subject/get` fetch needs from a
@@ -609,6 +676,12 @@ fn resolve_kind_and_native<'a>(kind: &'a str, subject_id: &'a str) -> (&'a str, 
     match id.split_once(':') {
         Some((prefix, native)) if !prefix.is_empty() && !native.is_empty() => {
             (if kind.is_empty() { prefix } else { kind }, native)
+        }
+        _ if kind.is_empty() && id.to_ascii_uppercase().starts_with("TASK-") => {
+            (orchestrator_core::SUBJECT_KIND_TASK, id)
+        }
+        _ if kind.is_empty() && id.to_ascii_uppercase().starts_with("REQUIREMENT-") => {
+            (orchestrator_core::SUBJECT_KIND_REQUIREMENT, id)
         }
         _ => (kind, id),
     }
@@ -1420,6 +1493,17 @@ mod tests {
         assert!(workflow_requires_git_metadata("coding-hotfix", std::iter::empty()));
         assert!(workflow_requires_git_metadata("custom", ["CODE-PREPARE"].into_iter()));
         assert!(!workflow_requires_git_metadata("directory-reconcile", ["scan", "apply"].into_iter()));
+    }
+
+    #[test]
+    fn bare_builtin_subject_ids_recover_their_kind_for_phase_admission() {
+        assert_eq!(resolve_kind_and_native("", "TASK-881"), (orchestrator_core::SUBJECT_KIND_TASK, "TASK-881"));
+        assert_eq!(
+            resolve_kind_and_native("", "REQUIREMENT-076"),
+            (orchestrator_core::SUBJECT_KIND_REQUIREMENT, "REQUIREMENT-076")
+        );
+        assert_eq!(resolve_kind_and_native("", "TRANSCRIPT-1"), ("", "TRANSCRIPT-1"));
+        assert_eq!(resolve_kind_and_native("transcript", "TRANSCRIPT-1"), ("transcript", "TRANSCRIPT-1"));
     }
 
     #[test]
