@@ -578,6 +578,36 @@ mod publication_tests {
     }
 
     #[test]
+    fn commit_implementation_changes_is_a_noop_outside_a_git_repository() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("portal-agent-output.txt"), "complete\n").unwrap();
+
+        commit_implementation_changes(root.path().to_str().unwrap(), "").unwrap();
+
+        assert_eq!(std::fs::read_to_string(root.path().join("portal-agent-output.txt")).unwrap(), "complete\n");
+    }
+
+    #[test]
+    fn commit_implementation_changes_is_a_noop_for_a_clean_repository() {
+        let (_root, _remote, work) = fixture();
+
+        commit_implementation_changes(work.to_str().unwrap(), "").unwrap();
+
+        assert!(!git_has_pending_changes(work.to_str().unwrap()).unwrap());
+    }
+
+    #[test]
+    fn commit_implementation_changes_still_requires_a_message_for_a_dirty_repository() {
+        let (_root, _remote, work) = fixture();
+        std::fs::write(work.join("reviewed.txt"), "changed\n").unwrap();
+
+        let error = commit_implementation_changes(work.to_str().unwrap(), "").unwrap_err();
+
+        assert!(error.to_string().contains("requires a non-empty commit message"));
+        assert!(git_has_pending_changes(work.to_str().unwrap()).unwrap());
+    }
+
+    #[test]
     fn publication_proves_exact_remote_commit_and_same_head_is_idempotent() {
         let (root, _remote, work) = fixture();
         let first = publish_head_durably(work.to_str().unwrap(), "origin", "reviewed", "run-a", root.path()).unwrap();
