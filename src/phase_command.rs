@@ -963,18 +963,37 @@ pub(crate) fn build_command_result_payload(
             .unwrap_or(contract_kind.unwrap_or("phase_result"))
             .to_string(),
     );
-    payload["phase_id"] = Value::String(phase_id.to_string());
-    payload["verdict"] = Value::String(format!("{:?}", phase_decision.verdict).to_ascii_lowercase());
-    payload["reason"] = Value::String(phase_decision.reason.clone());
-    payload["confidence"] = serde_json::json!(phase_decision.confidence);
-    payload["risk"] = Value::String(format!("{:?}", phase_decision.risk).to_ascii_lowercase());
-    payload["evidence"] = serde_json::to_value(&phase_decision.evidence).unwrap_or(Value::Array(vec![]));
-    payload["exit_code"] = serde_json::json!(command_result.exit_code);
-    payload["command"] = serde_json::json!({
-        "program": command_result.program,
-        "args": command_result.args
-    });
-    payload["duration_ms"] = serde_json::json!(command_result.duration_ms);
+    let verdict = phase_decision
+        .verdict_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{:?}", phase_decision.verdict).to_ascii_lowercase());
+    let mut decision_payload = serde_json::to_value(phase_decision).unwrap_or_else(|_| serde_json::json!({}));
+    decision_payload["verdict"] = Value::String(verdict.clone());
+
+    let object = payload.as_object_mut().expect("command result payload is an object");
+    object.insert("phase_id".to_string(), Value::String(phase_id.to_string()));
+    object.entry("verdict".to_string()).or_insert_with(|| Value::String(verdict));
+    object.entry("reason".to_string()).or_insert_with(|| Value::String(phase_decision.reason.clone()));
+    object.entry("confidence".to_string()).or_insert_with(|| serde_json::json!(phase_decision.confidence));
+    object
+        .entry("risk".to_string())
+        .or_insert_with(|| Value::String(format!("{:?}", phase_decision.risk).to_ascii_lowercase()));
+    object
+        .entry("evidence".to_string())
+        .or_insert_with(|| serde_json::to_value(&phase_decision.evidence).unwrap_or(Value::Array(vec![])));
+    object.entry("phase_decision".to_string()).or_insert(decision_payload);
+    object.insert("exit_code".to_string(), serde_json::json!(command_result.exit_code));
+    object.insert(
+        "command".to_string(),
+        serde_json::json!({
+            "program": command_result.program,
+            "args": command_result.args
+        }),
+    );
+    object.insert("duration_ms".to_string(), serde_json::json!(command_result.duration_ms));
 
     let excerpt_max = command.excerpt_max_chars.unwrap_or(800);
     let category = command_phase_category(command, phase_id);
@@ -1839,6 +1858,59 @@ mod tests {
         assert!(!command_failure_is_terminal(&rework_decision));
     }
 
+    #[test]
+    fn command_result_preserves_check_envelope_and_separates_routing_decision() {
+        let command = command_def("bash", &["-c", "verify"]);
+        let mut decision = decision_with_verdict(orchestrator_core::PhaseDecisionVerdict::Unknown);
+        decision.phase_id = "code-verify".to_string();
+        decision.verdict_key = Some("harness_retry".to_string());
+        decision.reason = "retry the harness".to_string();
+        let mut result = command_result_stub(0, None, Some(decision.clone()));
+        result.program = "bash".to_string();
+        result.args = vec!["-c".to_string(), "verify".to_string()];
+        result.duration_ms = 42;
+        result.parsed_payload = Some(serde_json::json!({
+            "kind": "code_check_result",
+            "verdict": "harness_error",
+            "failure_class": "timeout",
+            "exit_codes": [124],
+            "commands": ["cargo test --workspace"],
+            "phase_decision": {
+                "kind": "phase_decision",
+                "phase_id": "code-verify",
+                "verdict": "harness_retry",
+                "confidence": 1.0,
+                "risk": "medium",
+                "reason": "retry the harness"
+            }
+        }));
+
+        let payload =
+            build_command_result_payload(&command, "code-verify", Some("code_check_result"), &result, &decision);
+
+        assert_eq!(payload["verdict"], "harness_error");
+        assert_eq!(payload["failure_class"], "timeout");
+        assert_eq!(payload["exit_codes"], serde_json::json!([124]));
+        assert_eq!(payload["commands"], serde_json::json!(["cargo test --workspace"]));
+        assert_eq!(payload["phase_decision"]["verdict"], "harness_retry");
+        assert_eq!(payload["exit_code"], 0);
+        assert_eq!(payload["command"]["program"], "bash");
+        assert_eq!(payload["duration_ms"], 42);
+    }
+
+    #[test]
+    fn command_result_uses_custom_routing_key_when_wrapper_has_no_verdict() {
+        let command = command_def("bash", &["-c", "verify"]);
+        let mut decision = decision_with_verdict(orchestrator_core::PhaseDecisionVerdict::Unknown);
+        decision.verdict_key = Some("checks_failed".to_string());
+        let result = command_result_stub(0, None, Some(decision.clone()));
+
+        let payload = build_command_result_payload(&command, "code-verify", None, &result, &decision);
+
+        assert_eq!(payload["verdict"], "checks_failed");
+        assert_eq!(payload["phase_decision"]["verdict"], "checks_failed");
+    }
+
     // ---- TASK-206: command phases as decision producers ----
 
     #[test]
@@ -1917,6 +1989,40 @@ mod tests {
             let decision = result.phase_decision.as_ref().expect("verdict parsed from stdout");
             assert_eq!(decision.verdict, expected, "stdout JSON verdict must be parsed");
         }
+    }
+
+    #[tokio::test]
+    async fn command_wrapper_keeps_check_verdict_separate_from_custom_routing() {
+        let raw = serde_json::json!({
+            "kind": "code_check_result",
+            "verdict": "harness_error",
+            "failure_class": "permission_block",
+            "exit_codes": [126],
+            "commands": ["cargo test --workspace"],
+            "phase_decision": {
+                "kind": "phase_decision",
+                "phase_id": "sync-status",
+                "verdict": "harness_retry",
+                "confidence": 1.0,
+                "risk": "medium",
+                "reason": "retry without consuming implementation rework"
+            }
+        })
+        .to_string();
+        let command = echo_json_command(&raw);
+        let result = run_workflow_phase_with_command(&bound_context(), &echo_runtime(), &command, None)
+            .await
+            .expect("wrapper executes");
+        let decision = resolve_command_decision(&command, "sync-status", &result);
+
+        assert_eq!(decision.verdict, orchestrator_core::PhaseDecisionVerdict::Unknown);
+        assert_eq!(decision.verdict_key.as_deref(), Some("harness_retry"));
+
+        let payload =
+            build_command_result_payload(&command, "sync-status", Some("code_check_result"), &result, &decision);
+        assert_eq!(payload["verdict"], "harness_error");
+        assert_eq!(payload["failure_class"], "permission_block");
+        assert_eq!(payload["phase_decision"]["verdict"], "harness_retry");
     }
 
     #[tokio::test]
