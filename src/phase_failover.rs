@@ -124,6 +124,12 @@ pub fn failure_metadata(message: &str) -> Value {
         "retry_owner": kind.retry_owner(),
         "preservation_required": kind.preservation_required(),
     });
+    if matches!(kind, PhaseFailureKind::ProviderExhaustion { ref reason } if reason == "provider_session_capped") {
+        metadata["failure_reason"] = Value::String("provider_session_capped".to_string());
+        if let Some(retry_after) = extract_provider_retry_after(message) {
+            metadata["retry_after"] = Value::String(retry_after);
+        }
+    }
     if let Some(fingerprint) = kind.finding_fingerprint() {
         metadata["finding_fingerprint"] = Value::String(fingerprint.to_string());
     }
@@ -192,6 +198,9 @@ pub fn classify_phase_failure(message: &str) -> PhaseFailureKind {
     }
     if let Some(reason) = extract_provider_authentication_reason(message) {
         return PhaseFailureKind::ProviderAuthentication { reason };
+    }
+    if is_provider_session_cap_pattern(message) {
+        return PhaseFailureKind::ProviderExhaustion { reason: "provider_session_capped".to_string() };
     }
     if let Some(reason) = extract_provider_exhaustion_reason(message) {
         return PhaseFailureKind::ProviderExhaustion { reason };
@@ -403,7 +412,9 @@ fn extract_provider_exhaustion_reason(text: &str) -> Option<String> {
     }
     if normalized.contains("rate limit")
         || normalized.contains("rate-limit")
+        || normalized.contains("rate_limit_error")
         || normalized.contains("too many requests")
+        || normalized.contains("overloaded_error")
     {
         return Some("provider rate limit exceeded".to_string());
     }
@@ -417,6 +428,37 @@ fn extract_provider_exhaustion_reason(text: &str) -> Option<String> {
         return Some("secondary token budget exhausted".to_string());
     }
     None
+}
+
+fn is_provider_session_cap_pattern(text: &str) -> bool {
+    let normalized = text.to_ascii_lowercase();
+    normalized.contains("you've hit your session limit")
+        || normalized.contains("you’ve hit your session limit")
+        || normalized.contains("session_limit")
+}
+
+fn extract_provider_retry_after(text: &str) -> Option<String> {
+    let normalized = text.to_ascii_lowercase();
+    let start = normalized.find("resets ")? + "resets ".len();
+    let mut parts = text.get(start..)?.split_whitespace();
+    let time = parts.next()?.trim_matches(|ch: char| ch == ',' || ch == ';');
+    let normalized_time = time.to_ascii_lowercase();
+    let valid_time = normalized_time.chars().any(|ch| ch.is_ascii_digit())
+        && normalized_time.chars().all(|ch| ch.is_ascii_digit() || matches!(ch, ':' | '.' | 'a' | 'p' | 'm'));
+    if !valid_time || time.len() > 16 {
+        return None;
+    }
+    let timezone = parts.next().filter(|value| {
+        value.len() > 2
+            && value.len() <= 8
+            && value.starts_with('(')
+            && value.ends_with(')')
+            && value[1..value.len() - 1].chars().all(|ch| ch.is_ascii_alphabetic())
+    });
+    Some(match timezone {
+        Some(value) => format!("{time} {value}"),
+        None => time.to_string(),
+    })
 }
 
 /// Pure retry-classification decision for the phase-attempt gate.
@@ -598,6 +640,29 @@ mod tests {
         let target = classify_phase_failure("unknown model codex-future");
         assert!(matches!(target, PhaseFailureKind::TargetUnavailable));
         assert!(target.preservation_required());
+    }
+
+    #[test]
+    fn claude_session_cap_is_provider_owned_and_exposes_only_bounded_retry_time() {
+        let msg = "error | You've hit your session limit · resets 7:10pm (UTC) token=secret-value";
+        let kind = classify_phase_failure(msg);
+        assert!(matches!(
+            kind,
+            PhaseFailureKind::ProviderExhaustion { ref reason } if reason == "provider_session_capped"
+        ));
+        assert_eq!(kind.class_name(), "provider_capacity");
+        assert_eq!(kind.retry_owner(), "provider");
+        let metadata = failure_metadata(msg);
+        assert_eq!(metadata["failure_reason"], "provider_session_capped");
+        assert_eq!(metadata["retry_after"], "7:10pm (UTC)");
+        assert!(!metadata.to_string().contains("secret-value"));
+    }
+
+    #[test]
+    fn anthropic_overload_and_rate_limit_payloads_are_provider_capacity() {
+        for msg in [r#"{"error":{"type":"overloaded_error"}}"#, r#"{"error":{"type":"rate_limit_error"}}"#] {
+            assert!(matches!(classify_phase_failure(msg), PhaseFailureKind::ProviderExhaustion { .. }));
+        }
     }
 
     #[test]
