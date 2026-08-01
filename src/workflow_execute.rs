@@ -3799,6 +3799,21 @@ mod rework_convergence_tests {
     }
 
     #[test]
+    fn provider_session_cap_never_burns_an_implementation_attempt() {
+        let mut outcome = rework("You've hit your session limit · resets 7:10pm (UTC)");
+        let metadata = enforce_coding_rework_convergence(&workflow(Vec::new()), "code-implement", &mut outcome)
+            .expect("failure metadata");
+        assert_eq!(metadata["class"], "provider_capacity");
+        assert_eq!(metadata["failure_reason"], "provider_session_capped");
+        assert_eq!(metadata["retry_after"], "7:10pm (UTC)");
+        assert_eq!(metadata["retry_owner"], "provider");
+        let PhaseExecutionOutcome::ManualPending { instructions, .. } = outcome else {
+            panic!("provider session caps must not consume implementation attempts");
+        };
+        assert!(instructions.contains("retry_owner=provider"));
+    }
+
+    #[test]
     fn publication_conflict_is_owned_by_github_without_implementation_rework() {
         let mut outcome = rework("git push rejected: non-fast-forward publication conflict");
         let metadata = enforce_coding_rework_convergence(&workflow(Vec::new()), "code-publish", &mut outcome)
