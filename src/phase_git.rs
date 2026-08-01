@@ -1,3 +1,4 @@
+use animus_execution_protocol::ExecutionFence;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -371,6 +372,19 @@ fn sanitize_branch(value: &str) -> String {
     value.split('/').map(sanitize_ref_component).filter(|component| !component.is_empty()).collect::<Vec<_>>().join("/")
 }
 
+pub(crate) fn checkpoint_recovery_ref(execution: &ExecutionFence) -> Result<String> {
+    execution.validate_coding().map_err(anyhow::Error::msg)?;
+    let subject = execution.subject.as_ref().expect("coding fence requires subject");
+    let subject_id = sanitize_ref_component(&subject.qualified_id);
+    let workflow_id = sanitize_ref_component(&execution.workflow_id);
+    anyhow::ensure!(!subject_id.is_empty(), "checkpoint recovery subject is empty or invalid");
+    anyhow::ensure!(!workflow_id.is_empty(), "checkpoint recovery workflow is empty or invalid");
+    Ok(format!(
+        "refs/heads/animus/recovery/{subject_id}-{workflow_id}-w{}-s{}",
+        execution.workflow_generation, subject.generation
+    ))
+}
+
 fn remote_ref_reaches(cwd: &str, remote: &str, remote_ref: &str, commit: &str) -> Result<bool> {
     let output = git_output(cwd, &["ls-remote", "--refs", remote, remote_ref])?;
     if !output.status.success() {
@@ -556,6 +570,49 @@ pub fn current_branch(cwd: &str) -> Result<String> {
 mod publication_tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn checkpoint_ref_is_scoped_to_workflow_and_subject_generation() {
+        let mut execution: ExecutionFence = serde_json::from_value(serde_json::json!({
+            "schema": "animus.execution-fence.v1",
+            "version": 1,
+            "workflow_id": "wf/recovery",
+            "workflow_generation": 3,
+            "subject": {
+                "qualified_id": "task:TASK-809",
+                "generation": 7
+            },
+            "queue_lease": {
+                "entry_id": "queue-entry",
+                "owner_id": "daemon-owner",
+                "generation": 2,
+                "expires_at": "2026-08-01T19:00:00Z"
+            },
+            "repository": {
+                "repository": "https://github.com/launchapp-dev/example.git",
+                "base_ref": "refs/heads/main",
+                "head_ref": "refs/heads/animus/TASK-809"
+            }
+        }))
+        .expect("valid coding fence");
+
+        assert_eq!(
+            checkpoint_recovery_ref(&execution).unwrap(),
+            "refs/heads/animus/recovery/task-TASK-809-wf-recovery-w3-s7"
+        );
+
+        let initial_ref = checkpoint_recovery_ref(&execution).unwrap();
+        let queue_lease = execution.queue_lease.as_mut().unwrap();
+        queue_lease.owner_id = "recovery-owner".to_string();
+        queue_lease.generation = 3;
+        assert_eq!(checkpoint_recovery_ref(&execution).unwrap(), initial_ref);
+    }
+
+    #[test]
+    fn checkpoint_ref_rejects_unfenced_direct_execution() {
+        let execution = ExecutionFence::direct("wf-direct", 1, None);
+        assert!(checkpoint_recovery_ref(&execution).is_err());
+    }
 
     fn git(path: &Path, args: &[&str]) {
         let status = ProcessCommand::new("git").arg("-C").arg(path).args(args).status().unwrap();

@@ -477,7 +477,8 @@ pub async fn execute_workflow_with_hub(
     let pack_registry = resolve_pack_registry(Path::new(&params.project_root))?;
     ensure_workflow_pack_execution_requirements(&pack_registry, &workflow_config, &workflow_ref)?;
     let phase_inputs = workflow_phase_inputs(&workflow);
-    let workflow_vars = workflow.vars.clone();
+    let mut workflow_vars = workflow.vars.clone();
+    bind_execution_fence_vars(&mut workflow_vars, params.execution_fence.as_ref())?;
     let mut rework_context: Option<String> = None;
     let mut results = Vec::new();
     let workflow_start = Instant::now();
@@ -1892,6 +1893,39 @@ fn validate_execution_authority(
     Ok(())
 }
 
+fn bind_execution_fence_vars(vars: &mut HashMap<String, String>, execution: Option<&ExecutionFence>) -> Result<()> {
+    const RESERVED_VARS: [&str; 6] = [
+        "execution_workflow_generation",
+        "execution_subject_generation",
+        "execution_queue_lease_generation",
+        "execution_repository_base_ref",
+        "execution_repository_head_ref",
+        "execution_recovery_ref",
+    ];
+    for key in RESERVED_VARS {
+        vars.remove(key);
+    }
+    let Some(execution) = execution else {
+        return Ok(());
+    };
+    execution.validate().map_err(anyhow::Error::msg)?;
+    vars.insert("execution_workflow_generation".to_string(), execution.workflow_generation.to_string());
+    if let Some(subject) = execution.subject.as_ref() {
+        vars.insert("execution_subject_generation".to_string(), subject.generation.to_string());
+    }
+    if let Some(queue_lease) = execution.queue_lease.as_ref() {
+        vars.insert("execution_queue_lease_generation".to_string(), queue_lease.generation.to_string());
+    }
+    if let Some(repository) = execution.repository.as_ref() {
+        vars.insert("execution_repository_base_ref".to_string(), repository.base_ref.clone());
+        vars.insert("execution_repository_head_ref".to_string(), repository.head_ref.clone());
+    }
+    if execution.repository.is_some() && execution.subject.is_some() && execution.queue_lease.is_some() {
+        vars.insert("execution_recovery_ref".to_string(), crate::phase_git::checkpoint_recovery_ref(execution)?);
+    }
+    Ok(())
+}
+
 fn validate_execution_subject(execution: Option<&ExecutionFence>, subject: Option<&SubjectRef>) -> Result<()> {
     let Some(execution_subject) = execution.and_then(|execution| execution.subject.as_ref()) else {
         return Ok(());
@@ -2356,6 +2390,42 @@ mod publication_cleanup_tests {
             head_ref: "refs/heads/animus/TASK-PUBLICATION".to_string(),
         });
         execution
+    }
+
+    #[test]
+    fn execution_fence_vars_are_authoritative_and_include_recovery_ref() {
+        let execution = coding_execution_fence();
+        let mut vars = HashMap::from([
+            ("execution_workflow_generation".to_string(), "stale".to_string()),
+            ("execution_recovery_ref".to_string(), "refs/heads/unsafe".to_string()),
+        ]);
+
+        bind_execution_fence_vars(&mut vars, Some(&execution)).expect("bind execution fence");
+
+        assert_eq!(vars["execution_workflow_generation"], "1");
+        assert_eq!(vars["execution_subject_generation"], "1");
+        assert_eq!(vars["execution_queue_lease_generation"], "1");
+        assert_eq!(vars["execution_repository_base_ref"], "refs/heads/main");
+        assert_eq!(vars["execution_repository_head_ref"], "refs/heads/animus/TASK-PUBLICATION");
+        assert_eq!(
+            vars["execution_recovery_ref"],
+            "refs/heads/animus/recovery/task-TASK-PUBLICATION-wf-publication-w1-s1"
+        );
+    }
+
+    #[test]
+    fn execution_fence_vars_cannot_be_injected_without_scheduler_authority() {
+        let mut vars = HashMap::from([
+            ("project_var".to_string(), "preserved".to_string()),
+            ("execution_subject_generation".to_string(), "spoofed".to_string()),
+            ("execution_recovery_ref".to_string(), "refs/heads/unsafe".to_string()),
+        ]);
+
+        bind_execution_fence_vars(&mut vars, None).expect("clear reserved execution vars");
+
+        assert_eq!(vars.get("project_var").map(String::as_str), Some("preserved"));
+        assert!(!vars.contains_key("execution_subject_generation"));
+        assert!(!vars.contains_key("execution_recovery_ref"));
     }
 
     #[test]
