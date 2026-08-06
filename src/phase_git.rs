@@ -566,6 +566,62 @@ pub fn current_branch(cwd: &str) -> Result<String> {
     git_text(cwd, &["branch", "--show-current"], "resolve current branch")
 }
 
+/// Well-known per-subject workspace root on the ecosystem's ephemeral coding
+/// nodes. The coding workflow's `code-prepare` command clones the task
+/// checkout to `/tmp/animus-work/<subject_native_id>`; the node image's git
+/// `safe.directory` provisioning trusts this same dynamic root.
+pub const CODING_NODE_WORKSPACE_ROOT: &str = "/tmp/animus-work";
+
+/// Resolve the directory runner-owned coding publication must operate in.
+///
+/// A full-session delegated coding run (REQUIREMENT-052) executes ON the node
+/// with the node's animus project root (e.g. `/node`) as its execution cwd:
+/// `ensure_execution_cwd` deliberately returns the project root for a
+/// plugin-resolved subject. The task checkout is created by the coding
+/// workflow's `code-prepare` command — not by the runner — at
+/// `[CODING_NODE_WORKSPACE_ROOT]/<subject_native_id>`, so the execution cwd on
+/// the node is NOT a git repository and publication would fail closed with
+/// "coding publication requires a git repository" even though every phase
+/// succeeded inside a real checkout (production run cd8209ae / TASK-839).
+///
+/// Resolution order:
+/// 1. `execution_cwd` itself when it is already a git work tree (local runs
+///    and in-tree managed worktrees — behavior unchanged);
+/// 2. the per-subject node checkout, but only when it genuinely is a git work
+///    tree;
+/// 3. `execution_cwd` again, so the caller's `is_git_repo` guard still fails
+///    closed when there is no checkout at all.
+///
+/// This does not weaken the fail-closed guard: the caller still requires the
+/// resolved directory to be a git repository whose current branch equals the
+/// execution fence's reserved head ref, so a stale or unrelated checkout can
+/// never be published.
+pub fn resolve_coding_publication_cwd(execution_cwd: &str, subject_id: &str) -> String {
+    resolve_coding_publication_cwd_in(Path::new(CODING_NODE_WORKSPACE_ROOT), execution_cwd, subject_id)
+}
+
+fn resolve_coding_publication_cwd_in(workspace_root: &Path, execution_cwd: &str, subject_id: &str) -> String {
+    if is_git_repo(execution_cwd) {
+        return execution_cwd.to_string();
+    }
+    // The convention uses the BARE native id (`/tmp/animus-work/TASK-839`);
+    // strip a `<kind>:` qualifier when the caller hands one over.
+    let native = match subject_id.split_once(':') {
+        Some((prefix, native)) if !prefix.is_empty() && !native.is_empty() => native,
+        _ => subject_id,
+    };
+    // A subject id must name exactly one directory below the workspace root.
+    let safe = !native.is_empty() && native != "." && native != ".." && !native.contains(['/', '\\']);
+    if safe {
+        if let Some(candidate) = workspace_root.join(native).to_str() {
+            if is_git_repo(candidate) {
+                return candidate.to_string();
+            }
+        }
+    }
+    execution_cwd.to_string()
+}
+
 #[cfg(test)]
 mod publication_tests {
     use super::*;
@@ -744,6 +800,67 @@ mod publication_tests {
         assert!(!redacted.contains("hunter2"));
         assert!(!redacted.contains("ghp_still-secret"));
         assert!(redacted.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn publication_cwd_keeps_execution_cwd_when_it_is_a_git_repo() {
+        let (_root, _remote, work) = fixture();
+        let workspace = tempfile::tempdir().unwrap();
+
+        let resolved = resolve_coding_publication_cwd_in(workspace.path(), work.to_str().unwrap(), "TASK-839");
+
+        assert_eq!(resolved, work.to_str().unwrap());
+    }
+
+    #[test]
+    fn publication_cwd_resolves_the_per_subject_node_checkout() {
+        let workspace = tempfile::tempdir().unwrap();
+        let node_root = tempfile::tempdir().unwrap();
+        assert!(!is_git_repo(node_root.path().to_str().unwrap()));
+        let checkout = workspace.path().join("TASK-839");
+        git(workspace.path(), &["init", "-b", "animus/TASK-839", checkout.to_str().unwrap()]);
+
+        let resolved =
+            resolve_coding_publication_cwd_in(workspace.path(), node_root.path().to_str().unwrap(), "TASK-839");
+
+        assert_eq!(resolved, checkout.to_str().unwrap());
+    }
+
+    #[test]
+    fn publication_cwd_strips_the_kind_qualifier_from_a_qualified_subject_id() {
+        let workspace = tempfile::tempdir().unwrap();
+        let node_root = tempfile::tempdir().unwrap();
+        let checkout = workspace.path().join("TASK-839");
+        git(workspace.path(), &["init", "-b", "animus/TASK-839", checkout.to_str().unwrap()]);
+
+        let resolved =
+            resolve_coding_publication_cwd_in(workspace.path(), node_root.path().to_str().unwrap(), "task:TASK-839");
+
+        assert_eq!(resolved, checkout.to_str().unwrap());
+    }
+
+    #[test]
+    fn publication_cwd_fails_closed_to_execution_cwd_when_no_checkout_exists() {
+        let workspace = tempfile::tempdir().unwrap();
+        let node_root = tempfile::tempdir().unwrap();
+        let node = node_root.path().to_str().unwrap();
+
+        assert_eq!(resolve_coding_publication_cwd_in(workspace.path(), node, "TASK-404"), node);
+    }
+
+    #[test]
+    fn publication_cwd_rejects_subject_ids_that_escape_the_workspace_root() {
+        let workspace = tempfile::tempdir().unwrap();
+        let node_root = tempfile::tempdir().unwrap();
+        let node = node_root.path().to_str().unwrap();
+
+        for subject in ["", ".", "..", "../escape", "nested/TASK-1", "task:", ":"] {
+            assert_eq!(
+                resolve_coding_publication_cwd_in(workspace.path(), node, subject),
+                node,
+                "subject id {subject:?} must never resolve outside the workspace root"
+            );
+        }
     }
 
     #[test]
