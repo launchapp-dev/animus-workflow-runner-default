@@ -1617,12 +1617,22 @@ pub async fn execute_workflow_with_hub(
                 } else if let Some(task_title) =
                     publication_task_title(&workflow_subject, task.as_ref(), &subject_context)
                 {
+                    // A full-session delegated coding run executes ON the node
+                    // with the node's animus project root (e.g. `/node`) as its
+                    // execution cwd, while the coding workflow's `code-prepare`
+                    // command clones the task checkout to the per-subject node
+                    // workspace. Publication must run its git commands in that
+                    // checkout; resolve it here, failing closed to the execution
+                    // cwd (and the existing "requires a git repository" guard)
+                    // when no checkout exists.
+                    let publication_cwd =
+                        crate::phase_git::resolve_coding_publication_cwd(&execution_cwd, &subject_id_str);
                     let mut outcome = execute_post_success_actions(
                         &params.project_root,
                         task_title,
                         &workflow,
                         &workflow_config,
-                        &execution_cwd,
+                        &publication_cwd,
                         held_environment,
                         params.execution_fence.as_ref(),
                     )
@@ -1632,7 +1642,7 @@ pub async fn execute_workflow_with_hub(
                             &outcome,
                             params.execution_fence.as_ref().expect("required publication preflighted fence"),
                             &params.project_root,
-                            &execution_cwd,
+                            &publication_cwd,
                             held_environment,
                         ) {
                             Ok(receipt) => {
@@ -4309,6 +4319,144 @@ async fn execute_post_success_actions(
             "reason": crate::phase_git::redact_git_diagnostic(&error.to_string()),
             "workflow_ref": workflow_ref_id,
         }),
+    }
+}
+
+#[cfg(test)]
+mod runner_publication_cwd_tests {
+    use super::*;
+    use animus_execution_protocol::ExecutionFence;
+    use orchestrator_config::builtin_workflow_config;
+    use std::process::Command as ProcessCommand;
+
+    fn git(path: &Path, args: &[&str]) {
+        let status = ProcessCommand::new("git").arg("-C").arg(path).args(args).status().unwrap();
+        assert!(status.success(), "git {}", args.join(" "));
+    }
+
+    fn publication_workflow() -> OrchestratorWorkflow {
+        OrchestratorWorkflow {
+            id: "wf-publication-cwd".to_string(),
+            execution_fence: None,
+            task_id: "TASK-839".to_string(),
+            workflow_ref: Some("coding".to_string()),
+            subject: None,
+            input: None,
+            vars: HashMap::new(),
+            status: WorkflowStatus::Completed,
+            current_phase_index: 0,
+            phases: Vec::new(),
+            machine_state: Default::default(),
+            current_phase: None,
+            started_at: chrono::Utc::now(),
+            completed_at: None,
+            failure_reason: None,
+            checkpoint_metadata: Default::default(),
+            rework_counts: HashMap::new(),
+            total_reworks: 0,
+            decision_history: Vec::new(),
+        }
+    }
+
+    fn publication_fence(branch: &str) -> ExecutionFence {
+        serde_json::from_value(serde_json::json!({
+            "schema": "animus.execution-fence.v1",
+            "version": 1,
+            "workflow_id": "wf-publication-cwd",
+            "workflow_generation": 1,
+            "subject": { "qualified_id": "task:TASK-839", "generation": 1 },
+            "queue_lease": {
+                "entry_id": "queue-entry",
+                "owner_id": "daemon-owner",
+                "generation": 1,
+                "expires_at": "2026-08-01T19:00:00Z"
+            },
+            "repository": {
+                "repository": "https://github.com/launchapp-dev/example.git",
+                "base_ref": "refs/heads/main",
+                "head_ref": format!("refs/heads/{branch}")
+            }
+        }))
+        .expect("valid coding fence")
+    }
+
+    /// The fail-closed guard is unchanged: when neither the execution cwd nor
+    /// the per-subject node checkout is a git repository, runner publication
+    /// still refuses to run.
+    #[tokio::test]
+    async fn publication_still_fails_closed_without_a_git_checkout() {
+        let project = tempfile::tempdir().unwrap();
+        let node_root = tempfile::tempdir().unwrap();
+        assert!(!crate::phase_git::is_git_repo(node_root.path().to_str().unwrap()));
+
+        let outcome = execute_post_success_actions(
+            project.path().to_str().unwrap(),
+            "Coding task",
+            &publication_workflow(),
+            &builtin_workflow_config(),
+            node_root.path().to_str().unwrap(),
+            None,
+            Some(&publication_fence("animus/TASK-839")),
+        )
+        .await;
+
+        assert_eq!(outcome["status"].as_str(), Some("failed"));
+        assert_eq!(outcome["publication_durable"].as_bool(), Some(false));
+        assert_eq!(outcome["reason"].as_str(), Some("coding publication requires a git repository"));
+    }
+
+    /// When the execution cwd IS the prepared task checkout (what
+    /// `resolve_coding_publication_cwd` returns on a delegated node),
+    /// publication runs its git commands there and durably pushes the fenced
+    /// branch. The PR step cannot reach GitHub from a local-file remote, so
+    /// the outcome is a failed PR step with a DURABLE publication proof.
+    #[tokio::test]
+    async fn publication_runs_git_in_the_resolved_task_checkout() {
+        let project = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let remote = root.path().join("remote.git");
+        let work = root.path().join("TASK-839");
+        git(root.path(), &["init", "--bare", remote.to_str().unwrap()]);
+        git(root.path(), &["init", "-b", "animus/TASK-839", work.to_str().unwrap()]);
+        git(&work, &["config", "user.name", "Test"]);
+        git(&work, &["config", "user.email", "test@example.invalid"]);
+        std::fs::write(work.join("implemented.txt"), "implemented\n").unwrap();
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-m", "implemented"]);
+        git(&work, &["remote", "add", "origin", remote.to_str().unwrap()]);
+
+        let outcome = execute_post_success_actions(
+            project.path().to_str().unwrap(),
+            "Coding task",
+            &publication_workflow(),
+            &builtin_workflow_config(),
+            work.to_str().unwrap(),
+            None,
+            Some(&publication_fence("animus/TASK-839")),
+        )
+        .await;
+
+        assert_eq!(
+            outcome["publication_durable"].as_bool(),
+            Some(true),
+            "publication must prove durability from the task checkout: {outcome}"
+        );
+        assert_ne!(
+            outcome["reason"].as_str(),
+            Some("coding publication requires a git repository"),
+            "the resolved checkout must satisfy the git-repository guard"
+        );
+        let ls_remote = ProcessCommand::new("git")
+            .arg("-C")
+            .arg(&work)
+            .args(["ls-remote", "origin", "refs/heads/animus/TASK-839"])
+            .output()
+            .unwrap();
+        assert!(ls_remote.status.success());
+        let pushed = String::from_utf8_lossy(&ls_remote.stdout).split_whitespace().next().map(str::to_string);
+        let head = ProcessCommand::new("git").arg("-C").arg(&work).args(["rev-parse", "HEAD"]).output().unwrap();
+        let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
+        assert_eq!(pushed.as_deref(), Some(head.as_str()), "the fenced branch was pushed from the checkout");
     }
 }
 
