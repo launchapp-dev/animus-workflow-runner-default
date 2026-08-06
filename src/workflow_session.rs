@@ -800,6 +800,11 @@ pub(crate) async fn delegate_workflow_via_session(
 /// `phases_requested` is the workflow's declared phase ids -- used only to fill
 /// the result summary; the node, not the runner, actually drives them.
 ///
+/// `subject_id` MUST be the kind-qualified `<kind>:<id>` form: the environment
+/// plugin binds it as the reverse-backend-call authorization scope and its
+/// backend-call policy denies a bare native id. Callers qualify via
+/// `workflow_execute::exec_session_subject_id`.
+///
 /// Environment-host work runs on a DEDICATED OS thread with its own
 /// multi-thread runtime so the resident-host stdio I/O driver (spawned during
 /// lease acquisition) stays alive across `prepare` -> `exec_session` -> `teardown`
@@ -1459,6 +1464,37 @@ mod tests {
         assert_eq!(prepare.get("actor"), Some(&actor_value));
         assert_eq!(exec.get("actor"), Some(&actor_value));
         assert_eq!(exec.pointer("/actor/user_id").and_then(|value| value.as_str()), Some("user-42"));
+    }
+
+    #[cfg(feature = "remote-animus-session")]
+    #[test]
+    fn exec_session_request_carries_the_qualified_subject_id_on_the_wire() {
+        // The environment plugin binds `subject_id` as its reverse-backend-call
+        // authorization scope and requires the qualified `<kind>:<id>` form
+        // (animus-environment-railway backend-call-policy `subjectParts`). Lock
+        // the wire field so the qualified id the delegator computes reaches the
+        // plugin unaltered.
+        use animus_environment_protocol::{EnvironmentHandle, ExecSessionRequest};
+
+        let params = request_params_with_actor(
+            ExecSessionRequest {
+                handle: EnvironmentHandle {
+                    id: "node-1".to_string(),
+                    workspace_root: "/work".to_string(),
+                    metadata: serde_json::Value::Null,
+                },
+                subject_id: "task:TASK-839".to_string(),
+                workflow_ref: Some("coding".to_string()),
+                dispatch_input: None,
+                workflow_id: Some("wf-1".to_string()),
+                execution_fence: None,
+            },
+            None,
+            "serialize exec_session",
+        )
+        .expect("exec_session params");
+
+        assert_eq!(params.get("subject_id").and_then(|value| value.as_str()), Some("task:TASK-839"));
     }
 
     #[cfg(feature = "remote-animus-session")]
