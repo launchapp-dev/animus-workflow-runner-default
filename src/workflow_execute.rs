@@ -504,13 +504,20 @@ pub async fn execute_workflow_with_hub(
             {
                 let phases_requested: Vec<String> =
                     workflow.phases.iter().map(|phase| phase.phase_id.clone()).collect();
+                // The `environment/exec_session` boundary is a generic subject
+                // boundary: the environment plugin binds `subject_id` as the
+                // reverse-backend-call authorization scope, and its policy
+                // requires the qualified `<kind>:<id>` form (a bare native id is
+                // denied outright). Qualify only here -- every other consumer in
+                // this run keeps the bare native id.
+                let session_subject_id = exec_session_subject_id(&subject_kind_str, &subject_id_str);
                 return crate::workflow_session::delegate_workflow_via_session(
                     hub.clone(),
                     &params.project_root,
                     &environment.id,
                     &workflow.id,
                     &workflow_ref,
-                    &subject_id_str,
+                    &session_subject_id,
                     subject_git_repo.as_deref(),
                     phase_inputs.dispatch_input.as_deref(),
                     &execution_cwd,
@@ -2968,6 +2975,19 @@ mod existing_workflow_subject_tests {
     }
 }
 
+/// Subject id form handed to `environment/exec_session` (REQ-052 full-run
+/// delegation). The environment plugin binds it as the reverse-backend-call
+/// authorization scope, and its backend-call policy requires the qualified
+/// `<kind>:<id>` form -- a bare native id (`TASK-839`) is denied with
+/// "bound subject ... is not qualified as '<kind>:<id>'". The node-side
+/// runner also consumes it via `--subject-id`, whose parser already requires
+/// the same qualified form. Reuses the CLI-qualified rendering from
+/// `phase_command` so task / requirement / dynamic kinds all qualify
+/// consistently; already-qualified ids pass through unchanged.
+fn exec_session_subject_id(subject_kind: &str, subject_id: &str) -> String {
+    crate::phase_command::qualified_subject_id(subject_kind, subject_id)
+}
+
 fn resolve_input(params: &WorkflowExecuteParams) -> Result<WorkflowRunInput> {
     let workflow_ref = params.workflow_ref.clone();
     // A qualified `<kind>:<id>` subject of ANY kind — the daemon emits
@@ -4608,6 +4628,20 @@ mod dynamic_subject_context_tests {
         assert_eq!(context.attributes.get(SUBJECT_ATTR_PLUGIN_RESOLVED).map(String::as_str), Some("true"));
         // Backend attributes are carried through.
         assert_eq!(context.attributes.get("source").map(String::as_str), Some("krisp"));
+    }
+
+    #[test]
+    fn exec_session_subject_id_is_kind_qualified() {
+        // REQ-052 full-run delegation: the environment plugin binds the
+        // exec_session subject_id as its reverse-backend-call authorization
+        // scope and denies a bare native id ("not qualified as '<kind>:<id>'").
+        // The id handed across that boundary must be `<kind>:<id>`.
+        assert_eq!(exec_session_subject_id(SUBJECT_KIND_TASK, "TASK-839"), "task:TASK-839");
+        assert_eq!(exec_session_subject_id(SUBJECT_KIND_REQUIREMENT, "REQUIREMENT-052"), "requirement:REQUIREMENT-052");
+        // Dynamic backend kinds qualify on their verbatim kind name.
+        assert_eq!(exec_session_subject_id("transcript", "TRANSCRIPT-001"), "transcript:TRANSCRIPT-001");
+        // An already-qualified id passes through unchanged (idempotent).
+        assert_eq!(exec_session_subject_id(SUBJECT_KIND_TASK, "task:TASK-839"), "task:TASK-839");
     }
 
     #[test]
