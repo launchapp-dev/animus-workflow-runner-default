@@ -327,6 +327,17 @@ fn subject_kind_command_alias(kind: &str) -> Option<&str> {
     Some(kind)
 }
 
+/// The kind form a `subject_backend` wire call (`subject/get` params and the
+/// per-kind `<kind>/get` method candidate) must use. Subject backends dispatch
+/// on the BARE alias (`task`, `requirement`) — see [`subject_kind_command_alias`]
+/// — and the environment reverse-backend-call policy binds that same bare kind,
+/// so the namespaced wire kind (`animus.task`) must be aliased before the call
+/// is built. Dynamic kinds pass through verbatim; `custom`/empty fall back to
+/// the input unchanged (the fetch degrades or keeps its current behavior).
+fn subject_wire_kind(kind: &str) -> &str {
+    subject_kind_command_alias(kind).unwrap_or(kind)
+}
+
 /// Render a subject id in the kind-qualified `<kind>:<native>` form the CLI
 /// resolves without a `default_subject_kind` fallback.
 ///
@@ -546,6 +557,9 @@ async fn fetch_subject_record(project_root: &str, kind: &str, native_id: &str) -
     if kind.is_empty() || native_id.is_empty() {
         return None;
     }
+    // Backends (and the environment reverse-call policy) dispatch on the bare
+    // kind alias: `animus.task` must go out as `task`.
+    let kind = subject_wire_kind(kind);
 
     let mut registry = PluginRegistry::discover(project_root).ok()?;
     let kind_method = format!("{kind}/get");
@@ -620,6 +634,9 @@ async fn fetch_subject_record_required(project_root: &str, kind: &str, native_id
     if kind.is_empty() || native_id.is_empty() {
         return Err(anyhow!("subject kind/id is unavailable while resolving coding Git metadata for '{}'", native_id));
     }
+    // Backends (and the environment reverse-call policy) dispatch on the bare
+    // kind alias: `animus.task` must go out as `task`.
+    let kind = subject_wire_kind(kind);
 
     let mut registry = PluginRegistry::discover(project_root).map_err(|error| {
         anyhow!("subject backend discovery failed while resolving Git metadata for '{}:{}': {}", kind, native_id, error)
@@ -1523,6 +1540,28 @@ mod tests {
         );
         assert_eq!(resolve_kind_and_native("", "TRANSCRIPT-1"), ("", "TRANSCRIPT-1"));
         assert_eq!(resolve_kind_and_native("transcript", "TRANSCRIPT-1"), ("transcript", "TRANSCRIPT-1"));
+    }
+
+    #[test]
+    fn subject_get_wire_kind_uses_the_bare_alias_for_namespaced_builtins() {
+        // Production regression (run 0f3dfd59): the node-side Git-metadata
+        // preflight built `subject/get` params with the raw namespaced kind
+        // (`animus.task`) while the environment reverse-call policy had bound
+        // the bare kind (`task`), so every lookup was denied with
+        // "subject kind does not match bound kind 'task'". The wire call must
+        // carry the bare alias the backends dispatch on.
+        assert_eq!(subject_wire_kind(orchestrator_core::SUBJECT_KIND_TASK), "task");
+        assert_eq!(format!("{}/get", subject_wire_kind(orchestrator_core::SUBJECT_KIND_TASK)), "task/get");
+        assert_eq!(subject_wire_kind(orchestrator_core::SUBJECT_KIND_REQUIREMENT), "requirement");
+        // Case-insensitive namespaced forms alias too.
+        assert_eq!(subject_wire_kind("Animus.Task"), "task");
+        // Bare aliases and dynamic kinds already dispatch on their own name.
+        assert_eq!(subject_wire_kind("task"), "task");
+        assert_eq!(subject_wire_kind("transcript"), "transcript");
+        assert_eq!(subject_wire_kind("blog"), "blog");
+        // `custom` (and empty) keep their input — the fetch degrades as before.
+        assert_eq!(subject_wire_kind(orchestrator_core::SUBJECT_KIND_CUSTOM), orchestrator_core::SUBJECT_KIND_CUSTOM);
+        assert_eq!(subject_wire_kind(""), "");
     }
 
     #[test]
