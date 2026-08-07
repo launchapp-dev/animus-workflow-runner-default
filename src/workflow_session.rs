@@ -858,12 +858,19 @@ pub(crate) async fn delegate_workflow_via_session(
     let phase_results_sink = phase_results.clone();
     let phases_completed_sink = phases_completed.clone();
     let publication_receipt_sink = publication_receipt.clone();
+    // Channel for early (relay-open) publication verification: the terminal
+    // journal event delivers the receipt here while exec_session is still in
+    // progress, so git verification runs before the relay session closes.
+    let (receipt_early_tx, receipt_early_rx) =
+        tokio::sync::mpsc::channel::<PublicationReceipt>(1);
 
     let on_journal = move |event: &SessionJournalEvent| {
         if let Some(receipt) = terminal_publication_receipt(event, &workflow_id_for_events) {
             if let Ok(mut sink) = publication_receipt_sink.lock() {
-                *sink = Some(receipt);
+                *sink = Some(receipt.clone());
             }
+            // Signal early verification while the relay is still open.
+            let _ = receipt_early_tx.try_send(receipt);
         }
         // Mirror the node's agent-run transcript (output chunks, tool calls, ...)
         // into the PARENT run dir; lifecycle events fall through to the coarse map.
@@ -956,6 +963,7 @@ pub(crate) async fn delegate_workflow_via_session(
         };
     let scoped_root_for_thread = scoped_root_opt.clone();
     let binding_phase_id_for_thread = binding_phase_id.clone();
+    let receipt_early_rx_for_thread = receipt_early_rx;
 
     let (tx, rx) = tokio::sync::oneshot::channel();
     std::thread::spawn(move || {
@@ -1004,20 +1012,68 @@ pub(crate) async fn delegate_workflow_via_session(
                 {
                     persist_session_binding(scoped_root, &workflow_id_owned, phase_id, &environment_id_owned, &handle);
                 }
+                // Verify publication WHILE exec_session relay is still open.
+                // The terminal `workflow_completed` journal event delivers the
+                // receipt into `receipt_early_rx` via `on_journal`; we run git
+                // verification concurrently so the relay is guaranteed open
+                // (exec_session hasn't returned yet).  When exec_session
+                // completes and drops on_journal, the sender is dropped and
+                // receipt_early_rx.recv() returns None, completing the future.
+                let mut receipt_early_rx = receipt_early_rx_for_thread;
+                let execution_fence_for_early_verify = execution_fence_owned.clone();
+                let publication_durable_early = publication_durable_for_thread.clone();
+                let publication_verified_early = publication_verified_for_thread.clone();
+                let client_ref: &SessionEnvironmentClient = &client;
+                let handle_ref: &animus_environment_protocol::EnvironmentHandle = &handle;
+                let early_verify_fut = async move {
+                    if !publication_required {
+                        return;
+                    }
+                    if let (Some(receipt), Some(execution)) =
+                        (receipt_early_rx.recv().await, execution_fence_for_early_verify.as_ref())
+                    {
+                        let verified = verify_session_publication(
+                            &BoundSessionPublication { client: client_ref, handle: handle_ref },
+                            &receipt,
+                            execution,
+                        )
+                        .await
+                        .unwrap_or_else(|err| {
+                            eprintln!(
+                                "warning: early session publication verification error for '{}': {err:#}",
+                                handle_ref.id
+                            );
+                            false
+                        });
+                        if verified {
+                            publication_verified_early.store(true, Ordering::SeqCst);
+                            publication_durable_early.store(true, Ordering::SeqCst);
+                        }
+                    }
+                };
+
                 // Unbounded: an agent-run session's duration is not known up front.
-                let response = client.exec_session(
-                    &handle,
-                    subject_id_owned,
-                    Some(workflow_ref_owned),
-                    dispatch_input_owned,
-                    Some(workflow_id_owned.clone()),
-                    execution_fence_owned.clone(),
-                    actor_owned.as_ref(),
-                    on_journal,
-                ).await;
+                let (response, ()) = tokio::join!(
+                    client.exec_session(
+                        &handle,
+                        subject_id_owned,
+                        Some(workflow_ref_owned),
+                        dispatch_input_owned,
+                        Some(workflow_id_owned.clone()),
+                        execution_fence_owned.clone(),
+                        actor_owned.as_ref(),
+                        on_journal,
+                    ),
+                    early_verify_fut,
+                );
                 if let Ok(response) = response.as_ref() {
                     validate_session_response_fence(response, execution_fence_owned.as_ref(), publication_required)?;
                 }
+                // Fallback: if early verification did not complete (e.g. the
+                // terminal receipt event raced with the response and was missed
+                // by the channel), attempt verification now.  The relay may be
+                // closed at this point; if exec_git fails, unwrap_or(false)
+                // preserves the pre-fix behaviour for that edge case.
                 if response.is_ok() && !publication_durable_for_thread.load(std::sync::atomic::Ordering::SeqCst) {
                     let receipt = publication_receipt_for_thread
                         .lock()
@@ -1032,7 +1088,13 @@ pub(crate) async fn delegate_workflow_via_session(
                             execution,
                         )
                         .await
-                        .unwrap_or(false)
+                        .unwrap_or_else(|err| {
+                            eprintln!(
+                                "warning: session publication verification error for '{}' (relay may be closed): {err:#}",
+                                handle.id
+                            );
+                            false
+                        })
                     } else {
                         false
                     };
