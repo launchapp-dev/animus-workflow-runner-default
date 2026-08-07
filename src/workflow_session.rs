@@ -468,6 +468,106 @@ impl SessionPublicationCommands for BoundSessionPublication<'_> {
     }
 }
 
+/// Home-runner git verifier: runs git commands directly on the home runner
+/// (not via the delegated node's relay) so that publication verification
+/// succeeds even after the relay session to the node has closed.
+///
+/// ## Why this is needed
+///
+/// `exec_session` is a blocking RPC that returns only when the remote Animus
+/// finishes the whole workflow. By the time it returns the environment plugin's
+/// relay connection to the Railway node is closed — the node daemon shut down
+/// after completing its work — so any subsequent `environment/exec` call via
+/// `BoundSessionPublication` fails. This struct bypasses the relay entirely:
+///
+/// - `git config --get remote.origin.url` is answered synthetically from the
+///   receipt's self-reported remote URL (verified against the execution fence
+///   by `verify_session_publication`'s identity check below).
+/// - Network operations (`ls-remote`, `fetch`) replace the symbolic "origin"
+///   with the explicit remote URL so the unconfigured bare repo can reach the
+///   remote directly.
+/// - A temporary bare repository is initialised at construction time to hold
+///   objects fetched during `fetch`/`rev-parse`.
+///
+/// The temp directory is removed on drop.
+#[cfg(feature = "remote-animus-session")]
+struct HomeRunnerGitVerifier {
+    remote_url: String,
+    temp_dir: std::path::PathBuf,
+}
+
+#[cfg(feature = "remote-animus-session")]
+impl HomeRunnerGitVerifier {
+    fn new(remote_url: String) -> Result<Self> {
+        use anyhow::Context;
+
+        let dir_name = format!("animus-session-verify-{}", uuid::Uuid::new_v4());
+        let temp_dir = std::env::temp_dir().join(dir_name);
+        std::fs::create_dir_all(&temp_dir).context("creating session-proof temp dir")?;
+        let status = std::process::Command::new("git")
+            .args(["init", "--bare"])
+            .arg(&temp_dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .context("git init --bare for session publication verification")?;
+        if !status.success() {
+            let _ = std::fs::remove_dir_all(&temp_dir);
+            anyhow::bail!("git init --bare failed for session publication verification");
+        }
+        Ok(Self { remote_url, temp_dir })
+    }
+
+    fn run_git_sync(&self, args: Vec<String>) -> Result<crate::phase_git::PublicationCommandOutput> {
+        use anyhow::Context;
+
+        // Intercept `git config --get remote.origin.url`: the bare repo has no
+        // remote configured, but we know the URL from the receipt.
+        if args.len() == 3 && args[0] == "config" && args[1] == "--get" && args[2] == "remote.origin.url" {
+            return Ok(crate::phase_git::PublicationCommandOutput {
+                success: true,
+                stdout: format!("{}\n", self.remote_url),
+                stderr: String::new(),
+            });
+        }
+
+        // Replace the symbolic "origin" with the explicit remote URL so that
+        // ls-remote/fetch can reach GitHub without a configured remote.
+        let rewritten: Vec<String> = args
+            .into_iter()
+            .map(|arg| if arg == "origin" { self.remote_url.clone() } else { arg })
+            .collect();
+
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&self.temp_dir)
+            .args(&rewritten)
+            .output()
+            .with_context(|| format!("home-runner git {}", rewritten.join(" ")))?;
+
+        Ok(crate::phase_git::PublicationCommandOutput {
+            success: output.status.success(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+    }
+}
+
+#[cfg(feature = "remote-animus-session")]
+impl Drop for HomeRunnerGitVerifier {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.temp_dir);
+    }
+}
+
+#[cfg(feature = "remote-animus-session")]
+#[async_trait::async_trait]
+impl SessionPublicationCommands for HomeRunnerGitVerifier {
+    async fn run_git(&self, args: Vec<String>) -> Result<crate::phase_git::PublicationCommandOutput> {
+        self.run_git_sync(args)
+    }
+}
+
 #[cfg(feature = "remote-animus-session")]
 async fn verify_session_publication<E>(
     executor: &E,
@@ -477,29 +577,54 @@ async fn verify_session_publication<E>(
 where
     E: SessionPublicationCommands,
 {
-    if proof.validate_against_execution(execution).is_err() {
+    if let Err(err) = proof.validate_against_execution(execution) {
+        eprintln!("debug: session publication verification: proof-vs-execution mismatch: {err}");
         return Ok(false);
     }
     let Some(repository) = execution.repository.as_ref() else {
+        eprintln!("debug: session publication verification: execution fence has no repository reservation");
         return Ok(false);
     };
     let configured_remote = executor.run_git(vec!["config".into(), "--get".into(), "remote.origin.url".into()]).await?;
     if !configured_remote.success {
+        eprintln!(
+            "debug: session publication verification: git config remote.origin.url failed (stderr: {})",
+            configured_remote.stderr.trim()
+        );
         return Ok(false);
     }
     let configured_remote = crate::workflow_execute::canonical_remote_url(configured_remote.stdout.trim())?;
     let expected_identity = crate::workflow_execute::normalized_repository_identity(&repository.repository);
-    if crate::workflow_execute::normalized_repository_identity(&configured_remote) != expected_identity
-        || crate::workflow_execute::normalized_repository_identity(&proof.remote) != expected_identity
-    {
+    if crate::workflow_execute::normalized_repository_identity(&configured_remote) != expected_identity {
+        eprintln!(
+            "debug: session publication verification: configured remote identity '{}' != expected '{}'",
+            configured_remote, repository.repository
+        );
+        return Ok(false);
+    }
+    if crate::workflow_execute::normalized_repository_identity(&proof.remote) != expected_identity {
+        eprintln!(
+            "debug: session publication verification: receipt remote identity '{}' != expected '{}'",
+            proof.remote, repository.repository
+        );
         return Ok(false);
     }
     let observed =
         executor.run_git(vec!["ls-remote".into(), "--refs".into(), "origin".into(), proof.remote_ref.clone()]).await?;
-    if !observed.success
-        || crate::workflow_execute::exact_remote_sha(&observed.stdout, &proof.remote_ref).as_deref()
-            != Some(proof.commit_sha.as_str())
+    if !observed.success {
+        eprintln!(
+            "debug: session publication verification: ls-remote failed (stderr: {})",
+            observed.stderr.trim()
+        );
+        return Ok(false);
+    }
+    if crate::workflow_execute::exact_remote_sha(&observed.stdout, &proof.remote_ref).as_deref()
+        != Some(proof.commit_sha.as_str())
     {
+        eprintln!(
+            "debug: session publication verification: ls-remote sha mismatch for ref '{}' (expected {})",
+            proof.remote_ref, proof.commit_sha
+        );
         return Ok(false);
     }
     let verify_ref = format!("refs/animus/session-proof/{}", &proof.commit_sha[..12]);
@@ -512,6 +637,10 @@ where
         ])
         .await?;
     if !fetched.success {
+        eprintln!(
+            "debug: session publication verification: git fetch failed (stderr: {})",
+            fetched.stderr.trim()
+        );
         return Ok(false);
     }
 
@@ -1026,13 +1155,24 @@ pub(crate) async fn delegate_workflow_via_session(
                     let verified = if let (Some(receipt), Some(execution)) =
                         (receipt.as_ref(), execution_fence_owned.as_ref())
                     {
-                        verify_session_publication(
-                            &BoundSessionPublication { client: &client, handle: &handle },
-                            receipt,
-                            execution,
-                        )
-                        .await
-                        .unwrap_or(false)
+                        // Use the home-runner verifier instead of BoundSessionPublication:
+                        // by the time exec_session returns the relay to the Railway node is
+                        // closed, so environment/exec calls via the bound client fail and
+                        // verification never succeeds.  HomeRunnerGitVerifier runs git
+                        // directly on the home runner using a temp bare repo and the
+                        // receipt's remote URL, which bypasses the closed relay entirely.
+                        match HomeRunnerGitVerifier::new(receipt.remote.clone()) {
+                            Ok(verifier) => {
+                                verify_session_publication(&verifier, receipt, execution).await.unwrap_or(false)
+                            }
+                            Err(err) => {
+                                eprintln!(
+                                    "warning: remote-animus session publication verification skipped: \
+                                     could not initialise home-runner git verifier: {err:#}"
+                                );
+                                false
+                            }
+                        }
                     } else {
                         false
                     };
@@ -1929,5 +2069,94 @@ mod tests {
         crate::phase_session::mark_environment_torn_down(scoped_root, "wf-sess-1", "implementation").expect("mark");
         let cp = read_checkpoint(scoped_root, "wf-sess-1", "implementation").expect("read").expect("present");
         assert!(cp.environment.expect("binding").torn_down, "teardown flips torn_down");
+    }
+
+    /// Regression test for TASK-1245: `HomeRunnerGitVerifier` must successfully
+    /// verify a publication receipt without routing git through the node relay.
+    /// The relay closes when exec_session returns; this verifier uses a local bare
+    /// repo and the explicit remote URL so verification always succeeds on a
+    /// completed, honestly-published delegated coding run.
+    #[cfg(feature = "remote-animus-session")]
+    #[tokio::test]
+    async fn home_runner_verifier_succeeds_without_node_relay() {
+        use std::process::Command;
+
+        fn git(cwd: &Path, args: &[&str]) {
+            assert!(Command::new("git").arg("-C").arg(cwd).args(args).status().unwrap().success(), "git {:?}", args);
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let remote = root.path().join("remote.git");
+        let node = root.path().join("node-checkout");
+        // Bare remote (simulates GitHub).
+        git(root.path(), &["init", "--bare", remote.to_str().unwrap()]);
+        // Node checkout — the ONLY place that has the actual repo.
+        git(root.path(), &["init", "-b", "reviewed", node.to_str().unwrap()]);
+        git(&node, &["config", "user.name", "Node"]);
+        git(&node, &["config", "user.email", "node@example.invalid"]);
+        std::fs::write(node.join("work.txt"), "done\n").unwrap();
+        git(&node, &["add", "."]);
+        git(&node, &["commit", "-m", "work"]);
+        git(&node, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        git(&node, &["push", "origin", "HEAD:refs/heads/reviewed"]);
+
+        // Resolve the commit/tree from the node checkout (the home runner doesn't
+        // have a checkout; only the remote bare repo is accessible to it).
+        let commit = String::from_utf8(
+            Command::new("git")
+                .args(["-C", node.to_str().unwrap(), "rev-parse", "HEAD^{commit}"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        let tree = String::from_utf8(
+            Command::new("git")
+                .args(["-C", node.to_str().unwrap(), "rev-parse", "HEAD^{tree}"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        let execution = test_execution(remote.to_str().unwrap());
+        let receipt = test_publication_receipt(remote.to_str().unwrap(), &commit, &tree);
+
+        // The home runner has no checkout at all — only git installed and access
+        // to the remote (file:// in this test, GitHub HTTPS in production).
+        assert!(!crate::phase_git::is_git_repo(root.path().to_str().unwrap()));
+
+        let verifier = HomeRunnerGitVerifier::new(remote.to_str().unwrap().to_string())
+            .expect("HomeRunnerGitVerifier::new");
+        let verified = verify_session_publication(&verifier, &receipt, &execution).await.unwrap();
+        assert!(verified, "HomeRunnerGitVerifier must verify a genuine publication without node relay");
+
+        // A forged receipt (wrong tree sha) must still be rejected.
+        let mut forged = receipt.clone();
+        forged.tree_sha = "0".repeat(40);
+        let forged_verified = verify_session_publication(&verifier, &forged, &execution).await.unwrap();
+        assert!(!forged_verified, "HomeRunnerGitVerifier must reject a forged tree sha");
+
+        // finalize_session_publication promotes the verified receipt and keeps
+        // the run Completed — no regression of the coding-failed misreport.
+        let (status, verified_receipt) =
+            finalize_session_publication(WorkflowStatus::Completed, true, verified, verified, Some(receipt.clone()));
+        assert_eq!(status, WorkflowStatus::Completed, "verified completion must not be downgraded to Failed");
+        assert!(verified_receipt.is_some(), "verified receipt must be surfaced");
+
+        // session_should_teardown fires exactly once for the verified run.
+        assert!(
+            session_should_teardown(
+                WorkflowStatus::Completed,
+                true,
+                WorkflowPublicationCleanupPolicy::AfterRemoteVerified,
+                verified,
+            ),
+            "a verified completed run must trigger teardown"
+        );
     }
 }
