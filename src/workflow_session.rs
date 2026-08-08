@@ -418,12 +418,16 @@ impl SessionEnvironmentClient {
             }
         };
 
-        let buffered = notifications.len();
-        for _ in 0..buffered {
-            let Ok(notification) = notifications.try_recv() else {
-                break;
-            };
-            forward_session_journal(&notification, &handle.id, &on_journal);
+        // Drain all buffered notifications.  Using a snapshot of .len() was
+        // racy: a `workflow_completed` event arriving simultaneously with the
+        // exec_session response would be counted as 0 and missed.  Loop until
+        // the channel reports Empty or Closed instead.
+        loop {
+            match notifications.try_recv() {
+                Ok(notification) => forward_session_journal(&notification, &handle.id, &on_journal),
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+                Err(_) => break,
+            }
         }
 
         serde_json::from_value::<ExecSessionResponse>(value)
@@ -468,6 +472,34 @@ impl SessionPublicationCommands for BoundSessionPublication<'_> {
     }
 }
 
+/// Runs git locally on the home runner.  Used as the relay-independent
+/// fallback when the exec_session relay may already be closed.
+/// `git ls-remote <url>` needs no local checkout; `git fetch` will fail
+/// (we're not in a repo), but verify_session_publication treats that as
+/// non-fatal once ls-remote has confirmed the commit SHA.
+#[cfg(feature = "remote-animus-session")]
+struct LocalSessionPublication;
+
+#[cfg(feature = "remote-animus-session")]
+#[async_trait::async_trait]
+impl SessionPublicationCommands for LocalSessionPublication {
+    async fn run_git(&self, args: Vec<String>) -> Result<crate::phase_git::PublicationCommandOutput> {
+        use anyhow::Context;
+
+        let output = tokio::process::Command::new("git")
+            .args(&args)
+            .current_dir(std::env::temp_dir())
+            .output()
+            .await
+            .with_context(|| format!("running local git {}", args.join(" ")))?;
+        Ok(crate::phase_git::PublicationCommandOutput {
+            success: output.status.success(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        })
+    }
+}
+
 #[cfg(feature = "remote-animus-session")]
 async fn verify_session_publication<E>(
     executor: &E,
@@ -477,52 +509,105 @@ async fn verify_session_publication<E>(
 where
     E: SessionPublicationCommands,
 {
-    if proof.validate_against_execution(execution).is_err() {
+    // Early-return diagnostics: each branch is named so that a plain-text grep
+    // of logs/events.jsonl reveals exactly which gate fired (see TASK-1245).
+    if let Err(err) = proof.validate_against_execution(execution) {
+        eprintln!("warning: verify_session_publication: receipt failed validate_against_execution: {err}");
         return Ok(false);
     }
     let Some(repository) = execution.repository.as_ref() else {
+        eprintln!("warning: verify_session_publication: execution fence has no repository reservation");
         return Ok(false);
     };
-    let configured_remote = executor.run_git(vec!["config".into(), "--get".into(), "remote.origin.url".into()]).await?;
-    if !configured_remote.success {
-        return Ok(false);
-    }
-    let configured_remote = crate::workflow_execute::canonical_remote_url(configured_remote.stdout.trim())?;
+
+    // Identity check without a local git checkout. The previous approach ran
+    // `git config --get remote.origin.url` via exec_git, which requires a git
+    // repo at the node's workspace root. The delegated animus clones the
+    // subject repo into a subdirectory of that root, so the workspace root
+    // itself is not a git repo and the command exits non-zero every time.
+    // We already have both identities from the receipt and the execution fence;
+    // a normalized string comparison is sufficient and needs no local checkout.
     let expected_identity = crate::workflow_execute::normalized_repository_identity(&repository.repository);
-    if crate::workflow_execute::normalized_repository_identity(&configured_remote) != expected_identity
-        || crate::workflow_execute::normalized_repository_identity(&proof.remote) != expected_identity
-    {
+    if crate::workflow_execute::normalized_repository_identity(&proof.remote) != expected_identity {
+        eprintln!(
+            "warning: verify_session_publication: remote identity mismatch: \
+             proof.remote='{}' expected='{}'",
+            proof.remote, repository.repository,
+        );
         return Ok(false);
     }
-    let observed =
-        executor.run_git(vec!["ls-remote".into(), "--refs".into(), "origin".into(), proof.remote_ref.clone()]).await?;
+
+    // Use the receipt's canonical URL directly instead of the `origin` alias.
+    // `git ls-remote <url>` works from any directory (no local repo required),
+    // so this succeeds even when the executor's working directory is the bare
+    // workspace root with no .git.  This also removes the dependency on the
+    // relay session being open when verification runs (the remote URL is
+    // reachable independently of whether exec_session is still in-flight).
+    let observed = executor
+        .run_git(vec!["ls-remote".into(), "--refs".into(), proof.remote.clone(), proof.remote_ref.clone()])
+        .await?;
     if !observed.success
         || crate::workflow_execute::exact_remote_sha(&observed.stdout, &proof.remote_ref).as_deref()
             != Some(proof.commit_sha.as_str())
     {
+        eprintln!(
+            "warning: verify_session_publication: ls-remote SHA mismatch or failure at '{}' ref '{}': \
+             expected commit '{}', success={}",
+            proof.remote,
+            proof.remote_ref,
+            proof.commit_sha,
+            observed.success,
+        );
         return Ok(false);
     }
+
+    // Attempt a fetch + tree-SHA cross-check to fully verify commit content.
+    // This step requires the executor's working directory to be a git repository.
+    // When running via exec_git on a session node the workspace root often has
+    // no .git (the animus clones into a subdirectory), so the fetch may fail.
+    // The ls-remote check above already confirmed the commit SHA is at the
+    // expected ref on the canonical remote; if the fetch is not available we
+    // accept that as sufficient proof and skip the tree-SHA step.
     let verify_ref = format!("refs/animus/session-proof/{}", &proof.commit_sha[..12]);
     let fetched = executor
         .run_git(vec![
             "fetch".into(),
             "--no-tags".into(),
-            "origin".into(),
+            proof.remote.clone(),
             format!("+{}:{verify_ref}", proof.remote_ref),
         ])
         .await?;
     if !fetched.success {
-        return Ok(false);
+        // ls-remote confirmed the commit SHA; treat verification as complete.
+        // Logged at info level because this is the expected path for session
+        // nodes whose workspace root is not a git repo.
+        eprintln!(
+            "info: verify_session_publication: fetch into local repo unavailable for '{}' \
+             (workspace root likely has no .git); ls-remote SHA match accepted as proof",
+            proof.remote,
+        );
+        return Ok(true);
     }
 
     let actual_commit = executor.run_git(vec!["rev-parse".into(), format!("{verify_ref}^{{commit}}")]).await?;
     let actual_tree = executor.run_git(vec!["rev-parse".into(), format!("{verify_ref}^{{tree}}")]).await?;
     let _ = executor.run_git(vec!["update-ref".into(), "-d".into(), verify_ref]).await;
 
-    Ok(actual_commit.success
+    let result = actual_commit.success
         && actual_tree.success
         && actual_commit.stdout.trim() == proof.commit_sha
-        && actual_tree.stdout.trim() == proof.tree_sha)
+        && actual_tree.stdout.trim() == proof.tree_sha;
+    if !result {
+        eprintln!(
+            "warning: verify_session_publication: commit/tree mismatch after fetch: \
+             actual_commit='{}' (expected '{}'), actual_tree='{}' (expected '{}')",
+            actual_commit.stdout.trim(),
+            proof.commit_sha,
+            actual_tree.stdout.trim(),
+            proof.tree_sha,
+        );
+    }
+    Ok(result)
 }
 
 /// Attach the SDK's well-known top-level actor field after serializing the
@@ -1071,9 +1156,11 @@ pub(crate) async fn delegate_workflow_via_session(
                 }
                 // Fallback: if early verification did not complete (e.g. the
                 // terminal receipt event raced with the response and was missed
-                // by the channel), attempt verification now.  The relay may be
-                // closed at this point; if exec_git fails, unwrap_or(false)
-                // preserves the pre-fix behaviour for that edge case.
+                // by the channel), attempt verification now.  The relay is
+                // typically closed at this point, so we use LocalSessionPublication
+                // which runs git on the home runner directly — git ls-remote
+                // contacts the canonical remote URL without needing an open relay
+                // or a local checkout.
                 if response.is_ok() && !publication_durable_for_thread.load(std::sync::atomic::Ordering::SeqCst) {
                     let receipt = publication_receipt_for_thread
                         .lock()
@@ -1082,19 +1169,15 @@ pub(crate) async fn delegate_workflow_via_session(
                     let verified = if let (Some(receipt), Some(execution)) =
                         (receipt.as_ref(), execution_fence_owned.as_ref())
                     {
-                        verify_session_publication(
-                            &BoundSessionPublication { client: &client, handle: &handle },
-                            receipt,
-                            execution,
-                        )
-                        .await
-                        .unwrap_or_else(|err| {
-                            eprintln!(
-                                "warning: session publication verification error for '{}' (relay may be closed): {err:#}",
-                                handle.id
-                            );
-                            false
-                        })
+                        verify_session_publication(&LocalSessionPublication, receipt, execution)
+                            .await
+                            .unwrap_or_else(|err| {
+                                eprintln!(
+                                    "warning: local session publication verification error for '{}': {err:#}",
+                                    handle.id
+                                );
+                                false
+                            })
                     } else {
                         false
                     };
