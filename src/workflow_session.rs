@@ -553,10 +553,7 @@ where
         eprintln!(
             "warning: verify_session_publication: ls-remote SHA mismatch or failure at '{}' ref '{}': \
              expected commit '{}', success={}",
-            proof.remote,
-            proof.remote_ref,
-            proof.commit_sha,
-            observed.success,
+            proof.remote, proof.remote_ref, proof.commit_sha, observed.success,
         );
         return Ok(false);
     }
@@ -946,8 +943,7 @@ pub(crate) async fn delegate_workflow_via_session(
     // Channel for early (relay-open) publication verification: the terminal
     // journal event delivers the receipt here while exec_session is still in
     // progress, so git verification runs before the relay session closes.
-    let (receipt_early_tx, receipt_early_rx) =
-        tokio::sync::mpsc::channel::<PublicationReceipt>(1);
+    let (receipt_early_tx, receipt_early_rx) = tokio::sync::mpsc::channel::<PublicationReceipt>(1);
 
     let on_journal = move |event: &SessionJournalEvent| {
         if let Some(receipt) = terminal_publication_receipt(event, &workflow_id_for_events) {
@@ -2001,6 +1997,91 @@ mod tests {
             non_publication_receipt.is_none(),
             "publication-not-required completion must not promote an unverified journal receipt"
         );
+    }
+
+    /// Regression for TASK-1245: the delegated node runs git at its workspace
+    /// root, which is NOT a git repository (the subject checkout lives in a
+    /// subdirectory). The old verification called `git config --get
+    /// remote.origin.url` there, got a non-zero exit, and returned
+    /// unverified — blocking teardown and mis-marking completed runs failed.
+    /// The fixed path verifies via `ls-remote <canonical-url>` (no local repo
+    /// required) and accepts the SHA match when the in-repo fetch is
+    /// unavailable.
+    #[cfg(feature = "remote-animus-session")]
+    #[tokio::test]
+    async fn session_proof_verifies_from_a_non_repo_workspace_root() {
+        use std::process::Command;
+
+        struct NonRepoGit {
+            cwd: std::path::PathBuf,
+        }
+
+        #[async_trait::async_trait]
+        impl SessionPublicationCommands for NonRepoGit {
+            async fn run_git(&self, args: Vec<String>) -> Result<crate::phase_git::PublicationCommandOutput> {
+                let output = Command::new("git").arg("-C").arg(&self.cwd).args(args).output()?;
+                Ok(crate::phase_git::PublicationCommandOutput {
+                    success: output.status.success(),
+                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                })
+            }
+        }
+
+        fn git(cwd: &Path, args: &[&str]) {
+            assert!(Command::new("git").arg("-C").arg(cwd).args(args).status().unwrap().success());
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let host = root.path().join("workspace-root-no-checkout");
+        let remote = root.path().join("remote.git");
+        let node = root.path().join("node-checkout");
+        std::fs::create_dir(&host).unwrap();
+        git(root.path(), &["init", "--bare", remote.to_str().unwrap()]);
+        git(root.path(), &["init", "-b", "reviewed", node.to_str().unwrap()]);
+        git(&node, &["config", "user.name", "Node"]);
+        git(&node, &["config", "user.email", "node@example.invalid"]);
+        std::fs::write(node.join("shipped.txt"), "shipped\n").unwrap();
+        git(&node, &["add", "."]);
+        git(&node, &["commit", "-m", "shipped"]);
+        git(&node, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        git(&node, &["push", "origin", "HEAD:refs/heads/reviewed"]);
+
+        assert!(!crate::phase_git::is_git_repo(host.to_str().unwrap()));
+        let commit = String::from_utf8(
+            Command::new("git")
+                .args(["-C", node.to_str().unwrap(), "rev-parse", "HEAD^{commit}"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        let tree = String::from_utf8(
+            Command::new("git")
+                .args(["-C", node.to_str().unwrap(), "rev-parse", "HEAD^{tree}"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        let execution = test_execution(remote.to_str().unwrap());
+        let receipt = test_publication_receipt(remote.to_str().unwrap(), &commit, &tree);
+        let executor = NonRepoGit { cwd: host };
+
+        let verified = verify_session_publication(&executor, &receipt, &execution).await.unwrap();
+        assert!(verified, "ls-remote SHA match from a non-repo cwd must verify");
+
+        // A receipt pointing at a commit the remote ref does not contain must
+        // still fail closed from the same non-repo executor.
+        let mut forged = receipt;
+        forged.commit_sha = "9".repeat(40);
+        let forged_verified = verify_session_publication(&executor, &forged, &execution).await.unwrap();
+        assert!(!forged_verified, "unknown commit must not verify");
     }
 
     #[cfg(feature = "remote-animus-session")]
