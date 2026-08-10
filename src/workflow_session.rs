@@ -2039,6 +2039,79 @@ mod tests {
         assert!(bare.metadata.is_null());
     }
 
+    // TASK-1245: LocalSessionPublication runs git from std::env::temp_dir() (not a
+    // git repo) so ls-remote must work without a local checkout, and the inevitable
+    // fetch failure must be treated as non-fatal (the ls-remote SHA match is
+    // sufficient proof). This is the fallback path that fires when exec_session has
+    // already returned and the relay is no longer open for BoundSessionPublication.
+    #[cfg(feature = "remote-animus-session")]
+    #[tokio::test]
+    async fn local_publication_executor_verifies_via_ls_remote_without_local_checkout() {
+        use std::process::Command;
+
+        fn git(cwd: &Path, args: &[&str]) {
+            assert!(
+                Command::new("git").arg("-C").arg(cwd).args(args).status().unwrap().success(),
+                "git {:?} failed",
+                args
+            );
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let remote = root.path().join("remote-local-lsr.git");
+        let node = root.path().join("node-local-lsr");
+        git(root.path(), &["init", "--bare", remote.to_str().unwrap()]);
+        git(root.path(), &["init", "-b", "reviewed", node.to_str().unwrap()]);
+        git(&node, &["config", "user.name", "Node"]);
+        git(&node, &["config", "user.email", "node@test.invalid"]);
+        std::fs::write(node.join("file.txt"), "content\n").unwrap();
+        git(&node, &["add", "."]);
+        git(&node, &["commit", "-m", "commit"]);
+        git(&node, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        git(&node, &["push", "origin", "HEAD:refs/heads/reviewed"]);
+
+        let commit = String::from_utf8(
+            Command::new("git")
+                .args(["-C", node.to_str().unwrap(), "rev-parse", "HEAD^{commit}"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        let tree = String::from_utf8(
+            Command::new("git")
+                .args(["-C", node.to_str().unwrap(), "rev-parse", "HEAD^{tree}"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        let execution = test_execution(remote.to_str().unwrap());
+        let receipt = test_publication_receipt(remote.to_str().unwrap(), &commit, &tree);
+
+        // LocalSessionPublication runs git from temp_dir() which is NOT a git repo.
+        // ls-remote against the local bare repo path succeeds; fetch fails (no .git),
+        // and the code accepts the ls-remote SHA match as sufficient proof.
+        let verified = verify_session_publication(&LocalSessionPublication, &receipt, &execution)
+            .await
+            .expect("local publication verification must not error");
+        assert!(verified, "home-runner ls-remote must verify the receipt without a local checkout");
+
+        // A receipt with the wrong commit SHA must fail verification even without a
+        // local checkout — ls-remote returns the actual SHA, which won't match.
+        let mut wrong = receipt;
+        wrong.commit_sha = "0".repeat(40);
+        let rejected = verify_session_publication(&LocalSessionPublication, &wrong, &execution)
+            .await
+            .expect("wrong-sha verification must not error");
+        assert!(!rejected, "wrong commit SHA must be rejected by ls-remote check");
+    }
+
     // TASK-933: the remote-animus session path persists the node binding into the
     // run's session checkpoint at the reconciler's phase, as a Running checkpoint
     // carrying exactly rc.28's EnvironmentBinding shape. This is THE write the
