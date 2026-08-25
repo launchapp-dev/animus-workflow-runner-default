@@ -465,6 +465,63 @@ pub fn expand_allowed_tool_prefixes_for_additional_servers(runtime_contract: &mu
     }
 }
 
+/// Project the runtime contract's `mcp` block into the wire-level
+/// `mcp_servers` map (server name -> `.mcp.json`-style entry) that the
+/// provider-plugin chain actually consumes (TASK-1290).
+///
+/// The runner composes MCP configuration entirely inside
+/// `runtime_contract.mcp` (`stdio` for the built-in `animus` server,
+/// `additional_servers` for named project/workflow/skill servers) — but the
+/// plugin host forwards only a TOP-LEVEL `mcp_servers` context key to
+/// provider plugins, and the CLI transports (e.g. claude's `--mcp-config`
+/// materializer) read only `SessionRequest.mcp_servers`. Nothing on that
+/// path reads `runtime_contract.mcp`, so without this projection every
+/// CLI-harness workflow agent launches with ZERO MCP servers mounted — and,
+/// because `mcp.tool_policy` is enforced at the mount layer, with no tool
+/// policy either.
+///
+/// Returns `None` when the CLI does not advertise `supports_mcp` or when the
+/// contract carries no servers. An `additional_servers` entry cannot shadow
+/// the built-in `animus` stdio server (injection already skips such
+/// collisions; the projection keeps the builtin regardless).
+pub fn mcp_servers_wire_map(runtime_contract: &Value) -> Option<Value> {
+    let supports_mcp =
+        runtime_contract.pointer("/cli/capabilities/supports_mcp").and_then(Value::as_bool).unwrap_or(false);
+    if !supports_mcp {
+        return None;
+    }
+
+    let mut servers = serde_json::Map::new();
+    if let Some(command) = runtime_contract
+        .pointer("/mcp/stdio/command")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+    {
+        let mut entry = serde_json::json!({ "command": command });
+        if let Some(args) = runtime_contract.pointer("/mcp/stdio/args") {
+            entry["args"] = args.clone();
+        }
+        if let Some(env) = runtime_contract.pointer("/mcp/stdio/env") {
+            entry["env"] = env.clone();
+        }
+        servers.insert("animus".to_string(), entry);
+    }
+    if let Some(additional) = runtime_contract.pointer("/mcp/additional_servers").and_then(Value::as_object) {
+        for (name, definition) in additional {
+            if !servers.contains_key(name) {
+                servers.insert(name.clone(), definition.clone());
+            }
+        }
+    }
+
+    if servers.is_empty() {
+        None
+    } else {
+        Some(Value::Object(servers))
+    }
+}
+
 /// Return `true` when the phase's effective agent profile carries an
 /// `approval_policy` (checking the workflow YAML overlay profile first, then
 /// the agent_runtime_config profile). Mirrors the profile-resolution order of
@@ -1829,5 +1886,76 @@ mod tests {
         assert_eq!(parsed.stdio_command.as_deref(), Some("/opt/host/bin/host-mcp"));
         assert_eq!(parsed.stdio_args_json.as_deref(), Some("[\"--host\"]"));
         assert_eq!(parsed.agent_id.as_deref(), Some("host-agent"));
+    }
+
+    // ── mcp_servers_wire_map (TASK-1290) ─────────────────────────────────
+
+    use super::mcp_servers_wire_map;
+
+    fn mcp_capable_contract() -> serde_json::Value {
+        serde_json::json!({
+            "cli": { "name": "claude", "capabilities": { "supports_mcp": true } },
+            "mcp": {}
+        })
+    }
+
+    #[test]
+    fn wire_map_projects_builtin_stdio_as_animus_entry() {
+        let mut contract = mcp_capable_contract();
+        contract["mcp"]["stdio"] = serde_json::json!({
+            "command": "animus",
+            "args": ["--project-root", "/data/workspace", "mcp", "serve", "--agent-id", "pr-reviewer"]
+        });
+
+        let servers = mcp_servers_wire_map(&contract).expect("stdio must project");
+        assert_eq!(servers.pointer("/animus/command").and_then(serde_json::Value::as_str), Some("animus"));
+        assert_eq!(
+            servers.pointer("/animus/args/5").and_then(serde_json::Value::as_str),
+            Some("pr-reviewer"),
+            "stdio args (incl. --agent-id pin) must ride along verbatim"
+        );
+    }
+
+    #[test]
+    fn wire_map_merges_additional_servers_verbatim() {
+        let mut contract = mcp_capable_contract();
+        contract["mcp"]["stdio"] = serde_json::json!({ "command": "animus", "args": ["mcp", "serve"] });
+        contract["mcp"]["additional_servers"] = serde_json::json!({
+            "github": { "command": "github-mcp-server", "args": ["stdio"], "env": { "GITHUB_TOKEN": "x" } },
+            "remote": { "transport": "http", "url": "https://mcp.example/api", "command": "", "args": [], "env": {} }
+        });
+
+        let servers = mcp_servers_wire_map(&contract).expect("servers must project");
+        let object = servers.as_object().unwrap();
+        assert_eq!(object.len(), 3);
+        assert_eq!(servers.pointer("/github/env/GITHUB_TOKEN").and_then(serde_json::Value::as_str), Some("x"));
+        assert_eq!(servers.pointer("/remote/url").and_then(serde_json::Value::as_str), Some("https://mcp.example/api"));
+    }
+
+    #[test]
+    fn wire_map_keeps_builtin_animus_over_additional_collision() {
+        let mut contract = mcp_capable_contract();
+        contract["mcp"]["stdio"] = serde_json::json!({ "command": "animus", "args": ["mcp", "serve"] });
+        contract["mcp"]["additional_servers"] = serde_json::json!({
+            "animus": { "command": "evil-shadow", "args": [] }
+        });
+
+        let servers = mcp_servers_wire_map(&contract).expect("servers must project");
+        assert_eq!(servers.pointer("/animus/command").and_then(serde_json::Value::as_str), Some("animus"));
+    }
+
+    #[test]
+    fn wire_map_requires_supports_mcp() {
+        let mut contract = mcp_capable_contract();
+        contract["cli"]["capabilities"]["supports_mcp"] = serde_json::json!(false);
+        contract["mcp"]["stdio"] = serde_json::json!({ "command": "animus", "args": ["mcp", "serve"] });
+
+        assert!(mcp_servers_wire_map(&contract).is_none());
+    }
+
+    #[test]
+    fn wire_map_returns_none_when_no_servers_composed() {
+        assert!(mcp_servers_wire_map(&mcp_capable_contract()).is_none());
+        assert!(mcp_servers_wire_map(&serde_json::json!({})).is_none());
     }
 }
