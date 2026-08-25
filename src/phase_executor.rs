@@ -20,8 +20,8 @@ use crate::runtime_contract::{
     apply_phase_capability_launch_flags, expand_allowed_tool_prefixes_for_additional_servers, inject_agent_tool_policy,
     inject_approvals_signal, inject_default_stdio_mcp_for_agent, inject_memory_mcp_for_capable_agent,
     inject_named_mcp_servers, inject_project_mcp_servers, inject_response_schema_into_launch_args,
-    inject_workflow_mcp_servers, phase_output_json_schema_for, phase_response_json_schema_for, set_mcp_tool_policy,
-    stamp_approvals_on_runtime_contract,
+    inject_workflow_mcp_servers, mcp_servers_wire_map, phase_output_json_schema_for, phase_response_json_schema_for,
+    set_mcp_tool_policy, stamp_approvals_on_runtime_contract,
 };
 use crate::runtime_support::{
     inject_cli_launch_env, inject_cli_launch_overrides, phase_max_continuations, phase_runner_attempts,
@@ -1970,10 +1970,21 @@ async fn run_workflow_phase_with_agent(params: PhaseAgentParams<'_>) -> Result<A
                             workflow_id, phase_id, mcp_stdio_command, mcp_stdio_args, mcp_additional_servers
                         );
                     }
-                    context
-                        .as_object_mut()
-                        .expect("json object")
-                        .insert("runtime_contract".to_string(), runtime_contract);
+                    // TASK-1290: the plugin host forwards only a TOP-LEVEL
+                    // `mcp_servers` context key to provider plugins, and the
+                    // CLI transports build their MCP config (claude:
+                    // `--mcp-config`) from exactly that key — nothing on that
+                    // path reads `runtime_contract.mcp`. Project the composed
+                    // servers there, or every CLI-harness agent launches with
+                    // zero MCP mounts.
+                    let wire_mcp_servers = mcp_servers_wire_map(&runtime_contract);
+                    let context_object = context.as_object_mut().expect("json object");
+                    if let Some(servers) = wire_mcp_servers {
+                        if !context_object.contains_key("mcp_servers") {
+                            context_object.insert("mcp_servers".to_string(), servers);
+                        }
+                    }
+                    context_object.insert("runtime_contract".to_string(), runtime_contract);
                 } else {
                     info!(
                         workflow_id = %workflow_id,
