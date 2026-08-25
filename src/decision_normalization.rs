@@ -75,11 +75,7 @@ fn conservative_risk(decision_schema: &Value) -> String {
         .pointer("/properties/risk/enum")
         .and_then(Value::as_array)
         .and_then(|values| {
-            values
-                .iter()
-                .filter_map(Value::as_str)
-                .max_by_key(|risk| risk_rank(risk))
-                .map(ToOwned::to_owned)
+            values.iter().filter_map(Value::as_str).max_by_key(|risk| risk_rank(risk)).map(ToOwned::to_owned)
         })
         .unwrap_or_else(|| "high".to_string())
 }
@@ -298,10 +294,7 @@ mod tests {
         payload["phase_decision"].as_object_mut().unwrap().remove("verdict");
 
         normalize_phase_decision(&mut payload, "pr-review", &schema);
-        assert!(
-            payload["phase_decision"].get("verdict").is_none(),
-            "ambiguous mapping must not derive a verdict"
-        );
+        assert!(payload["phase_decision"].get("verdict").is_none(), "ambiguous mapping must not derive a verdict");
         assert!(validate_basic_json_schema(&payload, &schema).is_err());
     }
 
@@ -316,10 +309,7 @@ mod tests {
         payload["phase_decision"].as_object_mut().unwrap().remove("verdict");
 
         normalize_phase_decision(&mut payload, "pr-review", &schema);
-        assert!(
-            payload["phase_decision"].get("verdict").is_none(),
-            "an unpinned branch makes every mapping ambiguous"
-        );
+        assert!(payload["phase_decision"].get("verdict").is_none(), "an unpinned branch makes every mapping ambiguous");
     }
 
     #[test]
@@ -342,10 +332,7 @@ mod tests {
 
         let filled = normalize_phase_decision(&mut payload, "pr-review", &schema);
         assert!(filled.contains(&"reason".to_string()));
-        assert_eq!(
-            payload["phase_decision"]["reason"],
-            json!("exact-head APPROVE posted and PR squash-merged")
-        );
+        assert_eq!(payload["phase_decision"]["reason"], json!("exact-head APPROVE posted and PR squash-merged"));
         validate_basic_json_schema(&payload, &schema).expect("summary-derived reason must validate");
     }
 
