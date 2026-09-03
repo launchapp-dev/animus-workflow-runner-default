@@ -747,6 +747,170 @@ fn remove_additional_mcp_server_collisions(
     filtered
 }
 
+fn mcp_proxy_command() -> String {
+    if let Some(command) = std::env::var("ANIMUS_MCP_PROXY_BIN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return command;
+    }
+    for variable in ["ANIMUS_HOST_CLI_PATH", "ANIMUS_BIN"] {
+        if let Some(path) = std::env::var_os(variable).map(std::path::PathBuf::from) {
+            if let Some(parent) = path.parent() {
+                let candidate = parent.join(if cfg!(windows) { "animus-mcp-proxy.exe" } else { "animus-mcp-proxy" });
+                if candidate.is_file() {
+                    return candidate.to_string_lossy().to_string();
+                }
+            }
+        }
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        for directory in std::env::split_paths(&path) {
+            let candidate = directory.join(if cfg!(windows) { "animus-mcp-proxy.exe" } else { "animus-mcp-proxy" });
+            if candidate.is_file() {
+                return candidate.to_string_lossy().to_string();
+            }
+        }
+    }
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(parent) = executable.parent() {
+            let candidate = parent.join(if cfg!(windows) { "animus-mcp-proxy.exe" } else { "animus-mcp-proxy" });
+            if candidate.is_file() {
+                return candidate.to_string_lossy().to_string();
+            }
+        }
+    }
+    if cfg!(windows) { "animus-mcp-proxy.exe" } else { "animus-mcp-proxy" }.to_string()
+}
+
+fn resolve_secret_placeholder(
+    value: &str,
+    secret_decls: &std::collections::BTreeMap<String, orchestrator_config::SecretRef>,
+) -> String {
+    const PREFIX: &str = "${secret.";
+    if !value.contains(PREFIX) {
+        return value.to_string();
+    }
+    let snapshot = orchestrator_plugin_host::current_secret_snapshot_provider();
+    let mut output = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(start) = rest.find(PREFIX) {
+        output.push_str(&rest[..start]);
+        let after = &rest[start + PREFIX.len()..];
+        let Some(end) = after.find('}') else {
+            output.push_str(&rest[start..]);
+            return output;
+        };
+        if output.ends_with('$') {
+            output.pop();
+            output.push_str(PREFIX);
+            output.push_str(&after[..end]);
+            output.push('}');
+            rest = &after[end + 1..];
+            continue;
+        }
+        let secret_name = after[..end].trim();
+        let replacement = secret_decls
+            .get(secret_name)
+            .map(|declaration| declaration.env.trim())
+            .filter(|name| !name.is_empty())
+            .and_then(|name| {
+                std::env::var(name).ok().or_else(|| {
+                    snapshot
+                        .as_deref()
+                        .and_then(|provider| provider.snapshot_filtered(&[name.to_string()]).remove(name))
+                })
+            })
+            .unwrap_or_else(|| format!("{PREFIX}{}}}", &after[..end]));
+        output.push_str(&replacement);
+        rest = &after[end + 1..];
+    }
+    output.push_str(rest);
+    output
+}
+
+fn resolve_mcp_env(
+    env: &std::collections::BTreeMap<String, String>,
+    secret_decls: &std::collections::BTreeMap<String, orchestrator_config::SecretRef>,
+) -> std::collections::BTreeMap<String, String> {
+    env.iter().map(|(key, value)| (key.clone(), resolve_secret_placeholder(value, secret_decls))).collect()
+}
+
+fn oauth_proxy_entry(
+    name: &str,
+    url: Option<&str>,
+    env: &std::collections::BTreeMap<String, String>,
+    oauth: &orchestrator_config::OauthConfig,
+    project_root: &str,
+) -> Value {
+    let mut args =
+        vec!["--server".to_string(), name.to_string(), "--project-root".to_string(), project_root.to_string()];
+    if let Some(url) = url.map(str::trim).filter(|value| !value.is_empty()) {
+        args.push("--url".to_string());
+        args.push(url.to_string());
+    }
+    args.push("--oauth-config-json".to_string());
+    args.push(serde_json::to_string(oauth).expect("OAuth config must serialize"));
+    serde_json::json!({
+        "command": mcp_proxy_command(),
+        "args": args,
+        "env": env,
+        "transport": "stdio",
+    })
+}
+
+fn workflow_mcp_server_entry(
+    name: &str,
+    definition: &orchestrator_config::McpServerDefinition,
+    secret_decls: &std::collections::BTreeMap<String, orchestrator_config::SecretRef>,
+    project_root: &str,
+) -> Value {
+    let env = resolve_mcp_env(&definition.env, secret_decls);
+    if let Some(oauth) = definition.oauth.as_ref() {
+        return oauth_proxy_entry(name, definition.url.as_deref(), &env, oauth, project_root);
+    }
+    let mut value = serde_json::json!({
+        "command": definition.command,
+        "args": definition.args,
+        "env": env,
+    });
+    if let Some(transport) = &definition.transport {
+        value["transport"] = Value::String(transport.clone());
+    }
+    if let Some(url) = &definition.url {
+        value["url"] = Value::String(url.clone());
+    }
+    value
+}
+
+fn project_mcp_server_entry(
+    name: &str,
+    definition: &protocol::ProjectMcpServerEntry,
+    secret_decls: &std::collections::BTreeMap<String, orchestrator_config::SecretRef>,
+    project_root: &str,
+) -> Value {
+    let env = resolve_mcp_env(&definition.env, secret_decls);
+    if let Some(value) = definition.oauth.as_ref() {
+        match serde_json::from_value::<orchestrator_config::OauthConfig>(value.clone()) {
+            Ok(oauth) => return oauth_proxy_entry(name, definition.url.as_deref(), &env, &oauth, project_root),
+            Err(error) => warn!(server = name, %error, "Ignoring malformed OAuth config for project MCP server"),
+        }
+    }
+    let mut value = serde_json::json!({
+        "command": definition.command,
+        "args": definition.args,
+        "env": env,
+    });
+    if let Some(transport) = &definition.transport {
+        value["transport"] = Value::String(transport.clone());
+    }
+    if let Some(url) = &definition.url {
+        value["url"] = Value::String(url.clone());
+    }
+    value
+}
+
 pub fn inject_project_mcp_servers(
     runtime_contract: &mut Value,
     project_root: &str,
@@ -768,17 +932,7 @@ pub fn inject_project_mcp_servers(
         if !assigned {
             continue;
         }
-        let mut entry_json = serde_json::json!({
-            "command": entry.command,
-            "args": entry.args,
-            "env": entry.env,
-        });
-        if let Some(transport) = &entry.transport {
-            entry_json["transport"] = serde_json::Value::String(transport.clone());
-        }
-        if let Some(url) = &entry.url {
-            entry_json["url"] = serde_json::Value::String(url.clone());
-        }
+        let entry_json = project_mcp_server_entry(name, entry, &ctx.workflow_config.config.secrets, project_root);
         servers.insert(name.clone(), entry_json);
     }
     let servers = remove_additional_mcp_server_collisions(runtime_contract, servers);
@@ -790,7 +944,12 @@ pub fn inject_project_mcp_servers(
     }
 }
 
-pub fn inject_workflow_mcp_servers(runtime_contract: &mut Value, ctx: &RuntimeConfigContext, phase_id: &str) {
+pub fn inject_workflow_mcp_servers(
+    runtime_contract: &mut Value,
+    project_root: &str,
+    ctx: &RuntimeConfigContext,
+    phase_id: &str,
+) {
     if ctx.workflow_config.config.mcp_servers.is_empty() {
         return;
     }
@@ -828,17 +987,7 @@ pub fn inject_workflow_mcp_servers(runtime_contract: &mut Value, ctx: &RuntimeCo
         if !allowed_servers.is_empty() && !allowed_servers.contains(name) {
             continue;
         }
-        let mut entry_json = serde_json::json!({
-            "command": definition.command,
-            "args": definition.args,
-            "env": definition.env,
-        });
-        if let Some(transport) = &definition.transport {
-            entry_json["transport"] = serde_json::Value::String(transport.clone());
-        }
-        if let Some(url) = &definition.url {
-            entry_json["url"] = serde_json::Value::String(url.clone());
-        }
+        let entry_json = workflow_mcp_server_entry(name, definition, &ctx.workflow_config.config.secrets, project_root);
         servers.insert(name.clone(), entry_json);
     }
     let servers = remove_additional_mcp_server_collisions(runtime_contract, servers);
@@ -874,33 +1023,15 @@ pub fn inject_named_mcp_servers(
         }
 
         if let Some(definition) = ctx.workflow_config.config.mcp_servers.get(name) {
-            let mut entry_json = serde_json::json!({
-                "command": definition.command,
-                "args": definition.args,
-                "env": definition.env,
-            });
-            if let Some(transport) = &definition.transport {
-                entry_json["transport"] = serde_json::Value::String(transport.clone());
-            }
-            if let Some(url) = &definition.url {
-                entry_json["url"] = serde_json::Value::String(url.clone());
-            }
+            let entry_json =
+                workflow_mcp_server_entry(name, definition, &ctx.workflow_config.config.secrets, project_root);
             servers.insert(name.to_string(), entry_json);
             continue;
         }
 
         if let Some(definition) = project_config.mcp_servers.get(name) {
-            let mut entry_json = serde_json::json!({
-                "command": definition.command,
-                "args": definition.args,
-                "env": definition.env,
-            });
-            if let Some(transport) = &definition.transport {
-                entry_json["transport"] = serde_json::Value::String(transport.clone());
-            }
-            if let Some(url) = &definition.url {
-                entry_json["url"] = serde_json::Value::String(url.clone());
-            }
+            let entry_json =
+                project_mcp_server_entry(name, definition, &ctx.workflow_config.config.secrets, project_root);
             servers.insert(name.to_string(), entry_json);
             continue;
         }
@@ -1149,13 +1280,225 @@ mod tests {
         let mut runtime_contract = serde_json::json!({
             "mcp": {}
         });
-        inject_workflow_mcp_servers(&mut runtime_contract, &ctx, "research");
+        inject_workflow_mcp_servers(&mut runtime_contract, ".", &ctx, "research");
 
         let additional_servers = runtime_contract
             .pointer("/mcp/additional_servers")
             .and_then(Value::as_object)
             .expect("additional_servers should be injected");
         assert!(additional_servers.contains_key("animus.requirements/ao"));
+    }
+
+    #[test]
+    fn inject_workflow_oauth_server_builds_self_contained_proxy_and_resolves_secret() {
+        let mut workflow_config = builtin_workflow_config();
+        workflow_config.mcp_servers.clear();
+        workflow_config.secrets.insert(
+            "rental_bearer".to_string(),
+            orchestrator_config::SecretRef {
+                env: "ANIMUS_TEST_RENTAL_MCP_BEARER".to_string(),
+                required: true,
+                description: None,
+            },
+        );
+        let mut env = BTreeMap::new();
+        env.insert("RENTAL_MCP_BEARER".to_string(), "${secret.rental_bearer}".to_string());
+        workflow_config.mcp_servers.insert(
+            "rental-v1".to_string(),
+            McpServerDefinition {
+                command: String::new(),
+                args: Vec::new(),
+                transport: Some("http".to_string()),
+                url: Some("https://example.test/mcp".to_string()),
+                config: BTreeMap::new(),
+                tools: Vec::new(),
+                env,
+                oauth: Some(orchestrator_config::OauthConfig {
+                    flow: orchestrator_config::workflow_config::OauthFlow::ManualBearer,
+                    token_url: None,
+                    client_id_env: None,
+                    client_secret_env: None,
+                    refresh_token_env: None,
+                    bearer_env: Some("RENTAL_MCP_BEARER".to_string()),
+                    scopes: Vec::new(),
+                    audience: None,
+                    cache: true,
+                    client_id: None,
+                }),
+            },
+        );
+        workflow_config
+            .phase_mcp_bindings
+            .insert("research".to_string(), PhaseMcpBinding { servers: vec!["rental-v1".to_string()] });
+        let loaded_workflow_config = LoadedWorkflowConfig {
+            metadata: WorkflowConfigMetadata {
+                schema: workflow_config.schema.clone(),
+                version: workflow_config.version,
+                hash: workflow_config_hash(&workflow_config),
+                source: WorkflowConfigSource::Builtin,
+            },
+            config: workflow_config,
+            path: PathBuf::from("builtin"),
+        };
+        let ctx = RuntimeConfigContext {
+            agent_runtime_config: builtin_agent_runtime_config(),
+            workflow_config: loaded_workflow_config,
+        };
+        std::env::set_var("ANIMUS_TEST_RENTAL_MCP_BEARER", "resolved-bearer");
+        let mut runtime_contract = serde_json::json!({ "mcp": {} });
+
+        inject_workflow_mcp_servers(&mut runtime_contract, "/project", &ctx, "research");
+        std::env::remove_var("ANIMUS_TEST_RENTAL_MCP_BEARER");
+
+        let entry = runtime_contract.pointer("/mcp/additional_servers/rental-v1").expect("proxy entry");
+        assert!(entry.get("command").and_then(Value::as_str).is_some_and(|value| value.ends_with("animus-mcp-proxy")));
+        assert_eq!(entry.pointer("/env/RENTAL_MCP_BEARER").and_then(Value::as_str), Some("resolved-bearer"));
+        assert_eq!(entry.get("transport").and_then(Value::as_str), Some("stdio"));
+        assert!(entry.get("url").is_none());
+        let args = entry.get("args").and_then(Value::as_array).expect("proxy args");
+        assert!(args.windows(2).any(|pair| pair[0] == "--url" && pair[1] == "https://example.test/mcp"));
+        assert!(args.windows(2).any(|pair| {
+            pair[0] == "--oauth-config-json"
+                && pair[1].as_str().is_some_and(|value| {
+                    serde_json::from_str::<orchestrator_config::OauthConfig>(value).is_ok_and(|config| {
+                        config.flow == orchestrator_config::workflow_config::OauthFlow::ManualBearer
+                    })
+                })
+        }));
+    }
+
+    #[test]
+    fn inject_named_oauth_server_builds_self_contained_proxy_and_resolves_secret() {
+        let temp = tempfile::tempdir().expect("tempdir for project root");
+        let project_root = temp.path().to_string_lossy().to_string();
+        let mut workflow_config = builtin_workflow_config();
+        workflow_config.mcp_servers.clear();
+        workflow_config.secrets.insert(
+            "named_bearer".to_string(),
+            orchestrator_config::SecretRef {
+                env: "ANIMUS_TEST_NAMED_MCP_BEARER".to_string(),
+                required: true,
+                description: None,
+            },
+        );
+        let mut env = BTreeMap::new();
+        env.insert("NAMED_MCP_BEARER".to_string(), "${secret.named_bearer}".to_string());
+        workflow_config.mcp_servers.insert(
+            "named-oauth".to_string(),
+            McpServerDefinition {
+                command: String::new(),
+                args: Vec::new(),
+                transport: Some("http".to_string()),
+                url: Some("https://example.test/named".to_string()),
+                config: BTreeMap::new(),
+                tools: Vec::new(),
+                env,
+                oauth: Some(orchestrator_config::OauthConfig {
+                    flow: orchestrator_config::workflow_config::OauthFlow::ManualBearer,
+                    token_url: None,
+                    client_id_env: None,
+                    client_secret_env: None,
+                    refresh_token_env: None,
+                    bearer_env: Some("NAMED_MCP_BEARER".to_string()),
+                    scopes: Vec::new(),
+                    audience: None,
+                    cache: true,
+                    client_id: None,
+                }),
+            },
+        );
+        let loaded_workflow_config = LoadedWorkflowConfig {
+            metadata: WorkflowConfigMetadata {
+                schema: workflow_config.schema.clone(),
+                version: workflow_config.version,
+                hash: workflow_config_hash(&workflow_config),
+                source: WorkflowConfigSource::Builtin,
+            },
+            config: workflow_config,
+            path: PathBuf::from("builtin"),
+        };
+        let ctx = RuntimeConfigContext {
+            agent_runtime_config: builtin_agent_runtime_config(),
+            workflow_config: loaded_workflow_config,
+        };
+        std::env::set_var("ANIMUS_TEST_NAMED_MCP_BEARER", "named-resolved-bearer");
+        let mut runtime_contract = serde_json::json!({ "mcp": {} });
+
+        inject_named_mcp_servers(&mut runtime_contract, &project_root, &ctx, "research", &["named-oauth".to_string()])
+            .expect("named MCP injection");
+        std::env::remove_var("ANIMUS_TEST_NAMED_MCP_BEARER");
+
+        let entry = runtime_contract.pointer("/mcp/additional_servers/named-oauth").expect("proxy entry");
+        assert!(entry.get("command").and_then(Value::as_str).is_some_and(|value| value.ends_with("animus-mcp-proxy")));
+        assert_eq!(entry.pointer("/env/NAMED_MCP_BEARER").and_then(Value::as_str), Some("named-resolved-bearer"));
+        assert_eq!(entry.get("transport").and_then(Value::as_str), Some("stdio"));
+        assert!(entry.get("url").is_none());
+    }
+
+    #[test]
+    fn inject_project_oauth_server_builds_self_contained_proxy_and_resolves_secret() {
+        let temp = tempfile::tempdir().expect("tempdir for project root");
+        let project_root = temp.path().to_string_lossy().to_string();
+        let mut workflow_config = builtin_workflow_config();
+        workflow_config.mcp_servers.clear();
+        workflow_config.secrets.insert(
+            "project_bearer".to_string(),
+            orchestrator_config::SecretRef {
+                env: "ANIMUS_TEST_PROJECT_MCP_BEARER".to_string(),
+                required: true,
+                description: None,
+            },
+        );
+        let loaded_workflow_config = LoadedWorkflowConfig {
+            metadata: WorkflowConfigMetadata {
+                schema: workflow_config.schema.clone(),
+                version: workflow_config.version,
+                hash: workflow_config_hash(&workflow_config),
+                source: WorkflowConfigSource::Builtin,
+            },
+            config: workflow_config,
+            path: PathBuf::from("builtin"),
+        };
+        let ctx = RuntimeConfigContext {
+            agent_runtime_config: builtin_agent_runtime_config(),
+            workflow_config: loaded_workflow_config,
+        };
+        let mut project_config: protocol::Config =
+            serde_json::from_value(serde_json::json!({ "agent_runner_token": null })).expect("project config");
+        project_config.mcp_servers.insert(
+            "project-oauth".to_string(),
+            protocol::ProjectMcpServerEntry {
+                command: String::new(),
+                args: Vec::new(),
+                env: BTreeMap::from([("PROJECT_MCP_BEARER".to_string(), "${secret.project_bearer}".to_string())]),
+                assign_to: Vec::new(),
+                transport: Some("http".to_string()),
+                url: Some("https://example.test/project".to_string()),
+                oauth: Some(serde_json::json!({
+                    "flow": "manual_bearer",
+                    "bearer_env": "PROJECT_MCP_BEARER"
+                })),
+            },
+        );
+        project_config.save(&project_root).expect("save project config");
+        std::env::set_var("ANIMUS_TEST_PROJECT_MCP_BEARER", "project-resolved-bearer");
+        let mut runtime_contract = serde_json::json!({ "mcp": {} });
+
+        inject_project_mcp_servers(&mut runtime_contract, &project_root, &ctx, "research");
+        std::env::remove_var("ANIMUS_TEST_PROJECT_MCP_BEARER");
+
+        let entry = runtime_contract.pointer("/mcp/additional_servers/project-oauth").expect("proxy entry");
+        assert!(entry.get("command").and_then(Value::as_str).is_some_and(|value| value.ends_with("animus-mcp-proxy")));
+        assert_eq!(entry.pointer("/env/PROJECT_MCP_BEARER").and_then(Value::as_str), Some("project-resolved-bearer"));
+        assert_eq!(entry.get("transport").and_then(Value::as_str), Some("stdio"));
+        assert!(entry.get("url").is_none());
+    }
+
+    #[test]
+    fn secret_resolution_preserves_undeclared_and_escaped_references() {
+        let declarations = BTreeMap::new();
+        assert_eq!(resolve_secret_placeholder("${secret.unknown}", &declarations), "${secret.unknown}");
+        assert_eq!(resolve_secret_placeholder("$${secret.unknown}", &declarations), "${secret.unknown}");
     }
 
     #[test]
@@ -1184,7 +1527,7 @@ mod tests {
                 }
             }
         });
-        inject_workflow_mcp_servers(&mut runtime_contract, &ctx, "requirements");
+        inject_workflow_mcp_servers(&mut runtime_contract, ".", &ctx, "requirements");
 
         assert!(
             runtime_contract.pointer("/mcp/additional_servers").is_none(),
