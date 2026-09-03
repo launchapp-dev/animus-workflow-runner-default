@@ -519,7 +519,27 @@ pub fn mcp_servers_wire_map(runtime_contract: &Value) -> Option<Value> {
     if let Some(additional) = runtime_contract.pointer("/mcp/additional_servers").and_then(Value::as_object) {
         for (name, definition) in additional {
             if !servers.contains_key(name) {
-                servers.insert(name.clone(), definition.clone());
+                let mut definition = definition.clone();
+                if let Some(entry) = definition.as_object_mut() {
+                    let transport = entry.remove("transport").and_then(|value| value.as_str().map(ToOwned::to_owned));
+                    let has_url = entry.get("url").and_then(Value::as_str).is_some_and(|url| !url.trim().is_empty());
+                    if has_url {
+                        let kind = if transport.as_deref() == Some("sse") { "sse" } else { "http" };
+                        entry.insert("type".to_string(), Value::String(kind.to_string()));
+                        let command_empty = entry
+                            .get("command")
+                            .and_then(Value::as_str)
+                            .map(|command| command.trim().is_empty())
+                            .unwrap_or(true);
+                        if command_empty {
+                            entry.remove("command");
+                            if entry.get("args").and_then(Value::as_array).is_some_and(Vec::is_empty) {
+                                entry.remove("args");
+                            }
+                        }
+                    }
+                }
+                servers.insert(name.clone(), definition);
             }
         }
     }
@@ -1927,19 +1947,28 @@ mod tests {
     }
 
     #[test]
-    fn wire_map_merges_additional_servers_verbatim() {
+    fn wire_map_canonicalizes_additional_servers() {
         let mut contract = mcp_capable_contract();
         contract["mcp"]["stdio"] = serde_json::json!({ "command": "animus", "args": ["mcp", "serve"] });
         contract["mcp"]["additional_servers"] = serde_json::json!({
-            "github": { "command": "github-mcp-server", "args": ["stdio"], "env": { "GITHUB_TOKEN": "x" } },
-            "remote": { "transport": "http", "url": "https://mcp.example/api", "command": "", "args": [], "env": {} }
+            "github": { "transport": "stdio", "command": "github-mcp-server", "args": ["stdio"], "env": { "GITHUB_TOKEN": "x" } },
+            "remote": { "transport": "http", "url": "https://mcp.example/api", "command": "", "args": [], "env": {} },
+            "events": { "transport": "sse", "url": "https://mcp.example/events", "command": "", "args": [], "env": {} }
         });
 
         let servers = mcp_servers_wire_map(&contract).expect("servers must project");
         let object = servers.as_object().unwrap();
-        assert_eq!(object.len(), 3);
+        assert_eq!(object.len(), 4);
         assert_eq!(servers.pointer("/github/env/GITHUB_TOKEN").and_then(serde_json::Value::as_str), Some("x"));
         assert_eq!(servers.pointer("/remote/url").and_then(serde_json::Value::as_str), Some("https://mcp.example/api"));
+        assert_eq!(servers.pointer("/remote/type").and_then(serde_json::Value::as_str), Some("http"));
+        assert!(servers.pointer("/remote/transport").is_none());
+        assert!(servers.pointer("/remote/command").is_none());
+        assert!(servers.pointer("/remote/args").is_none());
+        assert_eq!(servers.pointer("/events/type").and_then(serde_json::Value::as_str), Some("sse"));
+        assert!(servers.pointer("/events/transport").is_none());
+        assert!(servers.pointer("/github/type").is_none());
+        assert!(servers.pointer("/github/transport").is_none());
     }
 
     #[test]
