@@ -644,6 +644,18 @@ pub async fn execute_workflow_with_hub(
         }
     };
 
+    // SPEC-001 (TASK-001): when the daemon staged this run's phase skill
+    // definitions (`skill_dir_sync::PHASE_SKILLS_DIR_ENV`) and the run holds a
+    // remote node — brokered acquire, owned prepare, or retained-publication
+    // reattach, all three surface as `held_environment` here — copy them onto
+    // the node BEFORE the first phase executes so the node's user-tier skill
+    // loader (`~/.animus/config/skill_definitions`) resolves them. Best-effort:
+    // write failures are logged; the missing-skill hard-fail at phase
+    // resolution is the enforcement point. No-op for local runs / unset env var.
+    if let Some(held) = held_environment {
+        crate::skill_dir_sync::sync_staged_skills_to_held_environment(held, Path::new(&params.project_root));
+    }
+
     // v0.5: PhaseEventCallback was removed. The protocol-shaped PhaseEvents
     // are recorded inside the `event_emitter` (`PhaseEventRecorder`) via
     // `emit_runtime`. We retain the no-op `emit` shim so the lifted call

@@ -367,6 +367,45 @@ impl SessionEnvironmentClient {
         })
     }
 
+    /// Buffered `environment/exec` carrying stdin — small provisioning writes
+    /// against the node (the SPEC-001 staged phase-skills sync). Same transport
+    /// shape as [`Self::exec_git`].
+    async fn exec_provision(
+        &self,
+        handle: &animus_environment_protocol::EnvironmentHandle,
+        program: &str,
+        args: &[String],
+        stdin: String,
+    ) -> Result<animus_environment_protocol::ExecResponse> {
+        use std::collections::BTreeMap;
+        use std::time::Duration;
+
+        use animus_environment_protocol::{ExecRequest, HarnessCommand, METHOD_ENVIRONMENT_EXEC};
+        use anyhow::Context;
+
+        let request = ExecRequest {
+            handle: handle.clone(),
+            command: HarnessCommand {
+                program: program.to_string(),
+                args: args.to_vec(),
+                env: BTreeMap::new(),
+                // Provisioning targets $HOME-relative paths; never pass the
+                // unrelated home runner's cwd (mirrors exec_git).
+                cwd: None,
+            },
+            stdin: Some(stdin),
+            timeout_secs: Some(crate::skill_dir_sync::SKILL_WRITE_TIMEOUT_SECS),
+        };
+        let params = serde_json::to_value(request).context("serializing environment provisioning exec request")?;
+        let value = self
+            .request_once(METHOD_ENVIRONMENT_EXEC, params, Some(Duration::from_secs(90)))
+            .await
+            .map_err(SessionHostCallError::into_anyhow)
+            .with_context(|| format!("provisioning exec via {}", self.plugin_name))?;
+        serde_json::from_value(value)
+            .with_context(|| format!("decoding provisioning exec response from {}", self.plugin_name))
+    }
+
     async fn exec_session<F>(
         &self,
         handle: &animus_environment_protocol::EnvironmentHandle,
@@ -1092,6 +1131,28 @@ pub(crate) async fn delegate_workflow_via_session(
                     (scoped_root_for_thread.as_deref(), binding_phase_id_for_thread.as_deref())
                 {
                     persist_session_binding(scoped_root, &workflow_id_owned, phase_id, &environment_id_owned, &handle);
+                }
+                // SPEC-001 (TASK-001): the delegated node runs the WHOLE workflow
+                // with its OWN runner, which resolves phase skills through the
+                // user-tier loader at ~/.animus/config/skill_definitions. Copy
+                // the daemon-staged definitions there BEFORE exec_session starts
+                // the node (this path never passes through the REQ-048
+                // `held_environment` choke point, so it syncs here directly).
+                // Best-effort: a failed write is logged; the node's own
+                // missing-skill hard-fail at phase resolution is the enforcement
+                // point. No-op when the env var is unset.
+                if let Some(plan) = crate::skill_dir_sync::staged_skill_sync_plan_from_env() {
+                    for write in &plan.writes {
+                        let result = client
+                            .exec_provision(&handle, &write.program, &write.args, write.stdin_b64.clone())
+                            .await
+                            .map(|response| crate::skill_dir_sync::SkillWriteOutcome {
+                                exit_code: response.exit_code,
+                                stderr: response.stderr,
+                                timed_out: response.timed_out,
+                            });
+                        crate::skill_dir_sync::log_skill_write_outcome(write, result);
+                    }
                 }
                 // Verify publication WHILE exec_session relay is still open.
                 // The terminal `workflow_completed` journal event delivers the

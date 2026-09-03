@@ -3,7 +3,9 @@ use std::path::Path;
 use anyhow::Result;
 use orchestrator_config::{
     apply_skill_for_execution, merge_skill_applications, parse_skill_capability_key, preview_skill_application,
+    skill_definition::SkillDefinition,
     skill_resolution::{resolve_skills_for_project, ResolvedSkill},
+    skill_scoping::{load_skills_from_directory, SkillSourceOrigin},
     SkillApplicationResult, SkillCapabilityKey,
 };
 use protocol::PhaseCapabilities;
@@ -64,6 +66,31 @@ pub struct AppliedPhaseSkills {
     pub application: SkillApplicationResult,
 }
 
+/// Load the daemon-staged phase skill definitions from the per-run dir named by
+/// [`crate::skill_dir_sync::PHASE_SKILLS_DIR_ENV`] (SPEC-001 / TASK-001), using
+/// the SAME YAML loader as the user-tier `~/.animus/config/skill_definitions`
+/// sweep ([`load_skills_from_directory`]). `None` when the env var is unset or
+/// blank, the dir is missing, or the load fails (each logged) — resolution then
+/// falls back to the project chain byte-identically.
+fn staged_phase_skill_definitions() -> Option<std::collections::BTreeMap<String, SkillDefinition>> {
+    let raw = std::env::var(crate::skill_dir_sync::PHASE_SKILLS_DIR_ENV).ok()?;
+    let dir = std::path::PathBuf::from(raw.trim());
+    if dir.as_os_str().is_empty() {
+        return None;
+    }
+    if !dir.is_dir() {
+        warn!(dir = %dir.display(), "staged phase skills directory does not exist; falling back to project skill resolution");
+        return None;
+    }
+    match load_skills_from_directory(&dir) {
+        Ok(definitions) => Some(definitions),
+        Err(error) => {
+            warn!(dir = %dir.display(), %error, "failed to load staged phase skill definitions; falling back to project skill resolution");
+            None
+        }
+    }
+}
+
 pub fn resolve_phase_skills(
     ctx: &RuntimeConfigContext,
     project_root: &Path,
@@ -74,7 +101,37 @@ pub fn resolve_phase_skills(
         return Ok(ResolvedPhaseSkillSet::default());
     }
 
-    let resolved = resolve_skills_for_project(&skills, project_root)?;
+    // SPEC-001 (TASK-001): the daemon stages the run's resolved skill
+    // definitions into a per-run dir and points the runner at it via
+    // `skill_dir_sync::PHASE_SKILLS_DIR_ENV`. Names defined there resolve from
+    // the staged dir FIRST; names not staged fall back to the existing project
+    // resolution, and missing-after-both keeps today's hard-fail semantics.
+    let staged = staged_phase_skill_definitions();
+    let resolved = match staged.as_ref().filter(|staged| !staged.is_empty()) {
+        Some(staged) => {
+            let missing: Vec<String> = skills.iter().filter(|name| !staged.contains_key(*name)).cloned().collect();
+            let project_resolved = resolve_skills_for_project(&missing, project_root)?;
+            let project_by_name: std::collections::HashMap<&str, ResolvedSkill> =
+                missing.iter().map(String::as_str).zip(project_resolved).collect();
+            skills
+                .iter()
+                .map(|name| {
+                    if let Some(definition) = staged.get(name) {
+                        // Staged definitions are the daemon-materialized
+                        // equivalent of the user tier (same parser, same
+                        // full-definition shape), so they are tagged `User`.
+                        ResolvedSkill { definition: definition.clone(), source: SkillSourceOrigin::User }
+                    } else {
+                        project_by_name
+                            .get(name.as_str())
+                            .unwrap_or_else(|| panic!("skill '{name}' resolved above"))
+                            .clone()
+                    }
+                })
+                .collect()
+        }
+        None => resolve_skills_for_project(&skills, project_root)?,
+    };
 
     Ok(ResolvedPhaseSkillSet { requested_skills: skills, resolved_skills: resolved })
 }
@@ -539,5 +596,232 @@ mod tests {
         let effective = apply_skill_capability_overrides(&PhaseCapabilities::default(), &overrides);
         assert!(effective.mutates_state);
         assert!(!effective.is_strictly_read_only());
+    }
+
+    // -----------------------------------------------------------------
+    // SPEC-001 (TASK-001): daemon-staged phase skills dir resolution
+    // -----------------------------------------------------------------
+
+    /// Build a `RuntimeConfigContext` whose `implementation` phase requests
+    /// exactly `skills` (mirrors the fixture shape of
+    /// `resolve_phase_skills_reports_missing_skill_in_runtime_path`).
+    fn ctx_with_phase_skills(skills: Vec<String>) -> RuntimeConfigContext {
+        use orchestrator_config::agent_runtime_config::{Idempotency, PhaseExecutionDefinition, PhaseExecutionMode};
+
+        let mut runtime = builtin_agent_runtime_config();
+        runtime.phases.insert(
+            "implementation".to_string(),
+            PhaseExecutionDefinition {
+                mode: PhaseExecutionMode::Agent,
+                agent_id: Some("default".to_string()),
+                directive: None,
+                system_prompt: None,
+                runtime: None,
+                capabilities: None,
+                output_contract: None,
+                output_json_schema: None,
+                decision_contract: None,
+                retry: None,
+                skills,
+                command: None,
+                manual: None,
+                default_tool: None,
+                idempotency: Idempotency::Unknown,
+                evals: None,
+                worktree: None,
+            },
+        );
+        let workflow = builtin_workflow_config();
+        RuntimeConfigContext {
+            agent_runtime_config: runtime,
+            workflow_config: LoadedWorkflowConfig {
+                metadata: WorkflowConfigMetadata {
+                    schema: workflow.schema.clone(),
+                    version: workflow.version,
+                    hash: workflow_config_hash(&workflow),
+                    source: WorkflowConfigSource::Builtin,
+                },
+                config: workflow,
+                path: PathBuf::from("fixture"),
+            },
+        }
+    }
+
+    fn write_skill_yaml(dir: &std::path::Path, name: &str, description: &str) {
+        std::fs::create_dir_all(dir).expect("skill dir");
+        std::fs::write(dir.join(format!("{name}.yaml")), format!("name: {name}\ndescription: {description}\n"))
+            .expect("skill yaml");
+    }
+
+    /// SPEC-001: a requested skill defined in the staged dir resolves from it
+    /// FIRST (tagged as the user tier it mirrors), without touching the project
+    /// chain.
+    #[test]
+    fn resolve_phase_skills_prefers_the_staged_dir() {
+        use protocol::test_utils::EnvVarGuard;
+
+        let _lock = crate::test_env::scoped_state_serializer();
+        let project = tempfile::tempdir().expect("tempdir");
+        let staged = tempfile::tempdir().expect("staged dir");
+        write_skill_yaml(staged.path(), "staged-review", "Staged review skill");
+        let _gate = EnvVarGuard::set(crate::skill_dir_sync::PHASE_SKILLS_DIR_ENV, staged.path().to_str());
+
+        let ctx = ctx_with_phase_skills(vec!["staged-review".to_string()]);
+        let resolved = resolve_phase_skills(&ctx, project.path(), "implementation").expect("resolve from staged dir");
+        assert_eq!(resolved.requested_skills, vec!["staged-review"]);
+        assert_eq!(resolved.resolved_skills.len(), 1);
+        assert_eq!(resolved.resolved_skills[0].definition.name, "staged-review");
+        assert_eq!(resolved.resolved_skills[0].definition.description, "Staged review skill");
+        assert!(
+            matches!(resolved.resolved_skills[0].source, SkillSourceOrigin::User),
+            "staged definitions are tagged as the user tier they mirror: {:?}",
+            resolved.resolved_skills[0].source
+        );
+    }
+
+    /// SPEC-001: names NOT in the staged dir fall through to the existing
+    /// project resolution in the same call, preserving the requested order.
+    #[test]
+    fn resolve_phase_skills_falls_back_to_project_resolution_for_unstaged_names() {
+        use protocol::test_utils::EnvVarGuard;
+
+        let _lock = crate::test_env::scoped_state_serializer();
+        let project = tempfile::tempdir().expect("tempdir");
+        let staged = tempfile::tempdir().expect("staged dir");
+        write_skill_yaml(staged.path(), "staged-only", "Staged-only skill");
+        write_skill_yaml(&project.path().join(".animus/config/skill_definitions"), "project-skill", "Project skill");
+        let _gate = EnvVarGuard::set(crate::skill_dir_sync::PHASE_SKILLS_DIR_ENV, staged.path().to_str());
+
+        let ctx = ctx_with_phase_skills(vec!["project-skill".to_string(), "staged-only".to_string()]);
+        let resolved = resolve_phase_skills(&ctx, project.path(), "implementation").expect("mixed resolution");
+        assert_eq!(resolved.resolved_skills.len(), 2);
+        assert_eq!(resolved.resolved_skills[0].definition.name, "project-skill");
+        assert!(matches!(resolved.resolved_skills[0].source, SkillSourceOrigin::Project));
+        assert_eq!(resolved.resolved_skills[1].definition.name, "staged-only");
+        assert!(matches!(resolved.resolved_skills[1].source, SkillSourceOrigin::User));
+    }
+
+    /// SPEC-001: missing-after-both keeps today's hard-fail semantics (the
+    /// staged dir does not mask the missing-skill error).
+    #[test]
+    fn resolve_phase_skills_hard_fails_when_missing_from_staged_dir_and_project() {
+        use protocol::test_utils::EnvVarGuard;
+
+        let _lock = crate::test_env::scoped_state_serializer();
+        let project = tempfile::tempdir().expect("tempdir");
+        let staged = tempfile::tempdir().expect("staged dir");
+        write_skill_yaml(staged.path(), "staged-only", "Staged-only skill");
+        let _gate = EnvVarGuard::set(crate::skill_dir_sync::PHASE_SKILLS_DIR_ENV, staged.path().to_str());
+
+        let ctx = ctx_with_phase_skills(vec!["staged-only".to_string(), "missing-everywhere".to_string()]);
+        let error =
+            resolve_phase_skills(&ctx, project.path(), "implementation").expect_err("missing skill must hard-fail");
+        assert!(error.to_string().contains("missing-everywhere"), "error names the missing skill: {error}");
+    }
+
+    /// SPEC-001: with the env var unset (or pointing at a missing dir) the
+    /// behavior is byte-identical to the pre-staging project-only path.
+    #[test]
+    fn resolve_phase_skills_without_staged_dir_env_keeps_project_only_behavior() {
+        use protocol::test_utils::EnvVarGuard;
+
+        let _lock = crate::test_env::scoped_state_serializer();
+        let project = tempfile::tempdir().expect("tempdir");
+        write_skill_yaml(&project.path().join(".animus/config/skill_definitions"), "project-skill", "Project skill");
+
+        let _unset = EnvVarGuard::set(crate::skill_dir_sync::PHASE_SKILLS_DIR_ENV, None);
+        let ctx = ctx_with_phase_skills(vec!["project-skill".to_string()]);
+        let resolved = resolve_phase_skills(&ctx, project.path(), "implementation").expect("project resolution");
+        assert!(matches!(resolved.resolved_skills[0].source, SkillSourceOrigin::Project));
+
+        let _missing =
+            EnvVarGuard::set(crate::skill_dir_sync::PHASE_SKILLS_DIR_ENV, Some("/definitely/missing/animus-skills"));
+        let resolved = resolve_phase_skills(&ctx, project.path(), "implementation").expect("project resolution");
+        assert!(matches!(resolved.resolved_skills[0].source, SkillSourceOrigin::Project));
+    }
+
+    /// SPEC-001 end-to-end-ish over a fake held environment: the sync writes
+    /// the staged files through the environment exec channel (the fake node
+    /// decodes the base64 stdin exactly like the `sh -c ... base64 -d` command
+    /// would), and phase resolution against the node's skill dir then finds the
+    /// skill.
+    #[test]
+    fn staged_skills_sync_to_a_held_node_and_then_resolve() {
+        use std::sync::Mutex;
+
+        use animus_session_backend::session::{SessionRequest, SessionRun};
+        use protocol::test_utils::EnvVarGuard;
+
+        use crate::phase_environment::{EnvCommandOutput, HeldEnvironment};
+
+        struct CapturedWrite {
+            program: String,
+            args: Vec<String>,
+            stdin: Option<String>,
+        }
+
+        struct FakeNode {
+            writes: Mutex<Vec<CapturedWrite>>,
+        }
+
+        impl HeldEnvironment for FakeNode {
+            fn id(&self) -> &str {
+                "fake-node"
+            }
+
+            fn exec_session(&self, _project_root: &std::path::Path, _request: &SessionRequest) -> Result<SessionRun> {
+                anyhow::bail!("unused in this test")
+            }
+
+            fn exec_command(
+                &self,
+                _project_root: &std::path::Path,
+                program: &str,
+                args: &[String],
+                _env: &BTreeMap<String, String>,
+                _cwd: Option<&str>,
+                stdin: Option<String>,
+                _timeout: Option<std::time::Duration>,
+            ) -> Result<EnvCommandOutput> {
+                self.writes.lock().expect("writes mutex").push(CapturedWrite {
+                    program: program.to_string(),
+                    args: args.to_vec(),
+                    stdin,
+                });
+                Ok(EnvCommandOutput { exit_code: 0, stdout: String::new(), stderr: String::new(), timed_out: false })
+            }
+        }
+
+        let _lock = crate::test_env::scoped_state_serializer();
+        let project = tempfile::tempdir().expect("tempdir");
+        let staged = tempfile::tempdir().expect("staged dir");
+        write_skill_yaml(staged.path(), "node-skill", "Skill synced to the node");
+        let node_skills = tempfile::tempdir().expect("node skill dir");
+
+        // 1. The handle exists; the sync writes the staged files through it.
+        let node = FakeNode { writes: Mutex::new(Vec::new()) };
+        {
+            let _gate = EnvVarGuard::set(crate::skill_dir_sync::PHASE_SKILLS_DIR_ENV, staged.path().to_str());
+            crate::skill_dir_sync::sync_staged_skills_to_held_environment(&node, project.path());
+        }
+        let writes = node.writes.lock().expect("writes mutex");
+        assert_eq!(writes.len(), 1, "one staged file -> one node write");
+        let write = &writes[0];
+        assert_eq!(write.program, "sh");
+        assert!(write.args[1].contains("base64 -d > \"$d/node-skill.yaml\""), "write command: {}", write.args[1]);
+
+        // 2. Simulate the node side: decode stdin into the node's user-tier
+        //    skill_definitions dir (what `base64 -d > "$d/<name>"` does).
+        let stdin_b64 = write.stdin.as_deref().expect("write carries base64 stdin");
+        let content = crate::skill_dir_sync::tests::base64_decode(stdin_b64);
+        std::fs::write(node_skills.path().join("node-skill.yaml"), &content).expect("materialize on node");
+        drop(writes);
+
+        // 3. Phase resolution against the node's dir finds the skill.
+        let _gate = EnvVarGuard::set(crate::skill_dir_sync::PHASE_SKILLS_DIR_ENV, node_skills.path().to_str());
+        let ctx = ctx_with_phase_skills(vec!["node-skill".to_string()]);
+        let resolved = resolve_phase_skills(&ctx, project.path(), "implementation").expect("resolve on node");
+        assert_eq!(resolved.resolved_skills.len(), 1);
+        assert_eq!(resolved.resolved_skills[0].definition.description, "Skill synced to the node");
     }
 }
