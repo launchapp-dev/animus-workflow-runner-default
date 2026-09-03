@@ -384,6 +384,40 @@ fn hash_serializable<T: Serialize>(value: &T) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+fn redact_persisted_request(mut value: Value) -> Value {
+    fn redact(value: &mut Value) {
+        match value {
+            Value::Object(object) => {
+                for (key, child) in object {
+                    if key == "env" {
+                        if let Some(env) = child.as_object_mut() {
+                            for value in env.values_mut() {
+                                if value
+                                    .as_str()
+                                    .is_some_and(|value| !(value.starts_with("${") && value.ends_with('}')))
+                                {
+                                    *value = Value::String("[redacted]".to_string());
+                                }
+                            }
+                        }
+                    } else {
+                        redact(child);
+                    }
+                }
+            }
+            Value::Array(values) => {
+                for child in values {
+                    redact(child);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    redact(&mut value);
+    value
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PhaseExecutionMetadata {
     pub phase_id: String,
@@ -784,7 +818,7 @@ pub async fn run_workflow_phase_attempt(
         phase_id,
         &provider_hint,
         request.run_id.0.as_str(),
-        Some(serde_json::to_value(request).unwrap_or(Value::Null)),
+        Some(redact_persisted_request(serde_json::to_value(request).unwrap_or(Value::Null))),
     ) {
         warn!(
             workflow_id = %workflow_id,
@@ -2044,7 +2078,7 @@ async fn run_workflow_phase_with_agent(params: PhaseAgentParams<'_>) -> Result<A
                     );
                     inject_agent_tool_policy(&mut runtime_contract, ctx, phase_id);
                     inject_project_mcp_servers(&mut runtime_contract, project_root, ctx, phase_id);
-                    inject_workflow_mcp_servers(&mut runtime_contract, ctx, phase_id);
+                    inject_workflow_mcp_servers(&mut runtime_contract, project_root, ctx, phase_id);
                     if let Some(policy) = applied_skills.application.tool_policy.as_ref() {
                         set_mcp_tool_policy(&mut runtime_contract, policy);
                     }
@@ -3017,12 +3051,44 @@ async fn run_workflow_phase_inner(params: &PhaseRunParams<'_>) -> Result<PhaseRu
 #[cfg(test)]
 mod tests {
     use super::{
-        phase_outcome_is_complete, phase_session_resume_plan, process_phase_event_stream, resolve_claude_profile_env,
-        PhaseExecutionOutcome, SidecarPollContext,
+        phase_outcome_is_complete, phase_session_resume_plan, process_phase_event_stream, redact_persisted_request,
+        resolve_claude_profile_env, PhaseExecutionOutcome, SidecarPollContext,
     };
     use crate::runtime_support::{inject_cli_launch_env, WorkflowPhaseRuntimeSettings};
 
+    use serde_json::Value;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn persisted_request_redacts_resolved_mcp_env_without_mutating_dispatch_value() {
+        let request = serde_json::json!({
+            "context": {
+                "mcp_servers": {
+                    "rental-v1": {
+                        "env": {
+                            "RENTAL_MCP_BEARER": "secret-value",
+                            "PLACEHOLDER": "${OTHER_ENV}"
+                        }
+                    }
+                }
+            }
+        });
+
+        let persisted = redact_persisted_request(request.clone());
+
+        assert_eq!(
+            persisted.pointer("/context/mcp_servers/rental-v1/env/RENTAL_MCP_BEARER").and_then(Value::as_str),
+            Some("[redacted]")
+        );
+        assert_eq!(
+            persisted.pointer("/context/mcp_servers/rental-v1/env/PLACEHOLDER").and_then(Value::as_str),
+            Some("${OTHER_ENV}")
+        );
+        assert_eq!(
+            request.pointer("/context/mcp_servers/rental-v1/env/RENTAL_MCP_BEARER").and_then(Value::as_str),
+            Some("secret-value")
+        );
+    }
 
     // ---- REQUIREMENT-048 Phase B: workflow/phase environment + workspace overrides ----
 
