@@ -527,6 +527,15 @@ pub async fn handle_workflow_run_phase(request: WorkflowPhaseRunRequest) -> Resu
     let held_environment: Option<&dyn crate::phase_environment::HeldEnvironment> =
         brokered_environment.as_deref().map(|brokered| brokered as &dyn crate::phase_environment::HeldEnvironment);
 
+    // SPEC-001 (TASK-001): per-phase dispatch is the brokered path's actual
+    // production entry — each phase is its own runner process, so the staged
+    // phase skill definitions must be re-synced onto the daemon-owned node
+    // BEFORE this phase executes (writes overwrite same-name files; idempotent).
+    // Best-effort; no-op when the env var is unset or the run is local.
+    if let Some(held) = held_environment {
+        crate::skill_dir_sync::sync_staged_skills_to_held_environment(held, std::path::Path::new(&project_root));
+    }
+
     let started = std::time::Instant::now();
     let run_result = crate::phase_executor::run_workflow_phase(&crate::phase_executor::PhaseRunParams {
         project_root: &project_root,

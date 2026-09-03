@@ -36,6 +36,7 @@ pub mod plugin;
 pub mod reattach;
 pub mod runtime_contract;
 pub mod runtime_support;
+pub(crate) mod skill_dir_sync;
 pub mod skill_dispatch;
 pub mod workflow_event_emitter;
 pub mod workflow_execute;
