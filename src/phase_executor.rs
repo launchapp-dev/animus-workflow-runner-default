@@ -3060,6 +3060,33 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
+    fn phase_validation_accepts_http_oauth_proxy_env_without_weakening_direct_http() {
+        let mut config = orchestrator_config::builtin_workflow_config();
+        let runtime = orchestrator_config::builtin_agent_runtime_config();
+        config.mcp_servers.insert(
+            "rental-v1".to_string(),
+            serde_json::from_value(serde_json::json!({
+                "transport": "http",
+                "url": "https://rental.example.invalid/mcp",
+                "env": {"RENTAL_MCP_BEARER": "${secret.RENTAL_MCP_BEARER}"},
+                "oauth": {"flow": "manual_bearer", "bearer_env": "RENTAL_MCP_BEARER", "cache": true}
+            }))
+            .unwrap(),
+        );
+        orchestrator_core::validate_workflow_and_runtime_configs_with_project_root(&config, &runtime, None)
+            .expect("phase validation must accept the OAuth proxy credential environment");
+        let encoded = serde_json::to_string(&config).unwrap();
+        let decoded = serde_json::from_str(&encoded).unwrap();
+        orchestrator_core::validate_workflow_and_runtime_configs_with_project_root(&decoded, &runtime, None)
+            .expect("persisted configuration must preserve the same validation contract");
+        assert_eq!(config.mcp_servers["rental-v1"].env["RENTAL_MCP_BEARER"], "${secret.RENTAL_MCP_BEARER}");
+        config.mcp_servers.get_mut("rental-v1").unwrap().oauth = None;
+        let err = orchestrator_core::validate_workflow_and_runtime_configs_with_project_root(&config, &runtime, None)
+            .expect_err("direct HTTP servers must still reject child-process environment");
+        assert!(err.to_string().contains("env must not be set"));
+    }
+
+    #[test]
     fn persisted_request_redacts_resolved_mcp_env_without_mutating_dispatch_value() {
         let request = serde_json::json!({
             "context": {
